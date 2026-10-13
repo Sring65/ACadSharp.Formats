@@ -354,6 +354,14 @@ internal partial class ImageEngine
                 }
                 break;
 
+            case Wipeout wo:
+                {
+                    // 擦除多边形：用背景色填充（透明背景无底色可擦则跳过）
+                    if (!_transparentBg)
+                        PdfQuadFill(cs, _whiteBg ? "#FFFFFF" : "#000000", WipeoutWorldPoly(wo, tr));
+                }
+                break;
+
             case Arc a: // 必须先于 Circle（fork 继承关系）
                 {
                     if (TryEmitComplexPdf(cs, ent, tr, pat, col, StrokeWidth(ent, scaleMul))) break;

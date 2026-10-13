@@ -1029,6 +1029,38 @@ internal partial class ImageEngine
         return segs;
     }
 
+    // Wipeout 世界坐标多边形（三引擎共享）：擦除多边形，世界点 = InsertPoint + X·UVector + Y·VVector
+    //（ClipBoundaryVertices 为 OCS 平面内每像素偏移，U/V 为每像素方向向量，均取 XY 分量做 2D 渲染）。
+    // tr 非空时 InsertPoint 整体世界化、U/V 只取线性部分（旋转+缩放、不平移）。
+    // 顶点 <2 或全退化返回空列表。
+    private static List<(double X, double Y)> WipeoutWorldPoly(Wipeout wo, Transform2D tr)
+    {
+        var pts = new List<(double X, double Y)>();
+        var clip = wo?.ClipBoundaryVertices;
+        if (clip == null || clip.Count < 2) return pts;
+        double ix, iy, ux, uy, vx, vy;
+        if (tr == null)
+        {
+            ix = wo.InsertPoint.X; iy = wo.InsertPoint.Y;
+            ux = wo.UVector.X; uy = wo.UVector.Y;
+            vx = wo.VVector.X; vy = wo.VVector.Y;
+        }
+        else
+        {
+            var i = tr.Apply(wo.InsertPoint.X, wo.InsertPoint.Y);
+            ix = i.Item1; iy = i.Item2;
+            (ux, uy) = TransformDirection(wo.UVector.X, wo.UVector.Y, tr);
+            (vx, vy) = TransformDirection(wo.VVector.X, wo.VVector.Y, tr);
+        }
+        foreach (var c in clip)
+        {
+            double wx = ix + c.X * ux + c.Y * vx;
+            double wy = iy + c.X * uy + c.Y * vy;
+            pts.Add((wx, wy));
+        }
+        return pts;
+    }
+
     // Leader 箭头两翼（三引擎共享）：尖端 pts[0]，沿 pts[0]→pts[1] 反方向张开 ±angle 的两翼。
     // 返回 (左翼世界点, 右翼世界点)；顶点不足或退化返回 false。箭头长 = TextHeight（>0 时）否则线宽倍数。
     private static bool LeaderArrowWings(Leader ld, List<(double X, double Y)> pts, double arrowLen,
@@ -1085,6 +1117,7 @@ internal partial class ImageEngine
                 case Mesh mesh: if (mesh.Vertices != null) foreach (var v in mesh.Vertices) Expand(v.X, v.Y); break;
                 case PolyfaceMesh pf: if (pf.Vertices != null) foreach (var v in pf.Vertices) Expand(v.Location.X, v.Location.Y); break;
                 case PolygonMesh pm: if (pm.Vertices != null) foreach (var v in pm.Vertices) Expand(v.Location.X, v.Location.Y); break;
+                case Wipeout wo: foreach (var p in WipeoutWorldPoly(wo, null)) Expand(p.X, p.Y); break;
                 case Arc a: ExpandCircle(a.Center.X, a.Center.Y, a.Radius); break; // 必须先于 Circle（fork 继承）
                 case Circle c: ExpandCircle(c.Center.X, c.Center.Y, c.Radius); break;
                 case Ellipse el: ExpandCircle(el.Center.X, el.Center.Y, Math.Max(el.MajorAxis, el.MinorAxis)); break;
@@ -1349,6 +1382,17 @@ internal partial class ImageEngine
                     if (TryEmitComplexSvg(sb, ent, tr, pat, col, w)) break;
                     foreach (var (a, b) in PolygonMeshWire(pm, tr))
                         EmitLine(sb, a.AX, a.AY, b.BX, b.BY, col, w, null);
+                }
+                break;
+
+            case Wipeout wo:
+                {
+                    // 擦除多边形：用背景色填充（模拟 AutoCAD 擦除底层图元）；透明背景无底色可擦则跳过
+                    if (!_transparentBg)
+                    {
+                        var wpoly = WipeoutWorldPoly(wo, tr);
+                        EmitQuadFill(sb, wpoly, _whiteBg ? "#FFFFFF" : "#000000");
+                    }
                 }
                 break;
 

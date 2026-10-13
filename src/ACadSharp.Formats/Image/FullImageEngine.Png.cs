@@ -275,6 +275,22 @@ internal partial class ImageEngine
                 }
                 break;
 
+            case Wipeout wo:
+                {
+                    // 擦除多边形：用背景色填充（透明背景无底色可擦则跳过）
+                    if (!_transparentBg && _rc != null)
+                    {
+                        var wpoly = WipeoutWorldPoly(wo, tr);
+                        if (wpoly.Count >= 3)
+                        {
+                            var pp = new List<RasterCanvas.P>(wpoly.Count);
+                            foreach (var p in wpoly) pp.Add(new RasterCanvas.P((float)PngSx(p.X), (float)PngSy(p.Y)));
+                            _rc.Fill(new List<List<RasterCanvas.P>> { pp }, false, _whiteBg ? RasterCanvas.Rgb.White : RasterCanvas.Rgb.Black);
+                        }
+                    }
+                }
+                break;
+
             case Arc a: // 必须先于 Circle（fork 继承关系）
                 {
                     string col = ColorOf(EntityAciIndex(ent), layerAci, byBlockAci);

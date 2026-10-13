@@ -5,7 +5,7 @@ using ACadSharp.Formats.Image;
 namespace ACadSharp.Formats.Image;
 
 /// <summary>
-/// GDB2CAD 专属 PNG 导出器（T4.9）：模型空间 → SkiaSharp 位图 → PNG 文件。
+/// GDB2CAD 专属 PNG 导出器（T4.9）：模型空间 → 纯托管 RasterCanvas 位图 → PNG 文件。
 /// 渲染语义与 FullSvgExporter/FullPdfExporter 共用同一 ImageEngine（画布/颜色/线型/SHX 字形/
 /// HATCH/文字/块展开一致）；位图特有像素上限见 ImageEngine.WritePng。
 /// </summary>

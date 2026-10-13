@@ -25,13 +25,11 @@
 		<ProjectReference Include="..\..\..\ACadSharp\src\ACadSharp\ACadSharp.csproj" />
 	</ItemGroup>
 
-	<!-- [GDB2CAD PATCH] T4.9：PNG 光栅输出端（FullImageEngine.Png.cs）渲染后端。
-	     仅 PNG 导出使用；SVG/PDF 输出路径不依赖此包（手写矢量文本/字节）。
-	     原生库（libSkiaSharp）由包内 runtimes\ 按 RID 解析，随 CopyLocalLockFileAssemblies 部署。 -->
+	<!-- [GDB2CAD PATCH] PNG 光栅输出端（FullImageEngine.Png.cs）已改为纯托管 RasterCanvas
+	     （RGBA 软件光栅化 + PNG 编码 ZLibStream，零外部依赖，无 SkiaSharp）。
+	     SHX bigfont（Hztxt.shx 等 CJK）按 GBK 双字节取字形码需要 936 编码；
+	     与 ACadSharp fork（DwgSummaryInfoReader）同策略，保留 CodePages。 -->
 	<ItemGroup>
-		<PackageReference Include="SkiaSharp" Version="3.119.4" />
-		<!-- SHX bigfont（Hztxt.shx 等 CJK）按 GBK 双字节取字形码需要 936 编码；
-		     与 ACadSharp fork（DwgSummaryInfoReader）同策略。 -->
 		<PackageReference Include="System.Text.Encoding.CodePages" Version="8.0.0" />
 	</ItemGroup>
 

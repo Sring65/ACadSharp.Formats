@@ -1409,7 +1409,7 @@ internal partial class ImageEngine
         double frac = 0.5;
         try
         {
-            // 纯托管替代 SkiaSharp：族名→TTF/TTC 文件→TrueTypeFont 度量（零外部依赖）。
+            // 纯托管（零外部依赖）：族名→TTF/TTC 文件→TrueTypeFont 度量。
             string? path = PdfFontManager.FindTtf(first);
             if (!string.IsNullOrEmpty(path))
             {

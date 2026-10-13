@@ -5,73 +5,76 @@ using System.IO;
 using System.Linq;
 using ACadSharp;
 using ACadSharp.Entities;
-using ACadSharp.Tables;
+using ACadSharp.Formats.Pdf;
+using ACadSharp.Text;
 using CSMath;
-using SkiaSharp;
 
 namespace ACadSharp.Formats.Image;
 
 /// <summary>
-/// PNG 光栅输出端（T4.9）：用 SkiaSharp 把与 SVG 端完全相同的几何渲染到位图并写出 PNG。
+/// PNG 光栅输出端（T4.9）：用纯托管 RasterCanvas 把与 SVG 端完全相同的几何渲染到位图并写出 PNG
+/// （零外部依赖，纯托管软件光栅化渲染）。
 /// 渲染语义严格对齐 SVG 端（FullImageEngine.Svg.cs）：1:1 画布 + 2% 边距 + OutputZoom 放大
-/// + 黑/白背景 + ACI 官方色表（ACI 7 黑底显白/白底显黑）+ 虚线（图案自路径起点，相位与
-/// stroke-dasharray 一致）+ 复杂线型（SHX 真实字形，WalkPattern 同算法）+ NURBS 样条 de Boor
-/// 采样 + HATCH（实心/渐变/图案）+ 变宽折线（ITaperOffsetBuilder）+ TEXT/MText（CJK 系统字体，
-/// 基线=插入点，旋转/倾斜/宽度因子）+ 点标记（光晕环）+ 嵌套块展开 + ByBlock/ByLayer 继承。
-/// 与 SVG 端的差异（位图固有限制）：
-///   ① 圆/椭圆按 TryGetPathPoints 相同采样密度折线化（虚线相位与复杂线型模式一致，均为
-///      CAD 约定：0°/长轴端点起、逆时针）；
-///   ② 画布有像素上限（单侧 <see cref="PngMaxSide"/>、总量 <see cref="PngMaxPixels"/>），
-///      超出时等比缩小并记日志——位图不像 SVG/PDF 可无损放大；
-///   ③ 文字用系统字体渲染（SkiaSharp 按族名取 GDI 字体），非内嵌 TTF 轮廓。
+/// + 黑/白背景 + ACI 官方色表（ACI 7 黑底显白/白底显黑）+ 虚线（图案自路径起点）+ 复杂线型（SHX 真实字形）
+/// + NURBS 样条 de Boor 采样 + HATCH（实心/渐变/图案）+ 变宽折线（ITaperOffsetBuilder）+ TEXT/MText
+/// （基线=插入点，旋转/倾斜/宽度因子；TTF 用 TrueTypeFont 真字形轮廓填充，SHX 用真实笔迹路径）
+/// + 点标记（圆盘）+ 嵌套块展开 + ByBlock/ByLayer 继承。
 /// </summary>
 internal partial class ImageEngine
 {
     // ===== 位图尺寸安全上限（仅 PNG 输出端）=====
-    private const int PngMaxSide = 16384;           // 单侧像素上限（Skia 大位图常见上限）
-    private const long PngMaxPixels = 32_000_000L;   // 总像素上限（≈128MB RGBA）
+    private const int PngMaxSide = 16384;           // 单侧像素上限
+    private const long PngMaxPixels = 32_000_000L;  // 总像素上限（≈128MB RGBA）
 
     // PNG 输出上下文（WritePng 设置；单线程导出，非并发）
-    private SKCanvas _pngC;
+    private RasterCanvas _rc;
     private double _pngKx; // 画布 X：每数据单位像素数（W/_w）
     private double _pngKy; // 画布 Y：每数据单位像素数（H/_h）
 
-    // 画布坐标映射（与 SVG 的 Sx/Sy 同语义：Y 翻转、边距 _margin；注意 Py 已被 PDF 端占用）
+    // 画布坐标映射（与 SVG 的 Sx/Sy 同语义：Y 翻转、边距 _margin）
     private double PngSx(double x) => _margin * _pngKx + (x - _minX) * _pngKx;
     private double PngSy(double y) => _h * _pngKy - (_margin * _pngKy + (y - _minY) * _pngKy);
     private double PngK => (_pngKx + _pngKy) * 0.5;
 
+    #region ===== 颜色工具 =====
+
+    // hex(#RRGGBB) → Rgb（带缓存；引擎内所有颜色均为该格式）
+    private static readonly ConcurrentDictionary<string, RasterCanvas.Rgb> _hexRgbCache = new();
+    private static RasterCanvas.Rgb HexToRgb(string hex)
+    {
+        if (string.IsNullOrEmpty(hex) || hex.Length != 7 || hex[0] != '#') return RasterCanvas.Rgb.White;
+        if (_hexRgbCache.TryGetValue(hex, out var c)) return c;
+        RasterCanvas.Rgb col;
+        try
+        {
+            col = new RasterCanvas.Rgb(
+                Convert.ToByte(hex.Substring(1, 2), 16),
+                Convert.ToByte(hex.Substring(3, 2), 16),
+                Convert.ToByte(hex.Substring(5, 2), 16));
+        }
+        catch { col = RasterCanvas.Rgb.White; }
+        _hexRgbCache[hex] = col;
+        return col;
+    }
+
+    #endregion
+
     #region ===== PNG 导出入口 =====
 
-    // PNG 文字对齐宽度（真实字体度量，数据单位）：按解析到的字体族/粗斜体用 SKFont.MeasureText
-    // 实测字宽（CJK 实测≈1.167em、半角≈0.5em），再乘宽度因子。修正 EstimateTextWidth 估算值
-    // （CJK 1.0em/半角 0.55em）与真实字宽不一致导致的居中/右对正/中间对齐文字漂移。
-    // 解析失败（字体族不可用）回退到 EstimateTextWidth 估算（与 SVG/PDF 一致，不劣化）。
+    // PNG 文字对齐宽度（真实字体度量，数据单位）：用 TrueTypeFont 实测字宽（CJK≈1em、拉丁≈0.5em），
+    // 再乘宽度因子。修正 EstimateTextWidth 估算值（CJK 1.0em/半角 0.55em）与真实字宽不一致导致的
+    // 居中/右对正/中间对齐文字漂移。解析失败（字体族不可用）回退到 EstimateTextWidth 估算。
     private double PngTextWidth(TextEntity t, string family)
     {
         string txt = t.Value ?? "";
         double wf = Math.Max(t.WidthFactor, 1e-9);
         if (txt.Length == 0) return 0;
-        var style = new SKFontStyle(SKFontStyleWeight.Normal, SKFontStyleWidth.Normal, SKFontStyleSlant.Upright);
-        SKTypeface? tf = null;
-        if (!string.IsNullOrEmpty(family))
-            foreach (var part in family.Split(','))
-            {
-                string f = part.Trim();
-                if (f.Length == 0 || f == "serif" || f == "sans-serif" || f == "monospace") continue;
-                try { var c = SKTypeface.FromFamilyName(f, style); if (c != null) { tf = c; break; } } catch { }
-            }
-        if (tf == null) return EstimateTextWidth(txt, t.Height) * wf; // 无字体 → 估算兜底
-        try
-        {
-            using (tf)
-            {
-                using var font = new SKFont(tf, 1f);
-                float w = font.MeasureText(txt);
-                return (double)w * t.Height * wf;
-            }
-        }
-        catch { return EstimateTextWidth(txt, t.Height) * wf; }
+        var fr = PickFont(family, txt);
+        if (fr == null) return EstimateTextWidth(txt, t.Height) * wf; // 无字体 → 估算兜底
+        double total = 0;
+        for (int i = 0; i < txt.Length; i++)
+            total += fr.GetAdvanceWidth(txt[i]) / fr.UnitsPerEm;
+        return total * t.Height * wf;
     }
 
     public ImageExportResult WritePng(string outPath)
@@ -111,30 +114,26 @@ internal partial class ImageEngine
 
             _skippedCounts.Clear();
         _useRealTextWidth = true; // PNG 端：文字对齐锚点用真实字体度量（修正居中/右对正漂移）
-            using (var bmp = new SKBitmap(W, H, SKColorType.Rgba8888, SKAlphaType.Premul))
-            using (var canvas = new SKCanvas(bmp))
+        var rc = new RasterCanvas(W, H);
+        {
+            if (_transparentBg) rc.Clear(0, 0, 0, 0);
+            else rc.Clear(_whiteBg ? (byte)255 : (byte)0, _whiteBg ? (byte)255 : (byte)0, _whiteBg ? (byte)255 : (byte)0, 255);
+            _rc = rc;
+            _pngKx = (double)W / _w;
+            _pngKy = (double)H / _h;
+
+            foreach (var ent in AllEntities())
+                EmitEntityPng(ent, null, 1.0, 7, null, null, _ltScale); // 顶层无 INSERT 上下文，ByBlock 兜底白/实线
+
+            LogSkipped("PNG");
+            if (!rc.SavePng(outPath))
             {
-                canvas.Clear(_transparentBg ? SKColors.Transparent : (_whiteBg ? SKColors.White : SKColors.Black));
-                _pngC = canvas;
-                _pngKx = (double)W / _w;
-                _pngKy = (double)H / _h;
-
-                foreach (var ent in AllEntities())
-                    EmitEntityPng(ent, null, 1.0, 7, null, null, _ltScale); // 顶层无 INSERT 上下文，ByBlock 兜底白/实线
-
-                LogSkipped("PNG");
-                // SkiaSharp 3.x：SavePng 扩展已移除 → SKBitmap.Encode 到 File 流。
-                using (var fs = File.Create(outPath))
-                {
-                    if (!bmp.Encode(fs, SKEncodedImageFormat.Png, 100))
-                    {
-                        _log($"❌  PNG 写文件失败：{outPath}");
-                        _pngC = null;
-                        return new ImageExportResult { Success = false };
-                    }
-                }
+                _log($"❌  PNG 写文件失败：{outPath}");
+                _rc = null;
+                return new ImageExportResult { Success = false };
             }
-        _pngC = null;
+        }
+        _rc = null;
         _log($"✅  PNG 已生成：{outPath}（画板 {W}×{H}，1:1 内容放大 {F(_pngKx)}×{F(_pngKy)} 倍{(_transparentBg ? "，透明背景" : "")}）");
         return new ImageExportResult
         {
@@ -152,9 +151,7 @@ internal partial class ImageEngine
 
     #region ===== 实体分发（与 EmitEntitySvg 逐 case 对齐）=====
 
-    // 发射单个实体（含 Insert 展开）。参数语义与 EmitEntitySvg 完全一致：
-    // tr=累积变换（嵌套块）、scaleMul=线宽/字高倍率、byBlockAci=随块颜色、byBlockDash=随块虚线、
-    // byBlockPat=随块复杂线型、ltMul=线型比例乘数、byLayerOverride=随图层颜色（块内=插入点块图层色）。
+    // 发射单个实体（含 Insert 展开）。参数语义与 EmitEntitySvg 完全一致。
     private void EmitEntityPng(Entity ent, Transform2D tr, double scaleMul, short byBlockAci, double[] byBlockDash, LtpPattern byBlockPat, double ltMul, short? byLayerOverride = null)
     {
         short layerAci;
@@ -191,7 +188,6 @@ internal partial class ImageEngine
                         else { var a = tr.Apply(v.Location.X, v.Location.Y); pts.Add((a.Item1, a.Item2)); }
                     }
                     // 几何宽度（组码43，数据单位，真实加粗）：>0 时按 CAD 语义渲染为"填充多边形"；否则按线宽(370)描边。
-                    // DWG 往返：全顶点等宽被归一为 ConstantWidth → 先物化为逐顶点宽度（与 SVG 端同序，含顶点变更）。
                     double sw = pl.Vertices.FirstOrDefault()?.StartWidth ?? 0;
                     if (sw <= 0 && pl.ConstantWidth > 0)
                     {
@@ -229,7 +225,6 @@ internal partial class ImageEngine
                     double r = a.Radius * (tr?.Scale ?? 1.0);
                     if (r > 0)
                     {
-                        // 与 EmitArcAsPolyline 同采样：每 2° 一段（CAD 弧恒逆时针，end<start 跨 360°）
                         double s = a.StartAngle * 180.0 / Math.PI, e = a.EndAngle * 180.0 / Math.PI;
                         double span = e - s;
                         while (span < 0) span += 360.0;
@@ -255,7 +250,6 @@ internal partial class ImageEngine
                     double r = c.Radius * (tr?.Scale ?? 1.0);
                     if (r > 0)
                     {
-                        // 与 TryGetPathPoints 同采样（CAD 线型从 0° 逆时针起）
                         int m = (int)Math.Clamp(Math.Ceiling(2 * Math.PI * r / 0.5), 64, 100000);
                         var pts = new List<(double X, double Y)>(m + 1);
                         for (int i = 0; i <= m; i++)
@@ -277,7 +271,6 @@ internal partial class ImageEngine
                     double ry = el.MinorAxis * (tr?.Scale ?? 1.0);
                     if (rx > 0 && ry > 0)
                     {
-                        // 与 TryGetPathPoints 同采样（从长轴端点起逆时针）
                         double rot = el.Rotation * 180.0 / Math.PI + (tr?.Rotation ?? 0.0);
                         double ca = Math.Cos(rot * Math.PI / 180.0), sa = Math.Sin(rot * Math.PI / 180.0);
                         int m = (int)Math.Clamp(Math.Ceiling(2 * Math.PI * Math.Max(rx, ry) / 0.5), 64, 100000);
@@ -296,46 +289,45 @@ internal partial class ImageEngine
             case Point pt:
                 {
                     var (cx, cy) = tr == null ? (pt.Location.X, pt.Location.Y) : tr.Apply(pt.Location.X, pt.Location.Y);
-                    // 点标记：颜色随实体/图层，直径 = 3× 当前线宽，外加背景色光晕环（与 EmitPoint 一致）
                     double lw = StrokeWidth(ent, scaleMul);
                     double radius = Math.Max(0.05, lw * 1.5);
                     if (!double.IsFinite(radius) || radius <= 0) radius = 0.05;
-                    double fx = PngSx(cx), fy = PngSy(cy);
-                    using (var pf = new SKPaint { IsAntialias = true, Color = HexSk(ColorOf(EntityAciIndex(ent), layerAci, byBlockAci)) })
-                        _pngC.DrawCircle((float)fx, (float)fy, (float)(radius * PngK), pf);
+                    float fx = (float)PngSx(cx), fy = (float)PngSy(cy);
+                    float rad = (float)(radius * PngK);
+                    var col = HexToRgb(ColorOf(EntityAciIndex(ent), layerAci, byBlockAci));
+                    // 背景色光晕环（透明背景无底色，跳过，避免在透明上出现一圈边）
                     if (!_transparentBg)
-                        // 背景色光晕环（透明背景无底色，跳过，避免在透明上出现一圈黑边）
-                        using (var ps = new SKPaint { IsAntialias = true, IsStroke = true, Color = _whiteBg ? SKColors.White : SKColors.Black, StrokeWidth = (float)(radius * 0.3 * PngK) })
-                            _pngC.DrawCircle((float)fx, (float)fy, (float)(radius * PngK), ps);
+                        _rc.FillDisc(fx, fy, rad + (float)(radius * 0.15 * PngK), _whiteBg ? RasterCanvas.Rgb.White : RasterCanvas.Rgb.Black);
+                    _rc.FillDisc(fx, fy, rad, col);
                 }
                 break;
 
             case TextEntity t:
                 {
                     string col = ColorOf(EntityAciIndex(ent), layerAci, byBlockAci);
-                    // SHX 样式：真实 SHX 笔迹路径（与 AutoCAD 一致字宽/字形）；非 SHX/字体缺失 → 回退原系统字体路径
+                    // SHX 样式：真实 SHX 笔迹路径（与 AutoCAD 一致字宽/字形）；非 SHX/字体缺失 → 回退原 TTF 路径
                     var shx = TryBuildShxTextWorld(t, tr, scaleMul);
                     if (shx != null)
                     {
-                        using (var path = new SKPath())
+                        var pb = new PolyBuilder();
+                        for (int k = 0; k < shx.Value.Type.Count; k++)
                         {
-                            for (int k = 0; k < shx.Value.Type.Count; k++)
+                            var p = shx.Value.Pts[k];
+                            switch (shx.Value.Type[k])
                             {
-                                var p = shx.Value.Pts[k];
-                                switch (shx.Value.Type[k])
-                                {
-                                    case 0: path.MoveTo((float)PngSx(p[0]), (float)PngSy(p[1])); break;
-                                    case 1: path.LineTo((float)PngSx(p[0]), (float)PngSy(p[1])); break;
-                                    case 2: path.QuadTo((float)PngSx(p[0]), (float)PngSy(p[1]), (float)PngSx(p[2]), (float)PngSy(p[3])); break;
-                                    case 3: path.CubicTo((float)PngSx(p[0]), (float)PngSy(p[1]), (float)PngSx(p[2]), (float)PngSy(p[3]), (float)PngSx(p[4]), (float)PngSy(p[5])); break;
-                                }
+                                case 0: pb.MoveTo((float)PngSx(p[0]), (float)PngSy(p[1])); break;
+                                case 1: pb.LineTo((float)PngSx(p[0]), (float)PngSy(p[1])); break;
+                                case 2: pb.QuadTo((float)PngSx(p[0]), (float)PngSy(p[1]), (float)PngSx(p[2]), (float)PngSy(p[3])); break;
+                                case 3: pb.CubicTo((float)PngSx(p[0]), (float)PngSy(p[1]), (float)PngSx(p[2]), (float)PngSy(p[3]), (float)PngSx(p[4]), (float)PngSy(p[5])); break;
                             }
-                            using (var paint = new SKPaint { IsAntialias = true, IsStroke = true, Color = HexSk(col), StrokeWidth = (float)Math.Max(0.0, shx.Value.PenWidth * PngK), StrokeJoin = SKStrokeJoin.Round, StrokeCap = SKStrokeCap.Round })
-                                _pngC.DrawPath(path, paint);
                         }
+                        var penCol = HexToRgb(col);
+                        float pw = (float)Math.Max(0.0, shx.Value.PenWidth * PngK);
+                        foreach (var pl in pb.ToPolylines(false))
+                            if (pl.Count >= 2) _rc.StrokePolyline(pl, false, pw, penCol);
                         break;
                     }
-                    // TTF 样式：原系统字体路径（不变）
+                    // TTF 样式：纯托管真字形轮廓填充（TrueTypeFont 替代 SkiaSystemFont）
                     string family = ResolveFontFamily(GetStyleFont(t.Style));
                     double? wReal = _useRealTextWidth ? PngTextWidth(t, family) : null;
                     var (bx, by, brot, bscale) = TextBaseline(t, tr, wReal);
@@ -345,7 +337,6 @@ internal partial class ImageEngine
                 break;
 
             case MText mt:
-                // 多行文字：解析格式码 + 参考列宽换行 + 附着点定位（与 EmitMTextSvg 同算法）
                 EmitMTextPng(mt, tr, scaleMul, layerAci, byBlockAci, GetStyleFont(mt.Style));
                 break;
 
@@ -381,7 +372,7 @@ internal partial class ImageEngine
         }
     }
 
-    // Insert 展开（与 EmitInsertSvg 同逻辑：变换组合 + 有效颜色/线型继承 + 块内 ByLayer=插入点块图层色）
+    // Insert 展开（与 EmitInsertSvg 同逻辑）
     private void EmitInsertPng(Insert ins, Transform2D parent, short byBlockAci, double[] byBlockDash, LtpPattern byBlockPat, double ltMul)
     {
         if (ins?.Block == null) return;
@@ -400,73 +391,56 @@ internal partial class ImageEngine
 
     #region ===== 描边基础（折线 + 虚线走查，相位与 SVG stroke-dasharray 一致）=====
 
-    // 描边折线（数据单位坐标）。dashed 时手动沿路径走查 dash/gap（相位从路径起点，与
-    // stroke-dasharray 及复杂线型模式一致）；闭合 + 无虚线 → Close() 干净转角。
+    // 描边折线（数据单位坐标）。dashed 时手动沿路径走查 dash/gap（相位从路径起点），闭合 + 无虚线 → 干净转角。
     private void StrokePts(List<(double X, double Y)> pts, bool closed, string col, double w, double[] dash)
     {
-        if (pts == null || pts.Count < 2) return;
+        if (pts == null || pts.Count < 2 || _rc == null) return;
+        var colRgb = HexToRgb(col);
+        float widthPx = (float)Math.Max(0.0, w * PngK);
         bool dashed = dash != null && dash.Length > 0;
-        using var paint = StrokePaint(col, w);
-        using var path = new SKPath();
         if (dashed)
         {
-            var walk = pts;
-            if (closed)
-            {
-                // 补首点收尾，保证图案走完闭合边（与 TryGetPathPoints 闭合处理同语义）
-                walk = new List<(double X, double Y)>(pts.Count + 1);
-                walk.AddRange(pts);
-                walk.Add(pts[0]);
-            }
-            var cum = BuildCum(walk);
-            WalkDashPx(path, walk, cum, dash);
+            var cum = BuildCum(pts);
+            var spans = WalkDashPx(pts, cum, dash);
+            foreach (var sp in spans)
+                if (sp.Count >= 2) _rc.StrokePolyline(sp, false, widthPx, colRgb);
         }
         else
         {
-            path.MoveTo((float)PngSx(pts[0].X), (float)PngSy(pts[0].Y));
-            for (int i = 1; i < pts.Count; i++)
-                path.LineTo((float)PngSx(pts[i].X), (float)PngSy(pts[i].Y));
-            if (closed) path.Close();
+            var pp = new List<RasterCanvas.P>(pts.Count);
+            foreach (var p in pts) pp.Add(new RasterCanvas.P((float)PngSx(p.X), (float)PngSy(p.Y)));
+            _rc.StrokePolyline(pp, closed, widthPx, colRgb);
         }
-        _pngC.DrawPath(path, paint);
     }
 
-    // 描边画笔（与 SVG 端一致：round 转角、butt 端帽、抗锯齿）
-    private SKPaint StrokePaint(string colHex, double wData)
+    // 沿折线走查 [dash, gap, dash, ...]（正长度交替，dash 起头），落笔区间生成像素子折线。
+    private List<List<RasterCanvas.P>> WalkDashPx(List<(double X, double Y)> pts, double[] cum, double[] dash)
     {
-        return new SKPaint
-        {
-            IsAntialias = true,
-            IsStroke = true,
-            Color = HexSk(colHex),
-            StrokeWidth = (float)Math.Max(0.0, wData * PngK),
-            StrokeJoin = SKStrokeJoin.Round,
-        };
-    }
-
-    // 沿折线走查 [dash, gap, dash, ...]（正长度交替，dash 起头），落笔区间追加为子路径。
-    private void WalkDashPx(SKPath path, List<(double X, double Y)> pts, double[] cum, double[] dash)
-    {
+        var result = new List<List<RasterCanvas.P>>();
         double L = cum[cum.Length - 1];
-        if (L <= 1e-9) return;
+        if (L <= 1e-9) return result;
         double period = 0;
         foreach (var v in dash) period += v;
-        if (period <= 1e-9) return;
+        if (period <= 1e-9) return result;
         double pos = 0;
         int i = 0, guard = 0;
         while (pos < L - 1e-9 && guard++ < 50000000)
         {
             double span = dash[i % dash.Length];
             if (span > 1e-9)
-                AppendSpanPathPx(path, pts, cum, pos, Math.Min(pos + span, L), PngSx, PngSy);
+            {
+                var sub = new List<RasterCanvas.P>();
+                AppendSpanPathPx(sub, pts, cum, pos, Math.Min(pos + span, L));
+                if (sub.Count >= 2) result.Add(sub);
+            }
             pos += span;
             i++;
         }
+        return result;
     }
 
-    // 把弧长区间 [s0, s1] 的子路径追加到 SKPath（端点精确插值 + 区间内原始采样顶点；AppendSpanPath 的位图版）
-    private static void AppendSpanPathPx(SKPath path, List<(double X, double Y)> pts, double[] cum, double s0, double s1,
-        Func<double, double> fx, Func<double, double> fy)
+    // 把弧长区间 [s0, s1] 的子路径追加到像素折线（端点精确插值 + 区间内原始采样顶点）。
+    private void AppendSpanPathPx(List<RasterCanvas.P> sub, List<(double X, double Y)> pts, double[] cum, double s0, double s1)
     {
         if (s1 - s0 < 1e-9) return;
         int n = pts.Count;
@@ -476,44 +450,40 @@ internal partial class ImageEngine
         if (s1 - s0 < 1e-9) return;
 
         PathPointAt(pts, cum, s0, out double ax, out double ay, out _, out _);
-        double m0x = fx(ax), m0y = fy(ay);
-        PathPointAt(pts, cum, s1, out double bx, out double by, out _, out _);
-        double m1x = fx(bx), m1y = fy(by);
-
-        path.MoveTo((float)m0x, (float)m0y);
+        sub.Add(new RasterCanvas.P((float)PngSx(ax), (float)PngSy(ay)));
         for (int i = 1; i < n; i++)
         {
             double c = cum[i];
             if (c <= s0 + 1e-9 || c >= s1 - 1e-9) continue;
-            path.LineTo((float)fx(pts[i].X), (float)fy(pts[i].Y));
+            sub.Add(new RasterCanvas.P((float)PngSx(pts[i].X), (float)PngSy(pts[i].Y)));
         }
-        double dx = m1x - m0x, dy = m1y - m0y;
-        if (dx * dx + dy * dy > 1e-18)
-            path.LineTo((float)m1x, (float)m1y);
+        PathPointAt(pts, cum, s1, out double bx, out double by, out _, out _);
+        sub.Add(new RasterCanvas.P((float)PngSx(bx), (float)PngSy(by)));
     }
 
     #endregion
 
     #region ===== 复杂线型（SHX 真实字形，WalkPattern 同算法）=====
 
-    // 复杂线型（PNG）：沿路径走查模式生成单个描边 SKPath（dash 子路径 + 字形子路径）。
-    // 返回 false = 不支持/空（调用方回退 dasharray 逻辑）。与 TryEmitComplexSvg 逐行对应。
+    // 复杂线型（PNG）：沿路径走查模式生成描边路径（dash 子路径 + 字形子路径）。返回 false = 不支持/空。
     private bool TryEmitComplexPng(Entity ent, Transform2D tr, LtpPattern pat, string col, double w)
     {
         if (pat == null) return false;
         if (!TryGetPathPoints(ent, tr, out var pts) || pts.Count < 2) return false;
         var cum = BuildCum(pts);
         if (cum[cum.Length - 1] <= 1e-9) return false;
-        using var path = new SKPath();
-        WalkPatternPx(path, pts, cum, pat);
-        if (path.IsEmpty) return false;
-        using var paint = StrokePaint(col, w);
-        _pngC.DrawPath(path, paint);
+        var pb = new PolyBuilder();
+        WalkPatternPx(pb, pts, cum, pat);
+        if (pb.IsEmpty) return false;
+        var colRgb = HexToRgb(col);
+        float widthPx = (float)Math.Max(0.0, w * PngK);
+        foreach (var pl in pb.ToPolylines(false))
+            if (pl.Count >= 2) _rc.StrokePolyline(pl, false, widthPx, colRgb);
         return true;
     }
 
     // 沿路径走查模式（WalkPattern 的位图版）：dash→线子路径；gap→留空；shape→段中点真实 SHX 字形（沿切向）。
-    private void WalkPatternPx(SKPath path, List<(double X, double Y)> pts, double[] cum, LtpPattern pat)
+    private void WalkPatternPx(PolyBuilder pb, List<(double X, double Y)> pts, double[] cum, LtpPattern pat)
     {
         double L = cum[cum.Length - 1];
         var segs = pat.Segs;
@@ -527,21 +497,42 @@ internal partial class ImageEngine
             double span = seg.Len;
             if (seg.Kind == LtpSeg.Dash)
             {
-                AppendSpanPathPx(path, pts, cum, pos, Math.Min(pos + span, L), PngSx, PngSy);
+                AppendSpanPb(pb, pts, cum, pos, Math.Min(pos + span, L));
             }
             else if (seg.Kind == LtpSeg.Shape)
             {
                 double at = pos + seg.CenterOffset;
                 PathPointAt(pts, cum, at, out double px, out double py, out double tx, out double ty);
-                EmitShapeGlyphPx(path, at, px, py, tx, ty, seg);
+                EmitShapeGlyphPb(pb, at, px, py, tx, ty, seg);
             }
             pos += span;
             i++;
         }
     }
 
+    // 把弧长区间 [s0, s1] 的子路径追加到 PolyBuilder。
+    private void AppendSpanPb(PolyBuilder pb, List<(double X, double Y)> pts, double[] cum, double s0, double s1)
+    {
+        if (s1 - s0 < 1e-9) return;
+        int n = pts.Count;
+        double L = cum[n - 1];
+        if (s0 < 0) s0 = 0;
+        if (s1 > L) s1 = L;
+        if (s1 - s0 < 1e-9) return;
+        PathPointAt(pts, cum, s0, out double ax, out double ay, out _, out _);
+        pb.MoveTo((float)PngSx(ax), (float)PngSy(ay));
+        for (int i = 1; i < n; i++)
+        {
+            double c = cum[i];
+            if (c <= s0 + 1e-9 || c >= s1 - 1e-9) continue;
+            pb.LineTo((float)PngSx(pts[i].X), (float)PngSy(pts[i].Y));
+        }
+        PathPointAt(pts, cum, s1, out double bx, out double by, out _, out _);
+        pb.LineTo((float)PngSx(bx), (float)PngSy(by));
+    }
+
     // 在路径点绘制真实 SHX 字形（追加到同一描边路径；EmitShapeGlyph 的位图版）。
-    private void EmitShapeGlyphPx(SKPath path, double at, double px, double py, double tx, double ty, LtpSeg seg)
+    private void EmitShapeGlyphPb(PolyBuilder pb, double at, double px, double py, double tx, double ty, LtpSeg seg)
     {
         GlyphRec? rec = null;
         if (!string.IsNullOrEmpty(seg.ShapeFile))
@@ -552,11 +543,11 @@ internal partial class ImageEngine
         }
         if (rec == null)
         {
-            // SHX 库/形状不可用 → 回退"点"（沿切向居中的短实线），保持图案节奏（与 SVG 端一致）
+            // SHX 库/形状不可用 → 回退"点"（沿切向居中的短实线），保持图案节奏
             double dd = seg.Len > 1e-9 ? Math.Min(seg.ShapeScale * 4.0, 0.9 * seg.Len) : 0.1;
             if (dd < 0.05) dd = 0.05;
-            path.MoveTo((float)PngSx(px - tx * dd / 2), (float)PngSy(py - ty * dd / 2));
-            path.LineTo((float)PngSx(px + tx * dd / 2), (float)PngSy(py + ty * dd / 2));
+            pb.MoveTo((float)PngSx(px - tx * dd / 2), (float)PngSy(py - ty * dd / 2));
+            pb.LineTo((float)PngSx(px + tx * dd / 2), (float)PngSy(py + ty * dd / 2));
             return;
         }
         double S = seg.ShapeScale > 1e-9 ? seg.ShapeScale : 1.0;
@@ -569,7 +560,6 @@ internal partial class ImageEngine
         }
         double ca = Math.Cos(ang), sa = Math.Sin(ang);
         double ox = seg.OX * S, oy = seg.OY * S;
-        // 字形点(字体单位) → 画布坐标：平移(包围盒中心→路径点)+旋转+缩放（与 EmitShapeGlyph 同序）
         void Xf(float gx, float gy, out double mx, out double my)
         {
             double lx = (gx - rec.CX) * S + ox;
@@ -585,22 +575,22 @@ internal partial class ImageEngine
             {
                 case 0:
                     Xf(p[0], p[1], out double mx, out double my);
-                    path.MoveTo((float)PngSx(mx), (float)PngSy(my));
+                    pb.MoveTo((float)PngSx(mx), (float)PngSy(my));
                     break;
                 case 1:
                     Xf(p[0], p[1], out double lx, out double ly);
-                    path.LineTo((float)PngSx(lx), (float)PngSy(ly));
+                    pb.LineTo((float)PngSx(lx), (float)PngSy(ly));
                     break;
                 case 2:
                     Xf(p[0], p[1], out double qx, out double qy);
                     Xf(p[2], p[3], out double ex, out double ey);
-                    path.QuadTo((float)PngSx(qx), (float)PngSy(qy), (float)PngSx(ex), (float)PngSy(ey));
+                    pb.QuadTo((float)PngSx(qx), (float)PngSy(qy), (float)PngSx(ex), (float)PngSy(ey));
                     break;
                 case 3:
                     Xf(p[0], p[1], out double c1x, out double c1y);
                     Xf(p[2], p[3], out double c2x, out double c2y);
                     Xf(p[4], p[5], out double ex2, out double ey2);
-                    path.CubicTo((float)PngSx(c1x), (float)PngSy(c1y), (float)PngSx(c2x), (float)PngSy(c2y),
+                    pb.CubicTo((float)PngSx(c1x), (float)PngSy(c1y), (float)PngSx(c2x), (float)PngSy(c2y),
                         (float)PngSx(ex2), (float)PngSy(ey2));
                     break;
             }
@@ -619,7 +609,7 @@ internal partial class ImageEngine
         if (layout.Lines.Count == 0) return;
         var (baselines, anchorX, anchorY) = MTextLocalLayout(layout, mt);
 
-        double rot = mt.Rotation * 180.0 / Math.PI + (tr?.Rotation ?? 0.0); // fork 弧度 → 度
+        double rot = mt.Rotation * 180.0 / Math.PI + (tr?.Rotation ?? 0.0);
         double rad = rot * Math.PI / 180.0;
         double ca = Math.Cos(rad), sa = Math.Sin(rad);
         double px = mt.InsertPoint.X, py = mt.InsertPoint.Y;
@@ -636,7 +626,6 @@ internal partial class ImageEngine
                     string col = run.Color.HasValue ? AciColor(run.Color.Value) : baseCol;
                     double fs = Math.Max(run.Height * scaleMul, 0.2);
                     string fam = ResolveFontFamily(!string.IsNullOrEmpty(run.Font) ? run.Font : styleFont);
-                    // 局部点→世界：P + R·(local − anchor)（局部偏移乘 scaleMul，与 SVG 端 ToWorld 同式）
                     double dx = (x - anchorX) * scaleMul, dy = (baselines[li] - anchorY) * scaleMul;
                     double wx = px + dx * ca - dy * sa;
                     double wy = py + dx * sa + dy * ca;
@@ -652,124 +641,166 @@ internal partial class ImageEngine
     //   (x,y)        = 基线左端点（数据坐标，TextBaseline/MText 已算好）
     //   fsData       = 字高（数据单位，含 scaleMul）
     //   rotCanvas    = 画布系旋转角（度；数据系 CCW 角 θ 传 −θ：画布 y 向下，正角=视觉顺时针）
-    //   widthFactor  = 字宽因子（沿文字自身基线方向压缩，先缩后转——与 SVG scale(WF,1) 同语义）
+    //   widthFactor  = 字宽因子（沿文字自身基线方向压缩，先缩后转）
     //   oblique      = 倾斜角（度，CAD \Q 语义：正=上端右倾）
-    // 局部系原点=基线左端点，文字沿局部 +x 排布；矩阵 = T(画布点)·R·K(skewX)·S(WF,1)。
+    // 字体解析：PdfFontManager.FindTtf（族名→TTF/TTC 文件）→ TrueTypeFont 取字形轮廓，纯托管填充。
     private void DrawTextPng(double x, double y, string content, double fsData, string colHex, double rotCanvas,
         string family, double widthFactor, bool bold = false, bool italic = false, double oblique = 0.0,
         bool underline = false, bool overline = false, double runWidthData = 0.0)
     {
-        if (string.IsNullOrEmpty(content) || _pngC == null) return;
+        if (string.IsNullOrEmpty(content) || _rc == null) return;
         double sx = PngSx(x), sy = PngSy(y);
         float fs = (float)(fsData * PngK);
         if (fs <= 0) return;
 
-        // SkiaSharp 3.x：SKMatrix 无 Scale/Translation/6 参构造；PostConcat 返回新矩阵（2.x 为就地 void）。
-        // 目标映射 local(u,v)→画布：T(sx,sy)·R(θ)·K(skewX)·S(wf,1)，即先缩字宽、再倾斜、再旋转、最后平移到锚点。
-        // 用 PostConcat 顺序拼接：S → K → R → T（后接者作用在右侧/先作用于局部坐标）。
-        // 关键：锚点 local(0,0) 必须映射到 (sx,sy)。旧版用 PreConcat 链（=S·R·K·T，顺序颠倒）会把
-        // 平移也乘进缩放 → 锚点被移到 (sx·wf, sy)，水平（及旋转文字的垂直）整体漂移，与 SVG 端
-        // （SVG 的 transform 列表 T·R·K 顺序正确）不一致。改 PostConcat 后锚点精确落在 (sx,sy)。
+        var fr = PickFont(family, content);
+        if (fr == null) return; // 无任何可用 TTF → 跳过（不劣化）
+
+        double upm = fr.UnitsPerEm;
         double wf = widthFactor > 1e-9 ? widthFactor : 1.0;
-        var m = SKMatrix.CreateScale((float)wf, 1.0f);
-        if (Math.Abs(oblique) > 1e-6)
-            // SVG skewX(α)：x' = x + tan(α)·y（y 向下）；CAD 正倾角 → α = −oblique
-            m = m.PostConcat(SKMatrix.CreateSkew((float)Math.Tan(-oblique * Math.PI / 180.0), 0f));
-        if (Math.Abs(rotCanvas) > 1e-6)
-            m = m.PostConcat(SKMatrix.CreateRotationDegrees((float)rotCanvas));
-        m = m.PostConcat(SKMatrix.CreateTranslation((float)sx, (float)sy));
+        double tanA = Math.Tan(-oblique * Math.PI / 180.0); // SVG skewX(−oblique)
+        double th = rotCanvas * Math.PI / 180.0;
+        double cosT = Math.Cos(th), sinT = Math.Sin(th);
+        var col = HexToRgb(colHex);
 
-        using (var tf = GetPngTypeface(family, bold, italic, content))
-        using (var paint = new SKPaint
+        double penAdv = 0; // 累计 advance（em 单位，未乘 wf）
+        for (int ci = 0; ci < content.Length; ci++)
         {
-            IsAntialias = true,
-            Color = HexSk(colHex),
-            TextSize = fs,
-            Typeface = tf ?? SKTypeface.Default,
-        })
-        {
-            _pngC.Save();
-            _pngC.Concat(m);
-            _pngC.DrawText(content, 0f, 0f, paint); // y=0 即基线
-            if ((underline || overline) && runWidthData > 0)
+            char ch = content[ci];
+            int gi = fr.GetGlyphIndex(ch);
+            if (gi != 0)
             {
-                // 下/上划线：局部系内沿基线方向，长 = run 宽（数据单位）×PngK（矩阵 S(WF) 会同步拉伸）
-                float rw = (float)(runWidthData * PngK);
-                using var dp = new SKPaint { IsAntialias = true, Color = paint.Color, IsStroke = true, StrokeWidth = Math.Max(1f, fs * 0.05f) };
-                if (underline)
-                    _pngC.DrawLine(0f, fs * 0.10f, rw, fs * 0.10f, dp);
-                if (overline)
-                    _pngC.DrawLine(0f, -fs * 0.85f, rw, -fs * 0.85f, dp);
+                var sink = new GlyphSink();
+                fr.TryGetGlyph(gi, sink);
+                foreach (var contour in sink.Contours)
+                {
+                    if (contour.Count < 3) continue;
+                    var px = new List<RasterCanvas.P>(contour.Count + 1);
+                    foreach (var fp in contour)
+                    {
+                        double ex = fp.X / upm + penAdv;
+                        double ey = fp.Y / upm;
+                        double Lx = ex * fs * wf;
+                        double Ly = -ey * fs;          // 翻转 y 到屏幕向下
+                        Lx += tanA * Ly;              // 倾斜
+                        double Xr = Lx * cosT - Ly * sinT; // 旋转
+                        double Yr = Lx * sinT + Ly * cosT;
+                        px.Add(new RasterCanvas.P((float)(sx + Xr), (float)(sy + Yr)));
+                    }
+                    if (px.Count >= 3)
+                    {
+                        px.Add(px[0]); // 闭合轮廓
+                        _rc.Fill(new List<List<RasterCanvas.P>> { px }, false, col);
+                    }
+                }
             }
-            _pngC.Restore();
+            double adv = fr.GetAdvanceWidth(ch) / upm;
+            penAdv += adv * wf;
+        }
+
+        // 下/上划线：沿文字方向（旋转后的局部 x 轴），长度 = run 宽（数据单位 × PngK）
+        if ((underline || overline) && runWidthData > 0)
+        {
+            float oy = underline ? (float)(0.10 * fs) : (float)(-0.85 * fs);
+            double dirx = cosT, diry = sinT;
+            double offx = -oy * sinT, offy = oy * cosT;
+            double len = runWidthData * PngK;
+            double x0 = sx + offx, y0 = sy + offy;
+            double x1 = x0 + dirx * len, y1 = y0 + diry * len;
+            float wline = (float)Math.Max(1f, fs * 0.05f);
+            var pp = new List<RasterCanvas.P> { new RasterCanvas.P((float)x0, (float)y0), new RasterCanvas.P((float)x1, (float)y1) };
+            _rc.StrokePolyline(pp, false, wline, col);
         }
     }
 
-    // 字体族解析：ResolveFontFamily 返回 CSS 族列表（如 "SimSun, 宋体, serif"），按序尝试；
-    // 均失败返回 null（调用方用 SKTypeface.Default 兜底）。
-    // SkiaSharp 3.x：字体按族名解析为 SKTypeface.FromFamilyName（2.x 的 SKTypeface.Create 已移除）。
-    // 额外做 CJK 字形覆盖校验：FromFamilyName 可能回退到不含 CJK 字形的基础字体，
-    // 若文本含 CJK 而解析结果不覆盖，则丢弃该族继续尝试下一族，避免中文渲染成空白/点阵。
-    private static SKTypeface? GetPngTypeface(string family, bool bold, bool italic, string content)
+    // 族名 → 可用 TrueTypeFont（纯托管）。先按 family（CSS 列表支持）尝试，含 CJK 时追加常用 CJK 兜底，
+    // 选取能覆盖文本全部码位的字体；均不可用返回 null（调用方跳过文字）。
+    private static readonly Dictionary<string, TrueTypeFont> _ttfCache = new(StringComparer.OrdinalIgnoreCase);
+    private static TrueTypeFont PickFont(string family, string text)
     {
-        if (string.IsNullOrEmpty(family)) return null;
-        var style = new SKFontStyle(
-            bold ? SKFontStyleWeight.Bold : SKFontStyleWeight.Normal,
-            SKFontStyleWidth.Normal,
-            italic ? SKFontStyleSlant.Italic : SKFontStyleSlant.Upright);
-        foreach (var part in family.Split(','))
-        {
-            string f = part.Trim();
-            if (f.Length == 0 || f == "serif" || f == "sans-serif" || f == "monospace") continue;
-            try
+        var fams = new List<string>();
+        if (!string.IsNullOrEmpty(family))
+            foreach (var p in family.Split(','))
             {
-                var tf = SKTypeface.FromFamilyName(f, style);
-                if (tf == null) continue;
-                if (!TypefaceCoversText(tf, content)) { tf.Dispose(); continue; }
-                return tf;
+                string f = p.Trim();
+                if (f.Length == 0 || f == "serif" || f == "sans-serif" || f == "monospace") continue;
+                fams.Add(f);
             }
-            catch { }
+        if (fams.Count == 0) fams.Add("Microsoft YaHei");
+        // 常用 CJK 兜底（覆盖校验失败回退）
+        foreach (var c in new[] { "Microsoft YaHei", "SimSun", "SimHei", "DengXian", "KaiTi", "FangSong" })
+            if (!fams.Contains(c)) fams.Add(c);
+
+        TrueTypeFont first = null;
+        foreach (var f in fams)
+        {
+            if (_ttfCache.TryGetValue(f, out var cached))
+            {
+                if (cached == null) continue;        // 已知缺失
+                if (Covers(cached, text)) return cached;
+                if (first == null) first = cached;
+                continue;
+            }
+            string path = PdfFontManager.FindTtf(f);
+            if (string.IsNullOrEmpty(path)) { _ttfCache[f] = null; continue; }
+            var tf = TrueTypeFont.LoadFromFile(path);
+            if (tf == null) { _ttfCache[f] = null; continue; }
+            _ttfCache[f] = tf;
+            if (Covers(tf, text)) return tf;
+            if (first == null) first = tf;
         }
-        return null;
+        return first;
     }
 
-    // 取样校验字体是否覆盖文本中的 CJK 码位（<0x2E80 的拉丁/数字不算）：
-    // 无 CJK 内容直接通过；有 CJK 内容时只要有一个 CJK 码位缺字形即判不覆盖。
-    private static bool TypefaceCoversText(SKTypeface tf, string content)
+    private static bool Covers(TrueTypeFont tf, string text)
     {
-        if (string.IsNullOrEmpty(content)) return true;
-        int cjkChecked = 0;
-        foreach (var ch in content)
+        foreach (var ch in text)
         {
-            if (ch < 0x2E80) continue;
-            cjkChecked++;
-            if (!tf.ContainsGlyph(ch)) return false;
-            if (cjkChecked >= 64) break;
+            if (ch < 0x20) continue;
+            if (tf.GetGlyphIndex(ch) == 0) return false;
         }
         return true;
+    }
+
+    // IGlyphSink 收集器：把字形轮廓命令收为若干闭合轮廓（字体单位）。
+    private sealed class GlyphSink : IGlyphSink
+    {
+        public readonly List<List<RasterCanvas.P>> Contours = new();
+        private List<RasterCanvas.P> _cur;
+        public void MoveTo(float x, float y) { _cur = new List<RasterCanvas.P>(); Contours.Add(_cur); _cur.Add(new RasterCanvas.P(x, y)); }
+        public void LineTo(float x, float y) { _cur?.Add(new RasterCanvas.P(x, y)); }
+        public void QuadTo(float cx, float cy, float x, float y)
+        {
+            if (_cur == null || _cur.Count == 0) return;
+            var s = _cur[_cur.Count - 1];
+            RasterCanvas.FlattenQuad(s.X, s.Y, cx, cy, x, y, _cur);
+        }
+        public void CubicTo(float c1x, float c1y, float c2x, float c2y, float x, float y)
+        {
+            if (_cur == null || _cur.Count == 0) return;
+            var s = _cur[_cur.Count - 1];
+            RasterCanvas.FlattenCubic(s.X, s.Y, c1x, c1y, c2x, c2y, x, y, _cur);
+        }
+        public void Close() { /* 字形轮廓本就闭合，无需额外操作 */ }
     }
 
     #endregion
 
     #region ===== 填充（四边形 / HATCH 实心/渐变/图案）=====
 
-    // 四边形填充（Solid/Face3D；与 EmitQuadFill 一致：填充 + 0.15 宽同色描边防 AA 缝隙）
+    // 四边形填充（Solid/Face3D；填充 + 0.15 宽同色描边防 AA 缝隙）
     private void EmitQuadFillPng(List<(double X, double Y)> pts, string color)
     {
-        if (pts == null || pts.Count < 3 || _pngC == null) return;
-        using var path = new SKPath();
-        path.MoveTo((float)PngSx(pts[0].X), (float)PngSy(pts[0].Y));
-        for (int i = 1; i < pts.Count; i++)
-            path.LineTo((float)PngSx(pts[i].X), (float)PngSy(pts[i].Y));
-        path.Close();
-        var col = HexSk(color);
-        using (var pf = new SKPaint { IsAntialias = true, Color = col })
-            _pngC.DrawPath(path, pf);
-        using (var ps = new SKPaint { IsAntialias = true, IsStroke = true, Color = col, StrokeWidth = (float)Math.Max(0.05, 0.15 * PngK) })
-            _pngC.DrawPath(path, ps);
+        if (pts == null || pts.Count < 3 || _rc == null) return;
+        var contour = new List<RasterCanvas.P>(pts.Count);
+        foreach (var p in pts) contour.Add(new RasterCanvas.P((float)PngSx(p.X), (float)PngSy(p.Y)));
+        var col = HexToRgb(color);
+        _rc.Fill(new List<List<RasterCanvas.P>> { contour }, false, col);
+        float w = (float)Math.Max(0.05, 0.15 * PngK);
+        _rc.StrokePolyline(contour, true, w, col);
     }
 
-    // HATCH → PNG（EmitHatchSvg 的位图版：实心=实体色/真色；渐变=linear/radial 双端 shader；图案=裁剪线段描边）
+    // HATCH → PNG（实心=实体色/真色；渐变=线性/径向双端插值；图案=裁剪线段描边）
     private void EmitHatchPng(Hatch ht, Transform2D tr, double scaleMul, short layerAci, short byBlockAci)
     {
         var loops = BuildHatchLoops(ht, tr);
@@ -781,67 +812,49 @@ internal partial class ImageEngine
             EmitHatchPatternPng(ht, loops, tr, scaleMul, layerAci, byBlockAci);
             return;
         }
-        using var path = new SKPath();
+        var contours = new List<List<RasterCanvas.P>>();
+        double minX = double.MaxValue, minY = double.MaxValue, maxX = double.MinValue, maxY = double.MinValue;
         foreach (var loop in loops)
         {
             if (loop.Count < 3) continue;
-            path.MoveTo((float)PngSx(loop[0].X), (float)PngSy(loop[0].Y));
-            for (int i = 1; i < loop.Count; i++)
-                path.LineTo((float)PngSx(loop[i].X), (float)PngSy(loop[i].Y));
-            path.Close();
+            var c = new List<RasterCanvas.P>(loop.Count);
+            foreach (var p in loop)
+            {
+                float fx = (float)PngSx(p.X), fy = (float)PngSy(p.Y);
+                c.Add(new RasterCanvas.P(fx, fy));
+                if (fx < minX) minX = fx; if (fy < minY) minY = fy;
+                if (fx > maxX) maxX = fx; if (fy > maxY) maxY = fy;
+            }
+            contours.Add(c);
         }
-        // SkiaSharp 3.x：填充规则改由 SKPath.FillType 承载（SKPaint.FillStyle/FillType 已移除）。
-        path.FillType = loops.Count > 1 ? SKPathFillType.EvenOdd : SKPathFillType.Winding;
-        using var paint = new SKPaint
-        {
-            IsAntialias = true,
-            Style = SKPaintStyle.Fill,
-            Color = SKColors.White, // 渐变时 shader 色不被 Color 调制
-        };
+        if (contours.Count == 0) { RecordSkip("HATCH(空)"); return; }
+        bool evenOdd = contours.Count > 1;
         if (gradient)
         {
-            // 渐变几何与 EmitHatchGradientDef 严格一致：范围=包围盒对角线一半，460 角度沿梯度方向，取首/末色标
-            double minX = double.MaxValue, minY = double.MaxValue, maxX = double.MinValue, maxY = double.MinValue;
-            foreach (var loop in loops)
-                foreach (var p in loop)
-                {
-                    if (p.X < minX) minX = p.X; if (p.Y < minY) minY = p.Y;
-                    if (p.X > maxX) maxX = p.X; if (p.Y > maxY) maxY = p.Y;
-                }
             double cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
             double L = 0.5 * Math.Sqrt((maxX - minX) * (maxX - minX) + (maxY - minY) * (maxY - minY));
             if (!double.IsFinite(L) || L <= 0) L = 1.0;
-            SKColor c1 = SKColors.White, c2 = SKColors.Black;
+            var c1 = RasterCanvas.Rgb.White; var c2 = RasterCanvas.Rgb.Black;
             if (gp.Colors != null && gp.Colors.Count >= 2)
             {
-                c1 = HexSk(StopHex(gp.Colors[0].Color));
-                c2 = HexSk(StopHex(gp.Colors[gp.Colors.Count - 1].Color));
+                c1 = HexToRgb(StopHex(gp.Colors[0].Color));
+                c2 = HexToRgb(StopHex(gp.Colors[gp.Colors.Count - 1].Color));
             }
-            SKShader shader;
             if (IsEllipticGradient(gp))
-            {
-                // 椭圆渐变：以包围盒中心为圆心、半径 L·PngK 的径向渐变（首→末色标，Clamp）
-                shader = SKShader.CreateRadialGradient(
-                    new SKPoint((float)PngSx(cx), (float)PngSy(cy)), (float)(L * PngK),
-                    new[] { c1, c2 }, SKShaderTileMode.Clamp);
-            }
+                _rc.FillGradient(contours, evenOdd, new RasterCanvas.P(0, 0), new RasterCanvas.P(0, 0), c1, c2, true, (float)cx, (float)cy, (float)(L * PngK));
             else
             {
-                double ang = gp.Angle; // fork 弧度
+                double ang = gp.Angle;
                 double dx = Math.Cos(ang), dy = Math.Sin(ang);
-                shader = SKShader.CreateLinearGradient(
-                    new SKPoint((float)PngSx(cx - dx * L), (float)PngSy(cy - dy * L)),
-                    new SKPoint((float)PngSx(cx + dx * L), (float)PngSy(cy + dy * L)),
-                    new[] { c1, c2 }, SKShaderTileMode.Clamp);
+                _rc.FillGradient(contours, evenOdd,
+                    new RasterCanvas.P((float)(cx - dx * L), (float)(cy - dy * L)),
+                    new RasterCanvas.P((float)(cx + dx * L), (float)(cy + dy * L)),
+                    c1, c2, false, 0, 0, 0);
             }
-            paint.Shader = shader;
-            _pngC.DrawPath(path, paint);
-            shader?.Dispose();
         }
         else
         {
-            paint.Color = HexSk(HatchSolidFillHex(ht, layerAci, byBlockAci));
-            _pngC.DrawPath(path, paint);
+            _rc.Fill(contours, evenOdd, HexToRgb(HatchSolidFillHex(ht, layerAci, byBlockAci)));
         }
     }
 
@@ -851,15 +864,16 @@ internal partial class ImageEngine
         var segs = BuildPatternSegments(loops, ht, tr, MaxPatternLinesPerHatch);
         if (segs.Count == 0) { RecordSkip("HATCH(图案)"); return; }
         string col = HatchSolidFillHex(ht, layerAci, byBlockAci);
-        double w = Math.Max(0.03, 0.1 * scaleMul); // 图案线细
-        using var path = new SKPath();
+        double w = Math.Max(0.03, 0.1 * scaleMul);
+        var colRgb = HexToRgb(col);
+        float widthPx = (float)(w * PngK);
         foreach (var s in segs)
         {
-            path.MoveTo((float)PngSx(s.X1), (float)PngSy(s.Y1));
-            path.LineTo((float)PngSx(s.X2), (float)PngSy(s.Y2));
+            var pp = new List<RasterCanvas.P> {
+                new RasterCanvas.P((float)PngSx(s.X1), (float)PngSy(s.Y1)),
+                new RasterCanvas.P((float)PngSx(s.X2), (float)PngSy(s.Y2)) };
+            _rc.StrokePolyline(pp, false, widthPx, colRgb);
         }
-        using var paint = StrokePaint(col, w);
-        _pngC.DrawPath(path, paint);
     }
 
     #endregion
@@ -870,7 +884,7 @@ internal partial class ImageEngine
     {
         var verts = pl.Vertices;
         int n = verts.Count;
-        if (n < 2 || _pngC == null) return;
+        if (n < 2 || _rc == null) return;
         double[] w = new double[n];
         for (int i = 0; i < n; i++)
             w[i] = verts[i].StartWidth;
@@ -906,62 +920,32 @@ internal partial class ImageEngine
             }
         }
 
-        var col = HexSk(stroke);
-        using var path = new SKPath();
+        var col = HexToRgb(stroke);
+        var contours = new List<List<RasterCanvas.P>>();
         int m = left.Count;
         if (m < 2) return;
         if (pl.IsClosed)
         {
-            // 闭合：left/right 各一条封闭偏移轮廓（内/外环），两子路径 + evenodd 填充得"环"
-            path.MoveTo((float)PngSx(left[0].X), (float)PngSy(left[0].Y));
-            for (int i = 1; i < m; i++) path.LineTo((float)PngSx(left[i].X), (float)PngSy(left[i].Y));
-            path.Close();
-            path.MoveTo((float)PngSx(right[0].X), (float)PngSy(right[0].Y));
-            for (int i = 1; i < m; i++) path.LineTo((float)PngSx(right[i].X), (float)PngSy(right[i].Y));
-            path.Close();
-            // SkiaSharp 3.x：填充规则在 SKPath.FillType（SKPaint.FillType 已移除）
-            path.FillType = SKPathFillType.EvenOdd;
-            using (var pf = new SKPaint { IsAntialias = true, Color = col, Style = SKPaintStyle.Fill })
-                _pngC.DrawPath(path, pf);
-            using (var ps = new SKPaint { IsAntialias = true, IsStroke = true, Color = col, StrokeWidth = (float)Math.Max(0.05, 0.1 * PngK) })
-                _pngC.DrawPath(path, ps);
+            // 闭合：left/right 各一条封闭偏移轮廓（内/外环），even-odd 填充得"环"
+            var cl = new List<RasterCanvas.P>(m); foreach (var p in left) cl.Add(new RasterCanvas.P((float)PngSx(p.X), (float)PngSy(p.Y)));
+            var cr = new List<RasterCanvas.P>(m); foreach (var p in right) cr.Add(new RasterCanvas.P((float)PngSx(p.X), (float)PngSy(p.Y)));
+            contours.Add(cl); contours.Add(cr);
+            _rc.Fill(contours, true, col);
+            float wd = (float)Math.Max(0.05, 0.1 * PngK);
+            _rc.StrokePolyline(cl, true, wd, col);
+            _rc.StrokePolyline(cr, true, wd, col);
         }
         else
         {
             // 开放：left 正向 + right 反向，两端闭合填充（带/楔形）
-            path.MoveTo((float)PngSx(left[0].X), (float)PngSy(left[0].Y));
-            for (int i = 1; i < m; i++) path.LineTo((float)PngSx(left[i].X), (float)PngSy(left[i].Y));
-            for (int i = m - 1; i >= 0; i--) path.LineTo((float)PngSx(right[i].X), (float)PngSy(right[i].Y));
-            path.Close();
-            using (var pf = new SKPaint { IsAntialias = true, Color = col })
-                _pngC.DrawPath(path, pf);
-            using (var ps = new SKPaint { IsAntialias = true, IsStroke = true, Color = col, StrokeWidth = (float)Math.Max(0.05, 0.1 * PngK) })
-                _pngC.DrawPath(path, ps);
+            var c = new List<RasterCanvas.P>(2 * m);
+            foreach (var p in left) c.Add(new RasterCanvas.P((float)PngSx(p.X), (float)PngSy(p.Y)));
+            for (int i = m - 1; i >= 0; i--) c.Add(new RasterCanvas.P((float)PngSx(right[i].X), (float)PngSy(right[i].Y)));
+            contours.Add(c);
+            _rc.Fill(contours, false, col);
+            float wd = (float)Math.Max(0.05, 0.1 * PngK);
+            _rc.StrokePolyline(c, true, wd, col);
         }
-    }
-
-    #endregion
-
-    #region ===== 颜色工具 =====
-
-    // hex(#RRGGBB) → SKColor（带缓存；引擎内所有颜色均为该格式：AciHex/StopHex/HatchSolidFillHex）
-    private static readonly ConcurrentDictionary<string, SKColor> _hexSkCache = new();
-    private static SKColor HexSk(string hex)
-    {
-        if (string.IsNullOrEmpty(hex) || hex.Length != 7 || hex[0] != '#') return SKColors.White;
-        if (_hexSkCache.TryGetValue(hex, out var c)) return c;
-        SKColor col;
-        try
-        {
-            col = new SKColor(
-                Convert.ToByte(hex.Substring(1, 2), 16),
-                Convert.ToByte(hex.Substring(3, 2), 16),
-                Convert.ToByte(hex.Substring(5, 2), 16),
-                255);
-        }
-        catch { col = SKColors.White; }
-        _hexSkCache[hex] = col;
-        return col;
     }
 
     #endregion

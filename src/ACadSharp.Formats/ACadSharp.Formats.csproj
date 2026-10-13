@@ -5,7 +5,8 @@
         需要本仓库不存在的 ACadSharp.Formats.snk 签名密钥，SignAssembly 已移除）。
 	     2) ACadSharp 依赖改为本地 fork 源码工程引用（原 Release 走 NuGet ACadSharp 3.8.*，
         与 fork 3.7.16 双程序集冲突，且 fork 含 100+ 补丁与 InternalsVisibleTo）。
-	     3) 新增 SharpAstro.Fonts（Fonts.Lib）引用：复杂线型 SHX Shape 段的真实字形解析（T4.3）。
+	     3) SHX 形状/字体解析已从外部 Fonts.Lib 迁至核心 ACadSharp.Text（ACadSharp.csproj 内），
+	        零外部依赖；复杂线型 SHX Shape 段仍走 ShxFont.Load + TryGetShapeNumber/TryGetGlyph。
 	     上游库 MIT（DomCR/ACadSharp.Formats）；GDB2CAD 专属导出器原在 Gdb\ 目录，R15 迁入对应
 	     格式目录（Svg\FullSvgExporter、Pdf\FullPdfExporter、Image\FullImageEngine.*/ImageConfiguration/
 	     TaperOffsetBuilder、Pdf\PdfFontManager/CjkFont），Gdb\ 已删除。 -->
@@ -22,7 +23,6 @@
 
 	<ItemGroup>
 		<ProjectReference Include="..\..\..\ACadSharp\src\ACadSharp\ACadSharp.csproj" />
-		<ProjectReference Include="..\..\..\Fonts.Lib\src\SharpAstro.Fonts\SharpAstro.Fonts.csproj" />
 	</ItemGroup>
 
 	<!-- [GDB2CAD PATCH] T4.9：PNG 光栅输出端（FullImageEngine.Png.cs）渲染后端。

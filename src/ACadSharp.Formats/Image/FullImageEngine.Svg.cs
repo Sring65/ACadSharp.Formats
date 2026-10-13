@@ -8,8 +8,8 @@ using ACadSharp;
 using ACadSharp.Entities;
 using ACadSharp.Tables;
 using CSMath;
-using SharpAstro.Fonts.Outlines;
-using SharpAstro.Fonts.Shx;
+// SHX 形状/字体解析现由核心 ACadSharp.Text 自行实现（零外部依赖，替代原 Fonts.Lib）。
+using ACadSharp.Text;
 
 namespace ACadSharp.Formats.Image;
 

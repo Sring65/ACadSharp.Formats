@@ -866,6 +866,52 @@ internal partial class ImageEngine
     // PDF：y 向上坐标系（原点在左下角），与 CAD 同向，不翻转
     private double Py(double y) => _margin + (y - _minY) * _scale;
 
+    // XLine/Ray 裁剪：把无限线（XLine）/射线（Ray）在"画布矩形"（数据坐标，含边距）内取可见段。
+    // 入参均为世界系（调用点先用 tr 把起点/方向转到世界系）：p0 起点、(dx,dy) 方向。
+    // 参数 t 与画布边界求交 → t∈[tmin,tmax]。XLine：t∈[-∞,+∞]；Ray：t∈[0,+∞]（仅起点之后）。
+    // 返回世界系两端点；与画布不相交返回 false（不发射）。
+    private bool ClipInfiniteLineToCanvas(double p0x, double p0y, double dx, double dy, bool isXLine,
+        out double x1, out double y1, out double x2, out double y2)
+    {
+        x1 = y1 = x2 = y2 = 0;
+        double cxmin = _minX - _margin, cxmax = _maxX + _margin;
+        double cymin = _minY - _margin, cymax = _maxY + _margin;
+        double tmin = isXLine ? double.NegativeInfinity : 0.0;
+        double tmax = double.PositiveInfinity;
+        bool ok = true;
+        // x 边界
+        if (Math.Abs(dx) > 1e-12)
+        {
+            double ta = (cxmin - p0x) / dx, tb = (cxmax - p0x) / dx;
+            if (ta > tb) { var tmp = ta; ta = tb; tb = tmp; }
+            if (ta > tmin) tmin = ta;
+            if (tb < tmax) tmax = tb;
+        }
+        else if (p0x < cxmin || p0x > cxmax) { ok = false; } // 垂直线但起点在画布 x 外
+        // y 边界
+        if (ok && Math.Abs(dy) > 1e-12)
+        {
+            double ta = (cymin - p0y) / dy, tb = (cymax - p0y) / dy;
+            if (ta > tb) { var tmp = ta; ta = tb; tb = tmp; }
+            if (ta > tmin) tmin = ta;
+            if (tb < tmax) tmax = tb;
+        }
+        else if (p0y < cymin || p0y > cymax) { ok = false; } // 水平线但起点在画布 y 外
+        if (!ok || !(tmax > tmin)) return false;
+        x1 = p0x + dx * tmin; y1 = p0y + dy * tmin;
+        x2 = p0x + dx * tmax; y2 = p0y + dy * tmax;
+        return true;
+    }
+
+    // XLine/Ray 的方向向量经块变换（只旋转+缩放、不平移）：取原点与原点+方向两点之差。
+    private static (double dx, double dy) TransformDirection(double dx, double dy, Transform2D tr)
+    {
+        if (tr == null) return (dx, dy);
+        var a = tr.Apply(0, 0);
+        var b = tr.Apply(dx, dy);
+        return (b.Item1 - a.Item1, b.Item2 - a.Item2);
+    }
+
     private IEnumerable<Entity> AllEntities()
     {
         foreach (var e in _doc.ModelSpace.Entities)
@@ -1206,6 +1252,26 @@ internal partial class ImageEngine
                     string col = ColorOf(EntityAciIndex(sp), layerAci, byBlockAci);
                     if (TryEmitComplexSvg(sb, ent, tr, pat, col, StrokeWidth(sp, scaleMul))) break;
                     EmitSplineSvg(sb, sp, tr, scaleMul, col, dash);
+                }
+                break;
+
+            case XLine xl:
+                {
+                    // 无限线：裁剪到画布矩形后渲染（与 AutoCAD 视口显示一致）
+                    var (px, py) = tr == null ? (xl.FirstPoint.X, xl.FirstPoint.Y) : tr.Apply(xl.FirstPoint.X, xl.FirstPoint.Y);
+                    var (dx, dy) = TransformDirection(xl.Direction.X, xl.Direction.Y, tr);
+                    if (ClipInfiniteLineToCanvas(px, py, dx, dy, true, out var x1, out var y1, out var x2, out var y2))
+                        EmitLine(sb, x1, y1, x2, y2, ColorOf(EntityAciIndex(ent), layerAci, byBlockAci), StrokeWidth(ent, scaleMul), dash);
+                }
+                break;
+
+            case Ray ray:
+                {
+                    // 射线：仅起点之后，裁剪到画布矩形后渲染
+                    var (px, py) = tr == null ? (ray.StartPoint.X, ray.StartPoint.Y) : tr.Apply(ray.StartPoint.X, ray.StartPoint.Y);
+                    var (dx, dy) = TransformDirection(ray.Direction.X, ray.Direction.Y, tr);
+                    if (ClipInfiniteLineToCanvas(px, py, dx, dy, false, out var x1, out var y1, out var x2, out var y2))
+                        EmitLine(sb, x1, y1, x2, y2, ColorOf(EntityAciIndex(ent), layerAci, byBlockAci), StrokeWidth(ent, scaleMul), dash);
                 }
                 break;
 

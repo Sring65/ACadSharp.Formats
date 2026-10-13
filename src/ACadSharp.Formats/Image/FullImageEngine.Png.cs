@@ -366,6 +366,26 @@ internal partial class ImageEngine
                 }
                 break;
 
+            case XLine xl:
+                {
+                    var (px, py) = tr == null ? (xl.FirstPoint.X, xl.FirstPoint.Y) : tr.Apply(xl.FirstPoint.X, xl.FirstPoint.Y);
+                    var (dx, dy) = TransformDirection(xl.Direction.X, xl.Direction.Y, tr);
+                    if (ClipInfiniteLineToCanvas(px, py, dx, dy, true, out var x1, out var y1, out var x2, out var y2))
+                        StrokePts(new List<(double X, double Y)> { (x1, y1), (x2, y2) }, false,
+                            ColorOf(EntityAciIndex(ent), layerAci, byBlockAci), StrokeWidth(ent, scaleMul), dash);
+                }
+                break;
+
+            case Ray ray:
+                {
+                    var (px, py) = tr == null ? (ray.StartPoint.X, ray.StartPoint.Y) : tr.Apply(ray.StartPoint.X, ray.StartPoint.Y);
+                    var (dx, dy) = TransformDirection(ray.Direction.X, ray.Direction.Y, tr);
+                    if (ClipInfiniteLineToCanvas(px, py, dx, dy, false, out var x1, out var y1, out var x2, out var y2))
+                        StrokePts(new List<(double X, double Y)> { (x1, y1), (x2, y2) }, false,
+                            ColorOf(EntityAciIndex(ent), layerAci, byBlockAci), StrokeWidth(ent, scaleMul), dash);
+                }
+                break;
+
             default:
                 RecordSkip(ent.GetType().Name);
                 break;

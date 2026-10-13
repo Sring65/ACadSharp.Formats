@@ -399,6 +399,26 @@ internal partial class ImageEngine
                 EmitSplinePdf(cs, sp, tr, scaleMul, col, dash);
                 break;
 
+            case XLine xl:
+                {
+                    var (px, py) = tr == null ? (xl.FirstPoint.X, xl.FirstPoint.Y) : tr.Apply(xl.FirstPoint.X, xl.FirstPoint.Y);
+                    var (dx, dy) = TransformDirection(xl.Direction.X, xl.Direction.Y, tr);
+                    if (ClipInfiniteLineToCanvas(px, py, dx, dy, true, out var x1, out var y1, out var x2, out var y2))
+                        PdfStroke(cs, col, StrokeWidth(ent, scaleMul), dash,
+                            F(Sx(x1)) + " " + F(Py(y1)) + " m " + F(Sx(x2)) + " " + F(Py(y2)) + " l S");
+                }
+                break;
+
+            case Ray ray:
+                {
+                    var (px, py) = tr == null ? (ray.StartPoint.X, ray.StartPoint.Y) : tr.Apply(ray.StartPoint.X, ray.StartPoint.Y);
+                    var (dx, dy) = TransformDirection(ray.Direction.X, ray.Direction.Y, tr);
+                    if (ClipInfiniteLineToCanvas(px, py, dx, dy, false, out var x1, out var y1, out var x2, out var y2))
+                        PdfStroke(cs, col, StrokeWidth(ent, scaleMul), dash,
+                            F(Sx(x1)) + " " + F(Py(y1)) + " m " + F(Sx(x2)) + " " + F(Py(y2)) + " l S");
+                }
+                break;
+
             default:
                 RecordSkip(ent.GetType().Name);
                 break;

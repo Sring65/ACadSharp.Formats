@@ -264,6 +264,17 @@ internal partial class ImageEngine
                 }
                 break;
 
+            case PolygonMesh pm:
+                {
+                    // M×N 多边形网格：网格线框
+                    string col = ColorOf(EntityAciIndex(ent), layerAci, byBlockAci);
+                    double w = StrokeWidth(ent, scaleMul);
+                    if (TryEmitComplexPng(ent, tr, pat, col, w)) break;
+                    foreach (var (a, b) in PolygonMeshWire(pm, tr))
+                        StrokePts(new List<(double X, double Y)> { (a.AX, a.AY), (b.BX, b.BY) }, false, col, w, null);
+                }
+                break;
+
             case Arc a: // 必须先于 Circle（fork 继承关系）
                 {
                     string col = ColorOf(EntityAciIndex(ent), layerAci, byBlockAci);

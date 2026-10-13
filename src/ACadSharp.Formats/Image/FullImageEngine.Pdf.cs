@@ -342,6 +342,18 @@ internal partial class ImageEngine
                 }
                 break;
 
+            case PolygonMesh pm:
+                {
+                    // M×N 多边形网格：网格线框
+                    double w = StrokeWidth(ent, scaleMul);
+                    if (TryEmitComplexPdf(cs, ent, tr, pat, col, w)) break;
+                    var dpm = new StringBuilder();
+                    foreach (var (a, b) in PolygonMeshWire(pm, tr))
+                        dpm.Append(F(Sx(a.AX)) + " " + F(Py(a.AY)) + " m " + F(Sx(b.BX)) + " " + F(Py(b.BY)) + " l ");
+                    if (dpm.Length > 0) PdfStroke(cs, col, w, null, dpm + "S");
+                }
+                break;
+
             case Arc a: // 必须先于 Circle（fork 继承关系）
                 {
                     if (TryEmitComplexPdf(cs, ent, tr, pat, col, StrokeWidth(ent, scaleMul))) break;

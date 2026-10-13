@@ -994,6 +994,41 @@ internal partial class ImageEngine
         return segs;
     }
 
+    // PolygonMesh 线框（三引擎共享）：M×N 多边形网格（顶点行优先，index = r*n + c）。
+    // MVertexCount/NVertexCount 有效且乘积 = 顶点数时画网格线（行线 + 列线）；
+    // 否则退化为按顺序顶点折线。顶点（Location）经 tr 世界化，返回世界系线段列表。
+    private static List<((double AX, double AY), (double BX, double BY))> PolygonMeshWire(PolygonMesh pm, Transform2D tr)
+    {
+        var segs = new List<((double AX, double AY), (double BX, double BY))>();
+        var verts = pm?.Vertices;
+        if (verts == null || verts.Count == 0) return segs;
+        var wp = new (double X, double Y)[verts.Count];
+        for (int i = 0; i < verts.Count; i++)
+        {
+            var p = tr == null ? (verts[i].Location.X, verts[i].Location.Y) : tr.Apply(verts[i].Location.X, verts[i].Location.Y);
+            wp[i] = p;
+        }
+        int m = pm.MVertexCount, n = pm.NVertexCount;
+        int total = verts.Count;
+        if (m > 0 && n > 0 && m * n == total)
+        {
+            // 行线（固定 r，沿 c）
+            for (int r = 0; r < m; r++)
+                for (int c = 0; c < n - 1; c++)
+                { int i1 = r * n + c, i2 = r * n + c + 1; segs.Add(((wp[i1].X, wp[i1].Y), (wp[i2].X, wp[i2].Y))); }
+            // 列线（固定 c，沿 r）
+            for (int r = 0; r < m - 1; r++)
+                for (int c = 0; c < n; c++)
+                { int i1 = r * n + c, i2 = (r + 1) * n + c; segs.Add(((wp[i1].X, wp[i1].Y), (wp[i2].X, wp[i2].Y))); }
+        }
+        else
+        {
+            for (int i = 0; i + 1 < total; i++)
+                segs.Add(((wp[i].X, wp[i].Y), (wp[i + 1].X, wp[i + 1].Y)));
+        }
+        return segs;
+    }
+
     // Leader 箭头两翼（三引擎共享）：尖端 pts[0]，沿 pts[0]→pts[1] 反方向张开 ±angle 的两翼。
     // 返回 (左翼世界点, 右翼世界点)；顶点不足或退化返回 false。箭头长 = TextHeight（>0 时）否则线宽倍数。
     private static bool LeaderArrowWings(Leader ld, List<(double X, double Y)> pts, double arrowLen,
@@ -1049,6 +1084,7 @@ internal partial class ImageEngine
                 case Polyline2D p2d: foreach (var v in p2d.Vertices) Expand(v.Location.X, v.Location.Y); break;
                 case Mesh mesh: if (mesh.Vertices != null) foreach (var v in mesh.Vertices) Expand(v.X, v.Y); break;
                 case PolyfaceMesh pf: if (pf.Vertices != null) foreach (var v in pf.Vertices) Expand(v.Location.X, v.Location.Y); break;
+                case PolygonMesh pm: if (pm.Vertices != null) foreach (var v in pm.Vertices) Expand(v.Location.X, v.Location.Y); break;
                 case Arc a: ExpandCircle(a.Center.X, a.Center.Y, a.Radius); break; // 必须先于 Circle（fork 继承）
                 case Circle c: ExpandCircle(c.Center.X, c.Center.Y, c.Radius); break;
                 case Ellipse el: ExpandCircle(el.Center.X, el.Center.Y, Math.Max(el.MajorAxis, el.MinorAxis)); break;
@@ -1301,6 +1337,17 @@ internal partial class ImageEngine
                     double w = StrokeWidth(ent, scaleMul);
                     if (TryEmitComplexSvg(sb, ent, tr, pat, col, w)) break;
                     foreach (var (a, b) in PolyfaceMeshWire(pf, tr))
+                        EmitLine(sb, a.AX, a.AY, b.BX, b.BY, col, w, null);
+                }
+                break;
+
+            case PolygonMesh pm:
+                {
+                    // M×N 多边形网格：网格线框（行线+列线），参数无效退化为顶点折线
+                    string col = ColorOf(EntityAciIndex(ent), layerAci, byBlockAci);
+                    double w = StrokeWidth(ent, scaleMul);
+                    if (TryEmitComplexSvg(sb, ent, tr, pat, col, w)) break;
+                    foreach (var (a, b) in PolygonMeshWire(pm, tr))
                         EmitLine(sb, a.AX, a.AY, b.BX, b.BY, col, w, null);
                 }
                 break;

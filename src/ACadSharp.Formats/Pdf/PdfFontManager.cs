@@ -90,20 +90,20 @@ internal sealed class PdfFontManager
         return names;
     }
 
-    // 标准族名 → 系统 TTF 文件路径（仅 .ttf；.ttc/SHX/缺失 → null）
-    private static string FindTtf(string family)
+    // 标准族名 → 系统 TTF/TTC 文件路径（缺失 → null）
+    public static string FindTtf(string family)
     {
         if (string.IsNullOrEmpty(family)) return null;
         string[] candidates;
         switch (family)
         {
             case "SimHei": candidates = new[] { "simhei.ttf" }; break;
-            case "SimSun": candidates = new[] { "simsun.ttf" }; break; // 系统为 .ttc，无独立 .ttf → 回退
+            case "SimSun": candidates = new[] { "simsun.ttc", "simsun.ttf" }; break; // 系统多为 .ttc
             case "DengXian": candidates = new[] { "Deng.ttf" }; break;
             case "KaiTi": candidates = new[] { "simkai.ttf" }; break;
             case "FangSong": candidates = new[] { "simfang.ttf" }; break;
             case "SimLi": candidates = new[] { "SIMLI.TTF" }; break;
-            case "Microsoft YaHei": candidates = new[] { "msyh.ttf" }; break; // .ttc → 回退
+            case "Microsoft YaHei": candidates = new[] { "msyh.ttc", "msyh.ttf" }; break; // 系统多为 .ttc
             default: candidates = new[] { family + ".ttf", family.ToLowerInvariant() + ".ttf" }; break;
         }
         return CjkFont.FindFontFile(candidates);

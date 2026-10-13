@@ -7,6 +7,7 @@ using System.Text;
 using ACadSharp;
 using ACadSharp.Entities;
 using ACadSharp.Tables;
+using ACadSharp.Formats.Pdf;
 using CSMath;
 // SHX 形状/字体解析现由核心 ACadSharp.Text 自行实现（零外部依赖，替代原 Fonts.Lib）。
 using ACadSharp.Text;
@@ -1408,23 +1409,25 @@ internal partial class ImageEngine
         double frac = 0.5;
         try
         {
-            var tf = SkiaSharp.SKTypeface.FromFamilyName(first,
-                new SkiaSharp.SKFontStyle(SkiaSharp.SKFontStyleWeight.Normal, SkiaSharp.SKFontStyleWidth.Normal, SkiaSharp.SKFontStyleSlant.Upright));
-            if (tf != null)
+            // 纯托管替代 SkiaSharp：族名→TTF/TTC 文件→TrueTypeFont 度量（零外部依赖）。
+            string? path = PdfFontManager.FindTtf(first);
+            if (!string.IsNullOrEmpty(path))
             {
-                using var font = new SkiaSharp.SKFont(tf, 1000f);
-                var m = font.Metrics;
-                // Ascent 为正（基线上方）、Descent 为负（基线下方）；em-box = [−descent, ascent]
-                double asc = m.Ascent, desc = m.Descent;
-                double em = asc - desc; // SkiaSharp y-down：asc 为负、desc 为正 → em 为负
-                if (Math.Abs(em) > 1e-6)
+                var tf = TrueTypeFont.LoadFromFile(path!);
+                if (tf != null)
                 {
-                    // em-box 中心相对基线 = (asc + desc)/2 → 占 em 比例（分子分母同号，结果正）
-                    frac = ((asc + desc) / 2.0) / em;
-                    if (frac < 0) frac = 0;
-                    if (frac > 1) frac = 1;
+                    // em-box = [−descent, ascent]（descent 取绝对值，兼容不同字体存储符号约定）
+                    double top = Math.Abs(tf.Ascent);
+                    double bottom = Math.Abs(tf.Descent);
+                    double em = top + bottom;
+                    if (em > 1e-6)
+                    {
+                        // em-box 中心相对基线 = (top − bottom)/2 → 占 em 比例
+                        frac = (top - bottom) / (2.0 * em);
+                        if (frac < 0) frac = 0;
+                        if (frac > 1) frac = 1;
+                    }
                 }
-                tf.Dispose();
             }
         }
         catch { frac = 0.5; } // 度量失败 → 回退 0.5（不劣化）

@@ -291,6 +291,23 @@ internal partial class ImageEngine
                 }
                 break;
 
+            case Polyline2D p2d:
+                {
+                    // 2D 多段线（老式 POLYLINE+VERTEX）：顶点折线折线（bulge 弧段暂按直线弦）
+                    if (TryEmitComplexPdf(cs, ent, tr, pat, col, StrokeWidth(ent, scaleMul))) break;
+                    var pts2d = new List<(double X, double Y)>(p2d.Vertices.Count);
+                    foreach (var v in p2d.Vertices)
+                    {
+                        if (tr == null) pts2d.Add((v.Location.X, v.Location.Y));
+                        else { var a = tr.Apply(v.Location.X, v.Location.Y); pts2d.Add((a.Item1, a.Item2)); }
+                    }
+                    var d2d = new StringBuilder();
+                    for (int i = 0; i < pts2d.Count; i++) d2d.Append(F(Sx(pts2d[i].X)) + " " + F(Py(pts2d[i].Y)) + " " + (i == 0 ? "m" : "l") + " ");
+                    if (p2d.IsClosed) d2d.Append("h ");
+                    PdfStroke(cs, col, StrokeWidth(ent, scaleMul), dash, d2d + "S");
+                }
+                break;
+
             case Arc a: // 必须先于 Circle（fork 继承关系）
                 {
                     if (TryEmitComplexPdf(cs, ent, tr, pat, col, StrokeWidth(ent, scaleMul))) break;

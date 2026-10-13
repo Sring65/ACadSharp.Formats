@@ -1013,6 +1013,7 @@ internal partial class ImageEngine
                 case Line ln: Expand(ln.StartPoint.X, ln.StartPoint.Y); Expand(ln.EndPoint.X, ln.EndPoint.Y); break;
                 case LwPolyline p2: foreach (var v in p2.Vertices) Expand(v.Location.X, v.Location.Y); break;
                 case Polyline3D p3: foreach (var v in p3.Vertices) Expand(v.Location.X, v.Location.Y); break;
+                case Polyline2D p2d: foreach (var v in p2d.Vertices) Expand(v.Location.X, v.Location.Y); break;
                 case Arc a: ExpandCircle(a.Center.X, a.Center.Y, a.Radius); break; // 必须先于 Circle（fork 继承）
                 case Circle c: ExpandCircle(c.Center.X, c.Center.Y, c.Radius); break;
                 case Ellipse el: ExpandCircle(el.Center.X, el.Center.Y, Math.Max(el.MajorAxis, el.MinorAxis)); break;
@@ -1220,6 +1221,21 @@ internal partial class ImageEngine
                     var pts = p3.Vertices.Select(v => tr == null ? (v.Location.X, v.Location.Y) : tr.Apply(v.Location.X, v.Location.Y)).ToList();
                     // 闭合 3D 折线需补闭合段（旧版硬编码 false 会漏最后一段）
                     EmitPolyline(sb, pts, col, StrokeWidth(ent, scaleMul), p3.IsClosed, dash);
+                }
+                break;
+
+            case Polyline2D p2d:
+                {
+                    // 2D 多段线（老式 POLYLINE+VERTEX）：顶点折线折线（bulge 弧段暂按直线弦，后续可采样为弧）
+                    string col = ColorOf(EntityAciIndex(ent), layerAci, byBlockAci);
+                    if (TryEmitComplexSvg(sb, ent, tr, pat, col, StrokeWidth(ent, scaleMul))) break;
+                    var pts = new List<(double X, double Y)>(p2d.Vertices.Count);
+                    foreach (var v in p2d.Vertices)
+                    {
+                        var p = tr == null ? (v.Location.X, v.Location.Y) : tr.Apply(v.Location.X, v.Location.Y);
+                        pts.Add(p);
+                    }
+                    EmitPolyline(sb, pts, col, StrokeWidth(ent, scaleMul), p2d.IsClosed, dash);
                 }
                 break;
 

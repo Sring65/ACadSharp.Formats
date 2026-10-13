@@ -217,6 +217,20 @@ internal partial class ImageEngine
                 }
                 break;
 
+            case Polyline2D p2d:
+                {
+                    string col = ColorOf(EntityAciIndex(ent), layerAci, byBlockAci);
+                    if (TryEmitComplexPng(ent, tr, pat, col, StrokeWidth(ent, scaleMul))) break;
+                    var pts = new List<(double X, double Y)>(p2d.Vertices.Count);
+                    foreach (var v in p2d.Vertices)
+                    {
+                        if (tr == null) pts.Add((v.Location.X, v.Location.Y));
+                        else { var a = tr.Apply(v.Location.X, v.Location.Y); pts.Add((a.Item1, a.Item2)); }
+                    }
+                    StrokePts(pts, p2d.IsClosed, col, StrokeWidth(ent, scaleMul), dash);
+                }
+                break;
+
             case Arc a: // 必须先于 Circle（fork 继承关系）
                 {
                     string col = ColorOf(EntityAciIndex(ent), layerAci, byBlockAci);

@@ -961,6 +961,39 @@ internal partial class ImageEngine
         return result;
     }
 
+    // PolyfaceMesh 线框（三引擎共享）：旧式 3D 多面体网格。每个 Face（VertexFaceRecord.Index1-4，
+    // 1-based，0=无效）把有效顶点索引连成一条线串；3 点成三角、4 点成四边形。
+    // 顶点（VertexFaceMesh.Location）经 tr 世界化，返回世界系线段列表 (a, b)。
+    private static List<((double AX, double AY), (double BX, double BY))> PolyfaceMeshWire(PolyfaceMesh pf, Transform2D tr)
+    {
+        var segs = new List<((double AX, double AY), (double BX, double BY))>();
+        var verts = pf?.Vertices;
+        var faces = pf?.Faces;
+        if (verts == null || verts.Count == 0 || faces == null) return segs;
+        // 顶点世界化（Location 为 XYZ）
+        var wp = new (double X, double Y)[verts.Count];
+        for (int i = 0; i < verts.Count; i++)
+        {
+            var p = tr == null ? (verts[i].Location.X, verts[i].Location.Y) : tr.Apply(verts[i].Location.X, verts[i].Location.Y);
+            wp[i] = p;
+        }
+        foreach (var f in faces)
+        {
+            short[] idx = { f.Index1, f.Index2, f.Index3, f.Index4 };
+            var valid = new List<(double X, double Y)>();
+            foreach (var ix in idx)
+            {
+                int i0 = ix - 1;
+                if (i0 < 0 || i0 >= wp.Length) continue; // 0 或越界 → 无效索引
+                valid.Add(wp[i0]);
+            }
+            // 依次连线（首尾不重复闭合；三角 3 点、四边形 4 点）
+            for (int k = 1; k < valid.Count; k++)
+                segs.Add(((valid[k - 1].X, valid[k - 1].Y), (valid[k].X, valid[k].Y)));
+        }
+        return segs;
+    }
+
     // Leader 箭头两翼（三引擎共享）：尖端 pts[0]，沿 pts[0]→pts[1] 反方向张开 ±angle 的两翼。
     // 返回 (左翼世界点, 右翼世界点)；顶点不足或退化返回 false。箭头长 = TextHeight（>0 时）否则线宽倍数。
     private static bool LeaderArrowWings(Leader ld, List<(double X, double Y)> pts, double arrowLen,
@@ -1015,6 +1048,7 @@ internal partial class ImageEngine
                 case Polyline3D p3: foreach (var v in p3.Vertices) Expand(v.Location.X, v.Location.Y); break;
                 case Polyline2D p2d: foreach (var v in p2d.Vertices) Expand(v.Location.X, v.Location.Y); break;
                 case Mesh mesh: if (mesh.Vertices != null) foreach (var v in mesh.Vertices) Expand(v.X, v.Y); break;
+                case PolyfaceMesh pf: if (pf.Vertices != null) foreach (var v in pf.Vertices) Expand(v.Location.X, v.Location.Y); break;
                 case Arc a: ExpandCircle(a.Center.X, a.Center.Y, a.Radius); break; // 必须先于 Circle（fork 继承）
                 case Circle c: ExpandCircle(c.Center.X, c.Center.Y, c.Radius); break;
                 case Ellipse el: ExpandCircle(el.Center.X, el.Center.Y, Math.Max(el.MajorAxis, el.MinorAxis)); break;
@@ -1257,6 +1291,17 @@ internal partial class ImageEngine
                             EmitLine(sb, mx1, my1, mx2, my2, col, w, null);
                         }
                     }
+                }
+                break;
+
+            case PolyfaceMesh pf:
+                {
+                    // 旧式 3D 多面体网格：按 Face 索引连线成线框（三角/四边形）
+                    string col = ColorOf(EntityAciIndex(ent), layerAci, byBlockAci);
+                    double w = StrokeWidth(ent, scaleMul);
+                    if (TryEmitComplexSvg(sb, ent, tr, pat, col, w)) break;
+                    foreach (var (a, b) in PolyfaceMeshWire(pf, tr))
+                        EmitLine(sb, a.AX, a.AY, b.BX, b.BY, col, w, null);
                 }
                 break;
 

@@ -330,6 +330,18 @@ internal partial class ImageEngine
                 }
                 break;
 
+            case PolyfaceMesh pf:
+                {
+                    // 旧式 3D 多面体网格：按 Face 索引连线成线框
+                    double w = StrokeWidth(ent, scaleMul);
+                    if (TryEmitComplexPdf(cs, ent, tr, pat, col, w)) break;
+                    var dpf = new StringBuilder();
+                    foreach (var (a, b) in PolyfaceMeshWire(pf, tr))
+                        dpf.Append(F(Sx(a.AX)) + " " + F(Py(a.AY)) + " m " + F(Sx(b.BX)) + " " + F(Py(b.BY)) + " l ");
+                    if (dpf.Length > 0) PdfStroke(cs, col, w, null, dpf + "S");
+                }
+                break;
+
             case Arc a: // 必须先于 Circle（fork 继承关系）
                 {
                     if (TryEmitComplexPdf(cs, ent, tr, pat, col, StrokeWidth(ent, scaleMul))) break;

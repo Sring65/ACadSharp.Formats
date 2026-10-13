@@ -253,6 +253,17 @@ internal partial class ImageEngine
                 }
                 break;
 
+            case PolyfaceMesh pf:
+                {
+                    // 旧式 3D 多面体网格：按 Face 索引连线成线框
+                    string col = ColorOf(EntityAciIndex(ent), layerAci, byBlockAci);
+                    double w = StrokeWidth(ent, scaleMul);
+                    if (TryEmitComplexPng(ent, tr, pat, col, w)) break;
+                    foreach (var (a, b) in PolyfaceMeshWire(pf, tr))
+                        StrokePts(new List<(double X, double Y)> { (a.AX, a.AY), (b.BX, b.BY) }, false, col, w, null);
+                }
+                break;
+
             case Arc a: // 必须先于 Circle（fork 继承关系）
                 {
                     string col = ColorOf(EntityAciIndex(ent), layerAci, byBlockAci);

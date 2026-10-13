@@ -912,6 +912,74 @@ internal partial class ImageEngine
         return (b.Item1 - a.Item1, b.Item2 - a.Item2);
     }
 
+    // MLine 渲染几何（三引擎共享）：把 MLine 按 MLineStyle.Elements 的各 Offset 偏移到世界系折线。
+    // 每个 Element 生成一条平行折线（沿角平分法向偏移），返回 (偏移后世界点列, 该 Element 的 ACI)。
+    // 顶点先经 tr 世界化，再在世界系算段方向/法向（tr 为相似变换，法向方向一致）；
+    // 偏移量乘块缩放（tr.Scale）。样式无定义时退化为画中线。
+    private static List<(List<(double X, double Y)> Poly, short Aci)> MLineOffsetPolys(MLine ml, Transform2D tr)
+    {
+        var result = new List<(List<(double X, double Y)>, short)>();
+        if (ml?.Vertices == null || ml.Vertices.Count < 2) return result;
+        // 顶点世界化
+        var wp = new List<(double X, double Y)>(ml.Vertices.Count);
+        foreach (var v in ml.Vertices)
+        {
+            var p = tr == null ? (v.Position.X, v.Position.Y) : tr.Apply(v.Position.X, v.Position.Y);
+            wp.Add(p);
+        }
+        // 每顶点法向（角平分法向，近似 miter 拐角）
+        int n = wp.Count;
+        var normals = new (double X, double Y)[n];
+        for (int i = 0; i < n; i++)
+        {
+            double dx, dy;
+            if (i == 0) { dx = wp[1].X - wp[0].X; dy = wp[1].Y - wp[0].Y; }
+            else if (i == n - 1) { dx = wp[n - 1].X - wp[n - 2].X; dy = wp[n - 1].Y - wp[n - 2].Y; }
+            else { dx = (wp[i].X - wp[i - 1].X) + (wp[i + 1].X - wp[i].X); dy = (wp[i].Y - wp[i - 1].Y) + (wp[i + 1].Y - wp[i].Y); }
+            double len = Math.Sqrt(dx * dx + dy * dy);
+            normals[i] = len < 1e-12 ? (0, 0) : (-dy / len, dx / len);
+        }
+        double offScale = tr?.Scale ?? 1.0;
+        var style = ml.Style ?? ACadSharp.Objects.MLineStyle.Default;
+        var elems = style.Elements.ToList();
+        if (elems.Count == 0)
+        {
+            result.Add((wp, EntityAciIndex(ml))); // 无样式定义 → 中线
+            return result;
+        }
+        foreach (var el in elems)
+        {
+            double off = el.Offset * offScale;
+            var poly = new List<(double X, double Y)>(n);
+            for (int i = 0; i < n; i++)
+                poly.Add((wp[i].X + normals[i].X * off, wp[i].Y + normals[i].Y * off));
+            short aci;
+            try { aci = el.Color.IsTrueColor ? TrueColorToAci(el.Color.R, el.Color.G, el.Color.B) : el.Color.Index; }
+            catch { aci = 256; }
+            result.Add((poly, aci));
+        }
+        return result;
+    }
+
+    // Leader 箭头两翼（三引擎共享）：尖端 pts[0]，沿 pts[0]→pts[1] 反方向张开 ±angle 的两翼。
+    // 返回 (左翼世界点, 右翼世界点)；顶点不足或退化返回 false。箭头长 = TextHeight（>0 时）否则线宽倍数。
+    private static bool LeaderArrowWings(Leader ld, List<(double X, double Y)> pts, double arrowLen,
+        out double w1x, out double w1y, out double w2x, out double w2y)
+    {
+        w1x = w1y = w2x = w2y = 0;
+        if (pts == null || pts.Count < 2) return false;
+        double ax = pts[0].X, ay = pts[0].Y;
+        double dx = ax - pts[1].X, dy = ay - pts[1].Y;
+        double len = Math.Sqrt(dx * dx + dy * dy);
+        if (len < 1e-9) return false;
+        double baseAng = Math.Atan2(dy, dx);
+        double a1 = baseAng + 0.5236; // +30°
+        double a2 = baseAng - 0.5236; // -30°
+        w1x = ax - arrowLen * Math.Cos(a1); w1y = ay - arrowLen * Math.Sin(a1);
+        w2x = ax - arrowLen * Math.Cos(a2); w2y = ay - arrowLen * Math.Sin(a2);
+        return true;
+    }
+
     private IEnumerable<Entity> AllEntities()
     {
         foreach (var e in _doc.ModelSpace.Entities)
@@ -1272,6 +1340,46 @@ internal partial class ImageEngine
                     var (dx, dy) = TransformDirection(ray.Direction.X, ray.Direction.Y, tr);
                     if (ClipInfiniteLineToCanvas(px, py, dx, dy, false, out var x1, out var y1, out var x2, out var y2))
                         EmitLine(sb, x1, y1, x2, y2, ColorOf(EntityAciIndex(ent), layerAci, byBlockAci), StrokeWidth(ent, scaleMul), dash);
+                }
+                break;
+
+            case MLine ml:
+                {
+                    // 多线：按 MLineStyle 各 Offset 偏移到世界系平行折线，逐条描边
+                    double w = StrokeWidth(ent, scaleMul);
+                    foreach (var (poly, aci) in MLineOffsetPolys(ml, tr))
+                    {
+                        string col = ColorOf(aci, layerAci, byBlockAci);
+                        var pts = new List<(double X, double Y)>(poly.Count);
+                        foreach (var p in poly) pts.Add(p);
+                        EmitPolyline(sb, pts, col, w, false, dash);
+                    }
+                }
+                break;
+
+            case Leader ld:
+                {
+                    // 引线：折线 + 尖端箭头（AutoCAD 默认实心/开放箭头，此处用开放 V 形）
+                    string col = ColorOf(EntityAciIndex(ent), layerAci, byBlockAci);
+                    double w = StrokeWidth(ent, scaleMul);
+                    var pts = new List<(double X, double Y)>(ld.Vertices?.Count ?? 0);
+                    if (ld.Vertices != null)
+                        foreach (var v in ld.Vertices)
+                        {
+                            var p = tr == null ? (v.X, v.Y) : tr.Apply(v.X, v.Y);
+                            pts.Add(p);
+                        }
+                    if (pts.Count >= 2)
+                    {
+                        EmitPolyline(sb, pts, col, w, false, dash);
+                        // 箭头（仅首段，尖端 pts[0]）
+                        double alen = ld.TextHeight > 1e-9 ? ld.TextHeight * scaleMul : Math.Max(w * 6.0, 4.0 * (tr?.Scale ?? 1.0));
+                        if (LeaderArrowWings(ld, pts, alen, out var w1x, out var w1y, out var w2x, out var w2y))
+                        {
+                            EmitLine(sb, w1x, w1y, pts[0].X, pts[0].Y, col, w, null);
+                            EmitLine(sb, w2x, w2y, pts[0].X, pts[0].Y, col, w, null);
+                        }
+                    }
                 }
                 break;
 

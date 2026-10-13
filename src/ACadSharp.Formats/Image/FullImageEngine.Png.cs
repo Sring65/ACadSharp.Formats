@@ -386,6 +386,43 @@ internal partial class ImageEngine
                 }
                 break;
 
+            case MLine ml:
+                {
+                    double w = StrokeWidth(ent, scaleMul);
+                    foreach (var (poly, aci) in MLineOffsetPolys(ml, tr))
+                    {
+                        string col = ColorOf(aci, layerAci, byBlockAci);
+                        var pts = new List<(double X, double Y)>(poly.Count);
+                        foreach (var p in poly) pts.Add(p);
+                        StrokePts(pts, false, col, w, dash);
+                    }
+                }
+                break;
+
+            case Leader ld:
+                {
+                    string col = ColorOf(EntityAciIndex(ent), layerAci, byBlockAci);
+                    double w = StrokeWidth(ent, scaleMul);
+                    var pts = new List<(double X, double Y)>(ld.Vertices?.Count ?? 0);
+                    if (ld.Vertices != null)
+                        foreach (var v in ld.Vertices)
+                        {
+                            var p = tr == null ? (v.X, v.Y) : tr.Apply(v.X, v.Y);
+                            pts.Add(p);
+                        }
+                    if (pts.Count >= 2)
+                    {
+                        StrokePts(pts, false, col, w, dash);
+                        double alen = ld.TextHeight > 1e-9 ? ld.TextHeight * scaleMul : Math.Max(w * 6.0, 4.0 * (tr?.Scale ?? 1.0));
+                        if (LeaderArrowWings(ld, pts, alen, out var w1x, out var w1y, out var w2x, out var w2y))
+                        {
+                            StrokePts(new List<(double X, double Y)> { (w1x, w1y), (pts[0].X, pts[0].Y) }, false, col, w, null);
+                            StrokePts(new List<(double X, double Y)> { (w2x, w2y), (pts[0].X, pts[0].Y) }, false, col, w, null);
+                        }
+                    }
+                }
+                break;
+
             default:
                 RecordSkip(ent.GetType().Name);
                 break;

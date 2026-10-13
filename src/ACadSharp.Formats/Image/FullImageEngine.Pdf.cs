@@ -419,6 +419,49 @@ internal partial class ImageEngine
                 }
                 break;
 
+            case MLine ml:
+                {
+                    double w = StrokeWidth(ent, scaleMul);
+                    foreach (var (poly, aci) in MLineOffsetPolys(ml, tr))
+                    {
+                        string ecol = ColorOf(aci, layerAci, byBlockAci);
+                        var d = new StringBuilder();
+                        for (int i = 0; i < poly.Count; i++)
+                            d.Append(F(Sx(poly[i].X)) + " " + F(Py(poly[i].Y)) + " " + (i == 0 ? "m" : "l") + " ");
+                        PdfStroke(cs, ecol, w, dash, d + "S");
+                    }
+                }
+                break;
+
+            case Leader ld:
+                {
+                    double w = StrokeWidth(ent, scaleMul);
+                    var pts = new List<(double X, double Y)>(ld.Vertices?.Count ?? 0);
+                    if (ld.Vertices != null)
+                        foreach (var v in ld.Vertices)
+                        {
+                            var p = tr == null ? (v.X, v.Y) : tr.Apply(v.X, v.Y);
+                            pts.Add(p);
+                        }
+                    if (pts.Count >= 2)
+                    {
+                        var d = new StringBuilder();
+                        for (int i = 0; i < pts.Count; i++)
+                            d.Append(F(Sx(pts[i].X)) + " " + F(Py(pts[i].Y)) + " " + (i == 0 ? "m" : "l") + " ");
+                        PdfStroke(cs, col, w, dash, d + "S");
+                        // 箭头（尖端 pts[0]）
+                        double alen = ld.TextHeight > 1e-9 ? ld.TextHeight * scaleMul : Math.Max(w * 6.0, 4.0 * (tr?.Scale ?? 1.0));
+                        if (LeaderArrowWings(ld, pts, alen, out var w1x, out var w1y, out var w2x, out var w2y))
+                        {
+                            var da = new StringBuilder();
+                            da.Append(F(Sx(w1x)) + " " + F(Py(w1y)) + " m " + F(Sx(pts[0].X)) + " " + F(Py(pts[0].Y)) + " l ");
+                            da.Append(F(Sx(pts[0].X)) + " " + F(Py(pts[0].Y)) + " m " + F(Sx(w2x)) + " " + F(Py(w2y)) + " l S");
+                            PdfStroke(cs, col, w, null, da.ToString());
+                        }
+                    }
+                }
+                break;
+
             default:
                 RecordSkip(ent.GetType().Name);
                 break;

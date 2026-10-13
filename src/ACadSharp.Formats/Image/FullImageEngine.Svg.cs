@@ -1014,6 +1014,7 @@ internal partial class ImageEngine
                 case LwPolyline p2: foreach (var v in p2.Vertices) Expand(v.Location.X, v.Location.Y); break;
                 case Polyline3D p3: foreach (var v in p3.Vertices) Expand(v.Location.X, v.Location.Y); break;
                 case Polyline2D p2d: foreach (var v in p2d.Vertices) Expand(v.Location.X, v.Location.Y); break;
+                case Mesh mesh: if (mesh.Vertices != null) foreach (var v in mesh.Vertices) Expand(v.X, v.Y); break;
                 case Arc a: ExpandCircle(a.Center.X, a.Center.Y, a.Radius); break; // 必须先于 Circle（fork 继承）
                 case Circle c: ExpandCircle(c.Center.X, c.Center.Y, c.Radius); break;
                 case Ellipse el: ExpandCircle(el.Center.X, el.Center.Y, Math.Max(el.MajorAxis, el.MinorAxis)); break;
@@ -1236,6 +1237,26 @@ internal partial class ImageEngine
                         pts.Add(p);
                     }
                     EmitPolyline(sb, pts, col, StrokeWidth(ent, scaleMul), p2d.IsClosed, dash);
+                }
+                break;
+
+            case Mesh mesh:
+                {
+                    // 3D 网格（现代 MESH）：渲染边线框（Edges 逐边画线段），与 AutoCAD 线框显示一致
+                    string col = ColorOf(EntityAciIndex(ent), layerAci, byBlockAci);
+                    double w = StrokeWidth(ent, scaleMul);
+                    if (mesh.Edges != null && mesh.Vertices != null && mesh.Vertices.Count > 0)
+                    {
+                        foreach (var e in mesh.Edges)
+                        {
+                            if (e.Start < 0 || e.End < 0 || e.Start >= mesh.Vertices.Count || e.End >= mesh.Vertices.Count) continue;
+                            var va = mesh.Vertices[e.Start];
+                            var vb = mesh.Vertices[e.End];
+                            var (mx1, my1) = tr == null ? (va.X, va.Y) : tr.Apply(va.X, va.Y);
+                            var (mx2, my2) = tr == null ? (vb.X, vb.Y) : tr.Apply(vb.X, vb.Y);
+                            EmitLine(sb, mx1, my1, mx2, my2, col, w, null);
+                        }
+                    }
                 }
                 break;
 

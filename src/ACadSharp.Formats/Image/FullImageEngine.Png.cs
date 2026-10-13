@@ -231,6 +231,28 @@ internal partial class ImageEngine
                 }
                 break;
 
+            case Mesh mesh:
+                {
+                    // 3D 网格：渲染边线框
+                    string col = ColorOf(EntityAciIndex(ent), layerAci, byBlockAci);
+                    double w = StrokeWidth(ent, scaleMul);
+                    if (mesh.Edges != null && mesh.Vertices != null && mesh.Vertices.Count > 0)
+                        foreach (var e in mesh.Edges)
+                        {
+                            if (e.Start < 0 || e.End < 0 || e.Start >= mesh.Vertices.Count || e.End >= mesh.Vertices.Count) continue;
+                            var va = mesh.Vertices[e.Start];
+                            var vb = mesh.Vertices[e.End];
+                            if (tr == null)
+                                StrokePts(new List<(double X, double Y)> { (va.X, va.Y), (vb.X, vb.Y) }, false, col, w, null);
+                            else
+                            {
+                                var a = tr.Apply(va.X, va.Y); var b = tr.Apply(vb.X, vb.Y);
+                                StrokePts(new List<(double X, double Y)> { (a.Item1, a.Item2), (b.Item1, b.Item2) }, false, col, w, null);
+                            }
+                        }
+                }
+                break;
+
             case Arc a: // 必须先于 Circle（fork 继承关系）
                 {
                     string col = ColorOf(EntityAciIndex(ent), layerAci, byBlockAci);

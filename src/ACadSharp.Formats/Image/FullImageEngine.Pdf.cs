@@ -308,6 +308,28 @@ internal partial class ImageEngine
                 }
                 break;
 
+            case Mesh mesh:
+                {
+                    // 3D 网格：渲染边线框
+                    double w = StrokeWidth(ent, scaleMul);
+                    if (mesh.Edges != null && mesh.Vertices != null && mesh.Vertices.Count > 0)
+                    {
+                        var d = new StringBuilder();
+                        foreach (var e in mesh.Edges)
+                        {
+                            if (e.Start < 0 || e.End < 0 || e.Start >= mesh.Vertices.Count || e.End >= mesh.Vertices.Count) continue;
+                            var va = mesh.Vertices[e.Start];
+                            var vb = mesh.Vertices[e.End];
+                            double ax, ay, bx, by;
+                            if (tr == null) { ax = va.X; ay = va.Y; bx = vb.X; by = vb.Y; }
+                            else { var a = tr.Apply(va.X, va.Y); var b = tr.Apply(vb.X, vb.Y); ax = a.Item1; ay = a.Item2; bx = b.Item1; by = b.Item2; }
+                            d.Append(F(Sx(ax)) + " " + F(Py(ay)) + " m " + F(Sx(bx)) + " " + F(Py(by)) + " l ");
+                        }
+                        if (d.Length > 0) PdfStroke(cs, col, w, null, d + "S");
+                    }
+                }
+                break;
+
             case Arc a: // 必须先于 Circle（fork 继承关系）
                 {
                     if (TryEmitComplexPdf(cs, ent, tr, pat, col, StrokeWidth(ent, scaleMul))) break;

@@ -3132,9 +3132,11 @@ internal partial class ImageEngine
                 double denom = n2 - n1;
                 double a = denom == 0 ? 0.0 : (t - n1) / denom;
                 int jj = j - (s - p + k);
-                dx[jj] = a * dx[jj] + (1.0 - a) * dx[jj + 1];
-                dy[jj] = a * dy[jj] + (1.0 - a) * dy[jj + 1];
-                dw[jj] = a * dw[jj] + (1.0 - a) * dw[jj + 1];
+                // 标准 de Boor 递推：d_j^(k) = (1-α)·d_j^(k-1) + α·d_{j+1}^(k-1)，α=(t-N_j)/(N_{j+p-k+1}-N_j)
+                // 注意 α 乘的是上标更高的 d_{j+1}，(1-α) 乘 d_j —— 系数不可颠倒，否则曲线错乱交叉。
+                dx[jj] = (1.0 - a) * dx[jj] + a * dx[jj + 1];
+                dy[jj] = (1.0 - a) * dy[jj] + a * dy[jj + 1];
+                dw[jj] = (1.0 - a) * dw[jj] + a * dw[jj + 1];
             }
         }
         double w = Math.Abs(dw[0]) < 1e-12 ? 1.0 : dw[0];

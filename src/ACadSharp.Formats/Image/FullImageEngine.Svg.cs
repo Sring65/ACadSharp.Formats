@@ -2445,12 +2445,13 @@ internal partial class ImageEngine
         var verts = pl.Vertices;
         int n = verts.Count;
         if (n < 2) return;
-        // 逐顶点有效宽度（数据单位）：顶点 i 宽 = 本顶点起宽(40)，起宽为0时继承入段终宽(41)。
-        // 统一处理"每节起点(40)/终点(41)线宽不等"（云形全 40=0/41=0.85 → 每顶点 0.85 均匀带）。
+        // 逐顶点有效宽度（数据单位）：无 bulge 弦偏移路径用（顶点 i 宽 = 起宽40，为0时继承入段终宽41）。
         double[] w = TaperedVertexWidths(pl);
+        // 逐段起/终点宽（含 bulge 弧偏移路径用）：段 i 从 40_i 渐变到 41_i，段间顶点收尖。
+        var (sw, ew) = TaperedSegmentWidths(pl);
 
         List<(double X, double Y)> left, right;
-        var taper = TryBuildTaperOffset(pl, w, tr, _opt.TaperOffsetBuilder);
+        var taper = TryBuildTaperOffset(pl, sw, ew, tr, _opt.TaperOffsetBuilder);
         if (taper.Ok)
         {
             // 含 bulge（弧段）：弧采样偏移轮廓（GC200 圆盘修复，T5.4）
@@ -2515,7 +2516,7 @@ internal partial class ImageEngine
     // 几何核心经 ITaperOffsetBuilder 注入（R13 架构拆分：算法在宿主程序 GDB2CAD.Core.TaperOffset，
     // 本包只含渲染契约）；builder 为 null 时回退弦路径（R10 前行为）。本方法只负责实体类型
     // 适配 + 变换应用（逐点顺序与旧实现一致 → 输出字节不变）。
-    private static (bool Ok, List<(double X, double Y)> Left, List<(double X, double Y)> Right) TryBuildTaperOffset(LwPolyline pl, double[] w, Transform2D tr, ITaperOffsetBuilder builder)
+    private static (bool Ok, List<(double X, double Y)> Left, List<(double X, double Y)> Right) TryBuildTaperOffset(LwPolyline pl, double[] sw, double[] ew, Transform2D tr, ITaperOffsetBuilder builder)
     {
         if (builder == null) return (false, null, null);
         var verts = pl.Vertices;
@@ -2524,7 +2525,7 @@ internal partial class ImageEngine
         double[] ys = new double[n];
         double[] bs = new double[n];
         for (int i = 0; i < n; i++) { xs[i] = verts[i].Location.X; ys[i] = verts[i].Location.Y; bs[i] = verts[i].Bulge; }
-        var core = builder.TryBuild(n, pl.IsClosed, xs, ys, bs, w);
+        var core = builder.TryBuild(n, pl.IsClosed, xs, ys, bs, sw, ew);
         if (core == null) return (false, null, null);
         var left = new List<(double X, double Y)>(core.Value.Left.Count);
         var right = new List<(double X, double Y)>(core.Value.Right.Count);
@@ -2762,6 +2763,26 @@ internal partial class ImageEngine
             w[i] = (pi >= 0) ? verts[pi].EndWidth : verts[i].StartWidth;
         }
         return w;
+    }
+
+    // 逐段起/终点全宽（三引擎共享，喂给 ITaperOffsetBuilder 的含 bulge 变宽路径）：
+    // 段 i（顶点 i→i+1）起点宽 = 组码 40_i(StartWidth[i])、终点宽 = 组码 41_i(EndWidth[i])，
+    // 共 ec = closed ? n : n−1 段。段 i 内从 sw[i] 渐变到 ew[i]；段间在共享顶点处
+    // 入段终宽 ew[i−1] 与出段起宽 sw[i] 可不连续 → 偏移轮廓在该顶点收尖（云形 scallop 凹谷，
+    // 用户反馈"凸度每小段两端点宽不一致"）。连续折线（ew[i]==sw[i+1]）退化为逐顶点等宽（零回归）。
+    private static (double[] Sw, double[] Ew) TaperedSegmentWidths(LwPolyline pl)
+    {
+        var verts = pl.Vertices;
+        int n = verts.Count;
+        int ec = pl.IsClosed ? n : n - 1;
+        var sw = new double[ec];
+        var ew = new double[ec];
+        for (int i = 0; i < ec; i++)
+        {
+            sw[i] = verts[i].StartWidth;
+            ew[i] = verts[i].EndWidth;
+        }
+        return (sw, ew);
     }
 
     // LwPolyline 采样为世界系折线点（三引擎共享，含 bulge 弧段）：

@@ -1017,11 +1017,13 @@ internal partial class ImageEngine
         var verts = pl.Vertices;
         int n = verts.Count;
         if (n < 2 || _rc == null) return;
-        // 逐顶点有效宽度：顶点 i 宽 = 本顶点起宽(40)，起宽为0时继承入段终宽(41)
+        // 逐顶点有效宽度：无 bulge 弦偏移路径用（顶点 i 宽 = 起宽40，为0时继承入段终宽41）
         double[] w = TaperedVertexWidths(pl);
+        // 逐段起/终点宽：含 bulge 弧偏移路径用（段 i 从 40_i 渐变到 41_i，段间顶点收尖）
+        var (sw, ew) = TaperedSegmentWidths(pl);
 
         List<(double X, double Y)> left, right;
-        var taper = TryBuildTaperOffset(pl, w, tr, _opt.TaperOffsetBuilder);
+        var taper = TryBuildTaperOffset(pl, sw, ew, tr, _opt.TaperOffsetBuilder);
         if (taper.Ok)
         {
             left = taper.Left; right = taper.Right;

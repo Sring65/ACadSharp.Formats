@@ -567,6 +567,16 @@ internal partial class ImageEngine
                 }
                 break;
 
+            case Shape shp:
+                {
+                    // SHX 形状实体：用 shape 字体库真实字形笔迹渲染（BuildShapePath 共享，PDF 用 Sx/Py 不翻转 Y）
+                    string shpCol = ColorOf(EntityAciIndex(shp), layerAci, byBlockAci);
+                    string shpPath = BuildShapePath(shp, tr, Sx, Py, pdf: true);
+                    if (shpPath.Length > 0)
+                        PdfStroke(cs, shpCol, StrokeWidth(shp, scaleMul), null, shpPath + " S");
+                }
+                break;
+
             default:
                 RecordSkip(ent.GetType().Name);
                 break;

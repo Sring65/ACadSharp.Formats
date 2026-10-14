@@ -526,10 +526,87 @@ internal partial class ImageEngine
                 }
                 break;
 
+            case Shape shp:
+                {
+                    // SHX 形状实体：用 shape 字体库真实字形笔迹渲染（PolyBuilder 曲线 → 画布描边）
+                    EmitShapeEntityPng(shp, tr,
+                        ColorOf(EntityAciIndex(shp), layerAci, byBlockAci),
+                        StrokeWidth(shp, scaleMul));
+                }
+                break;
+
             default:
                 RecordSkip(ent.GetType().Name);
                 break;
         }
+    }
+
+    // SHX Shape 实体 → PNG（EmitShapeEntityPb）。AutoCAD shape 变换：
+    //   局部点(字体单位) → 缩放(Size，X 额外×RelativeXScale) → 斜切(Oblique: x+=y·tanθ)
+    //   → 旋转(Rotation) → 平移(InsertionPoint)；块内 shape 再整体过块变换 tr。
+    // 插入点 = 字形原点(0,0)（与复杂线型 shape 的"包围盒中心对齐"不同）。
+    private void EmitShapeEntityPng(Shape shp, Transform2D tr, string col, double w)
+    {
+        var pb = new PolyBuilder();
+        GlyphRec? rec = null;
+        var style = shp.ShapeStyle;
+        if (style != null && !string.IsNullOrEmpty(style.Filename))
+        {
+            var font = GetShapeFont(style.Filename);
+            if (font != null) rec = GetGlyph(font, style.Filename, shp.ShapeIndex);
+        }
+        double ipx = shp.InsertionPoint.X, ipy = shp.InsertionPoint.Y;
+        if (tr != null) { var a = tr.Apply(ipx, ipy); ipx = a.Item1; ipy = a.Item2; }
+        double size = shp.Size > 1e-9 ? shp.Size : 1.0;
+        double relX = shp.RelativeXScale > 1e-9 ? shp.RelativeXScale : 1.0;
+        double shear = Math.Tan(shp.ObliqueAngle);
+        double cr = Math.Cos(shp.Rotation), sr = Math.Sin(shp.Rotation);
+        // 字形点(字体单位) → 世界坐标（再经 PngSx/PngSy 映射到像素）
+        void Xf(double gx, double gy, out double wx, out double wy)
+        {
+            double sx = gx * relX * size + gy * size * shear; // X 缩放 + 斜切
+            double sy = gy * size;                            // Y 缩放
+            double lx = sx * cr - sy * sr;                    // 旋转
+            double ly = sx * sr + sy * cr;
+            wx = ipx + lx; wy = ipy + ly;
+            if (tr != null) { var t = tr.Apply(wx, wy); wx = t.Item1; wy = t.Item2; }
+        }
+        if (rec == null)
+        {
+            // 回退"点"：插入点处短实线
+            double dd = 0.2 * size;
+            Xf(-dd, 0, out double ax, out double ay);
+            Xf(dd, 0, out double bx, out double by);
+            pb.MoveTo((float)PngSx(ax), (float)PngSy(ay));
+            pb.LineTo((float)PngSx(bx), (float)PngSy(by));
+        }
+        else
+        {
+            for (int k = 0; k < rec.Type.Count; k++)
+            {
+                var p = rec.Pts[k];
+                switch (rec.Type[k])
+                {
+                    case 0: Xf(p[0], p[1], out double mx, out double my); pb.MoveTo((float)PngSx(mx), (float)PngSy(my)); break;
+                    case 1: Xf(p[0], p[1], out double lx, out double ly); pb.LineTo((float)PngSx(lx), (float)PngSy(ly)); break;
+                    case 2:
+                        Xf(p[0], p[1], out double qx, out double qy);
+                        Xf(p[2], p[3], out double ex, out double ey);
+                        pb.QuadTo((float)PngSx(qx), (float)PngSy(qy), (float)PngSx(ex), (float)PngSy(ey));
+                        break;
+                    case 3:
+                        Xf(p[0], p[1], out double c1x, out double c1y);
+                        Xf(p[2], p[3], out double c2x, out double c2y);
+                        Xf(p[4], p[5], out double ex2, out double ey2);
+                        pb.CubicTo((float)PngSx(c1x), (float)PngSy(c1y), (float)PngSx(c2x), (float)PngSy(c2y), (float)PngSx(ex2), (float)PngSy(ey2));
+                        break;
+                }
+            }
+        }
+        var penCol = HexToRgb(col);
+        float pw = (float)Math.Max(0.0, w * PngK);
+        foreach (var pl in pb.ToPolylines(false))
+            if (pl.Count >= 2) _rc.StrokePolyline(pl, false, pw, penCol);
     }
 
     // Insert 展开（与 EmitInsertSvg 同逻辑）

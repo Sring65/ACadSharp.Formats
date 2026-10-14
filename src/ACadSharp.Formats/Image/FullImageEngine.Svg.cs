@@ -1745,10 +1745,121 @@ internal partial class ImageEngine
                 }
                 break;
 
+            case Shape shp:
+                {
+                    // SHX 形状实体（SHAPE）：用 shape 字体库的真实字形笔迹渲染（AutoCAD shape 变换）。
+                    string shpCol = ColorOf(EntityAciIndex(shp), layerAci, byBlockAci);
+                    string shpPath = BuildShapePath(shp, tr, Sx, Sy, pdf: false);
+                    if (shpPath.Length > 0)
+                        sb.AppendLine($"  <path d=\"{shpPath}\" fill=\"none\" stroke=\"{shpCol}\" stroke-width=\"{F(StrokeWidth(shp, scaleMul))}\" stroke-linejoin=\"round\"/>");
+                }
+                break;
+
             default:
                 RecordSkip(ent.GetType().Name);
                 break;
         }
+    }
+
+    // 构建 SHX Shape 实体的 path d 串（世界坐标 → fx/fy 映射）。AutoCAD shape 变换：
+    //   局部点(字体单位) → 缩放(Size，X 额外×RelativeXScale) → 斜切(Oblique: x+=y·tanθ)
+    //   → 旋转(Rotation) → 平移(InsertionPoint)；块内 shape 再整体过块变换 tr。
+    // 插入点 = 字形原点(0,0)（与复杂线型 shape 的"包围盒中心对齐"不同）。
+    // fx/fy：SVG 用 Sx/Sy（Y 翻转）；PDF 用 Sx/Py（不翻转）。pdf 参数切换 path 语法。
+    // 字形/字体不可用回退"点"（插入点处短实线），返回空串表示无可绘制。
+    private string BuildShapePath(Shape shp, Transform2D tr,
+                                  Func<double, double> fx, Func<double, double> fy, bool pdf)
+    {
+        var d = new StringBuilder();
+        GlyphRec? rec = null;
+        var style = shp.ShapeStyle;
+        if (style != null && !string.IsNullOrEmpty(style.Filename))
+        {
+            var font = GetShapeFont(style.Filename);
+            if (font != null)
+                rec = GetGlyph(font, style.Filename, shp.ShapeIndex);
+        }
+        // 插入点（世界）= 块变换作用于原始插入点
+        double ipx = shp.InsertionPoint.X, ipy = shp.InsertionPoint.Y;
+        if (tr != null) { var a = tr.Apply(ipx, ipy); ipx = a.Item1; ipy = a.Item2; }
+        double size = shp.Size > 1e-9 ? shp.Size : 1.0;
+        double relX = shp.RelativeXScale > 1e-9 ? shp.RelativeXScale : 1.0;
+        double shear = Math.Tan(shp.ObliqueAngle);
+        double cr = Math.Cos(shp.Rotation), sr = Math.Sin(shp.Rotation);
+        // 字形点(字体单位) → 输出坐标：局部变换 + 插入点 + 块变换
+        void Xf(double gx, double gy, out double mx, out double my)
+        {
+            double sx = gx * relX * size + gy * size * shear; // X 缩放 + 斜切
+            double sy = gy * size;                            // Y 缩放
+            double lx = sx * cr - sy * sr;                    // 旋转
+            double ly = sx * sr + sy * cr;
+            double wx = ipx + lx, wy = ipy + ly;
+            if (tr != null) { var t = tr.Apply(wx, wy); wx = t.Item1; wy = t.Item2; }
+            mx = fx(wx); my = fy(wy);
+        }
+        if (rec == null)
+        {
+            // 回退"点"：插入点处短实线（尺寸随 size，沿世界 X）
+            double dd = 0.2 * size;
+            Xf(-dd, 0, out double ax, out double ay);
+            Xf(dd, 0, out double bx, out double by);
+            if (pdf) d.Append(F(ax)).Append(' ').Append(F(ay)).Append(" m ").Append(F(bx)).Append(' ').Append(F(by)).Append(" l ");
+            else d.Append("M").Append(F(ax)).Append(',').Append(F(ay)).Append("L").Append(F(bx)).Append(',').Append(F(by));
+            return d.ToString();
+        }
+        double curX = 0, curY = 0; bool haveCur = false;
+        for (int k = 0; k < rec.Type.Count; k++)
+        {
+            var p = rec.Pts[k];
+            switch (rec.Type[k])
+            {
+                case 0:
+                {
+                    Xf(p[0], p[1], out double mxx, out double myy);
+                    if (pdf) d.Append(F(mxx)).Append(' ').Append(F(myy)).Append(" m ");
+                    else d.Append("M").Append(F(mxx)).Append(',').Append(F(myy));
+                    curX = mxx; curY = myy; haveCur = true;
+                    break;
+                }
+                case 1:
+                {
+                    Xf(p[0], p[1], out double mxx, out double myy);
+                    if (pdf) d.Append(F(mxx)).Append(' ').Append(F(myy)).Append(" l ");
+                    else d.Append("L").Append(F(mxx)).Append(',').Append(F(myy));
+                    curX = mxx; curY = myy; haveCur = true;
+                    break;
+                }
+                case 2:
+                {
+                    Xf(p[0], p[1], out double qx, out double qy);
+                    Xf(p[2], p[3], out double ex, out double ey);
+                    if (pdf)
+                    {
+                        double p0x = haveCur ? curX : qx, p0y = haveCur ? curY : qy;
+                        double c1x = p0x + 2.0 / 3.0 * (qx - p0x), c1y = p0y + 2.0 / 3.0 * (qy - p0y);
+                        double c2x = ex + 2.0 / 3.0 * (qx - ex), c2y = ey + 2.0 / 3.0 * (qy - ey);
+                        d.Append(F(c1x)).Append(' ').Append(F(c1y)).Append(' ').Append(F(c2x)).Append(' ')
+                         .Append(F(c2y)).Append(' ').Append(F(ex)).Append(' ').Append(F(ey)).Append(" c ");
+                    }
+                    else d.Append("Q").Append(F(qx)).Append(',').Append(F(qy)).Append(' ').Append(F(ex)).Append(',').Append(F(ey));
+                    curX = ex; curY = ey; haveCur = true;
+                    break;
+                }
+                case 3:
+                {
+                    Xf(p[0], p[1], out double c1x, out double c1y);
+                    Xf(p[2], p[3], out double c2x, out double c2y);
+                    Xf(p[4], p[5], out double ex, out double ey);
+                    if (pdf) d.Append(F(c1x)).Append(' ').Append(F(c1y)).Append(' ').Append(F(c2x)).Append(' ')
+                        .Append(F(c2y)).Append(' ').Append(F(ex)).Append(' ').Append(F(ey)).Append(" c ");
+                    else d.Append("C").Append(F(c1x)).Append(',').Append(F(c1y)).Append(' ')
+                        .Append(F(c2x)).Append(',').Append(F(c2y)).Append(' ').Append(F(ex)).Append(',').Append(F(ey));
+                    curX = ex; curY = ey; haveCur = true;
+                    break;
+                }
+            }
+        }
+        return d.ToString();
     }
 
     private void EmitInsertSvg(StringBuilder sb, Insert ins, Transform2D parent, short byBlockAci, double[] byBlockDash, LtpPattern byBlockPat, double ltMul)

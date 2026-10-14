@@ -1123,8 +1123,8 @@ internal partial class ImageEngine
                 case Arc a: ExpandCircle(a.Center.X, a.Center.Y, a.Radius); break; // 必须先于 Circle（fork 继承）
                 case Circle c: ExpandCircle(c.Center.X, c.Center.Y, c.Radius); break;
                 case Ellipse el: ExpandCircle(el.Center.X, el.Center.Y, Math.Max(el.MajorAxis, el.MinorAxis) / 2.0); break;
-                case TextEntity t: Expand(t.InsertPoint.X, t.InsertPoint.Y); break;
-                case MText mt: Expand(mt.InsertPoint.X, mt.InsertPoint.Y); break;
+                case TextEntity t: ExpandTextBox(t.InsertPoint.X, t.InsertPoint.Y, TextMetrics(t), Expand); break;
+                case MText mt: ExpandTextBox(mt.InsertPoint.X, mt.InsertPoint.Y, TextMetrics(mt), Expand); break;
                 case Solid sd:
                     Expand(sd.FirstCorner.X, sd.FirstCorner.Y); Expand(sd.SecondCorner.X, sd.SecondCorner.Y);
                     Expand(sd.ThirdCorner.X, sd.ThirdCorner.Y); Expand(sd.FourthCorner.X, sd.FourthCorner.Y); break;
@@ -1138,6 +1138,49 @@ internal partial class ImageEngine
             }
         }
         return any;
+    }
+
+    // 文字包围盒估算：TEXT/MText 若只展开基线插入点，会把 ascender/descender 裁出画布
+    // （典型：顶部文字只剩基线附近下半、上环丢失，如 sample-hatch 的 "81,96"）。
+    // 这里按字高/行数/宽度因子估算**轴对齐**文字盒（ascender≈0.85H、descender≈0.25H，左右各扩
+    // 总宽以覆盖中/右对齐）。取轴对齐 AABB（不乘旋转）：任何旋转文字都包含在其 AABB 内，
+    // 既避免旋转角度单位/块内双重旋转的坑，又保证永不裁切（旋转时仅多留少量空白）。
+    private static (double Hw, double Asc, double Desc) TextMetrics(Entity e)
+    {
+        double H = 1.0, wf = 1.0, len = 1.0, rows = 1.0;
+        if (e is TextEntity t)
+        {
+            H = t.Height > 0 ? t.Height : 1.0;
+            wf = t.WidthFactor > 0 ? t.WidthFactor : 1.0;
+            len = Math.Max(1, (t.Value ?? "").Length);
+        }
+        else if (e is MText mt)
+        {
+            H = mt.Height > 0 ? mt.Height : 1.0;
+            // MText 无实体级宽度因子（run 级 \W 各段独立），范围估算取 1.0 即可（行宽按 0.6em 估算已含裕量）。
+            var ls = (mt.Value ?? "").Split(new[] { "\\P", "\n" }, StringSplitOptions.None);
+            rows = Math.Max(1, ls.Length);
+            foreach (var s in ls) len = Math.Max(len, s.Length);
+        }
+        double totalW = H * 0.6 * len * wf;        // 估算文字总宽（平均字宽 0.6em）
+        double Hw = Math.Max(totalW, H);            // 左右各扩展量（覆盖中/右对齐，至少一字宽）
+        double Htot = H * rows * 1.2;               // 总高（含行距）
+        return (Hw, 0.85 * Htot, 0.25 * Htot);
+    }
+
+    // 以 (cx,cy) 为基线锚点的轴对齐文字盒 4 角（局部坐标，供 EntityLocalPoints yield）。
+    private static IEnumerable<XY> TextBoxCorners(double cx, double cy, (double Hw, double Asc, double Desc) m)
+    {
+        yield return new XY(cx - m.Hw, cy - m.Desc);
+        yield return new XY(cx + m.Hw, cy - m.Desc);
+        yield return new XY(cx + m.Hw, cy + m.Asc);
+        yield return new XY(cx - m.Hw, cy + m.Asc);
+    }
+
+    // 以 (cx,cy) 为基线锚点的轴对齐文字盒 4 角，逐角 expand（模型空间）。
+    private static void ExpandTextBox(double cx, double cy, (double Hw, double Asc, double Desc) m, Action<double, double> expand)
+    {
+        foreach (var c in TextBoxCorners(cx, cy, m)) expand(c.X, c.Y);
     }
 
     // 展开 Insert（含嵌套），用于计算范围
@@ -1193,8 +1236,8 @@ internal partial class ImageEngine
         else if (e is Circle c) { yield return new XY(c.Center.X - c.Radius, c.Center.Y - c.Radius); yield return new XY(c.Center.X + c.Radius, c.Center.Y + c.Radius); }
         else if (e is Arc a) { yield return new XY(a.Center.X - a.Radius, a.Center.Y - a.Radius); yield return new XY(a.Center.X + a.Radius, a.Center.Y + a.Radius); }
         else if (e is Ellipse el) { double r = Math.Max(el.MajorAxis, el.MinorAxis); yield return new XY(el.Center.X - r, el.Center.Y - r); yield return new XY(el.Center.X + r, el.Center.Y + r); }
-        else if (e is TextEntity t) yield return new XY(t.InsertPoint.X, t.InsertPoint.Y);
-        else if (e is MText mt) yield return new XY(mt.InsertPoint.X, mt.InsertPoint.Y);
+        else if (e is TextEntity t) { var tm = TextMetrics(t); foreach (var cp in TextBoxCorners(t.InsertPoint.X, t.InsertPoint.Y, tm)) yield return cp; }
+        else if (e is MText mt) { var tm = TextMetrics(mt); foreach (var cp in TextBoxCorners(mt.InsertPoint.X, mt.InsertPoint.Y, tm)) yield return cp; }
         else if (e is Solid so)
         {
             yield return new XY(so.FirstCorner.X, so.FirstCorner.Y);

@@ -703,11 +703,11 @@ internal partial class ImageEngine
         {
             // 变宽填充折线回退（ConstantWidth = DWG 往返后的等宽形式，语义相同）
             if ((p2.Vertices.FirstOrDefault()?.StartWidth ?? 0) > 0 || p2.ConstantWidth > 0) return false;
-            var l = new List<(double X, double Y)>(p2.Vertices.Count);
-            foreach (var v in p2.Vertices) { Apply(v.Location.X, v.Location.Y, out double x, out double y); l.Add((x, y)); }
-            if (p2.IsClosed && l.Count >= 3) l.Add(l[0]); // 补闭合段，模式可走完整个环
-            pts = l;
-            return l.Count >= 2;
+            // 含 bulge 弧段：必须用 LwPolylineSamplePoints 采样（与主路径一致）。
+            // 旧实现只取 v.Location（丢 Bulge）→ 带凸度的圆环/弧在复杂线型下被沿"控制点连线"
+            // （顶点折线）走查 = 多绘制控制线（#63）。LwPolylineSamplePoints 已含闭合段（首尾回到 v0）。
+            pts = LwPolylineSamplePoints(p2, tr);
+            return pts.Count >= 2;
         }
         if (ent is Polyline3D p3)
         {
@@ -2991,13 +2991,17 @@ internal partial class ImageEngine
                     hx[i] = cp[i].X * wi; hy[i] = cp[i].Y * wi; hw[i] = wi;
                 }
                 pts.AddRange(SampleNurbs(sp.Knots.ToArray(), hx, hy, hw, p, samplesPerSpan, tr));
-                return pts;
             }
-            for (int i = 0; i < n; i++) AddPoint(pts, cp[i].X, cp[i].Y, tr); // 回退：控制点折线
-            return pts;
+            else
+                for (int i = 0; i < n; i++) AddPoint(pts, cp[i].X, cp[i].Y, tr); // 回退：控制点折线
         }
-        if (sp.FitPoints != null)
+        else if (sp.FitPoints != null)
             foreach (var fp in sp.FitPoints) AddPoint(pts, fp.X, fp.Y, tr);
+
+        // 闭合样条：SampleNurbs 用 span 中点采样（j+0.5/ns），首尾采样点不精确重合，
+        // 三引擎描边又都按开放路径发射（SVG 无 Z / PNG closed=false / PDF 无闭合）→ 闭合样条
+        // 首尾留缺口（#52）。这里补回首采样点使首尾重合，描边自然闭合（三引擎共用本方法）。
+        if (sp.IsClosed && pts.Count >= 2) pts.Add(pts[0]);
         return pts;
     }
 

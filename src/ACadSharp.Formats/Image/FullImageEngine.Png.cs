@@ -804,6 +804,10 @@ internal partial class ImageEngine
                 // 若传 int 会选中 TryGetGlyph(int codepoint) 重载，内部把 gi 当 Unicode 码点再查一次
                 // cmap → 取错字形（多个字符 gi 作码点映射到同一/默认 glyph）→ 文字乱码/竖条纹。
                 fr.TryGetGlyph((ushort)gi, sink);
+                // 同一字形的所有轮廓（外环 + 字怀内环）收集后【一次性】Fill(evenOdd=多轮廓)：
+                // 逐轮廓单独 Fill(evenOdd:false) 会把字怀内环也独立填实 → 中间空洞粘连（O/A/0/8/9/6 的孔被堵）。
+                // 奇偶规则下内环挖空，与 HATCH 实心路径（evenOdd = contours.Count>1）一致。
+                var glyphContours = new List<List<RasterCanvas.P>>();
                 foreach (var contour in sink.Contours)
                 {
                     if (contour.Count < 3) continue;
@@ -822,9 +826,11 @@ internal partial class ImageEngine
                     if (px.Count >= 3)
                     {
                         px.Add(px[0]); // 闭合轮廓
-                        _rc.Fill(new List<List<RasterCanvas.P>> { px }, false, col);
+                        glyphContours.Add(px);
                     }
                 }
+                if (glyphContours.Count > 0)
+                    _rc.Fill(glyphContours, glyphContours.Count > 1, col);
             }
             double adv = fr.GetAdvanceWidth(ch) / upm;
             penAdv += adv * wf;

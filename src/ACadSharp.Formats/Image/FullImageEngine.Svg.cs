@@ -653,6 +653,8 @@ internal partial class ImageEngine
             AppendSpanPath(d, pts, cum, at - dd / 2, at + dd / 2, fx, fy, pdf);
             return;
         }
+        // shape 缩放 = 组码46 标称缩放（已含 $LTSCALE 全局线型缩放，见 GetActiveLineType→pat.Scaled）。
+        // 不额外硬编码 0.5——该缩放由图纸 header $LTSCALE 决定，链路已正确应用。
         double S = seg.ShapeScale > 1e-9 ? seg.ShapeScale : 1.0;
         double ang;
         switch (seg.RotType)

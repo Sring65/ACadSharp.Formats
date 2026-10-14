@@ -563,8 +563,12 @@ internal partial class ImageEngine
         int i = 0, guard = 0;
         while (pos < L - 1e-9 && guard++ < 50000000)
         {
-            double span = dash[i % dash.Length];
-            if (span > 1e-9)
+            int idx = i % dash.Length;
+            double span = dash[idx];
+            // dash 数组按 [dash, gap, dash, gap, ...] 正长度交替（dash 起头）：
+            // 偶数下标=dash 段（落笔）、奇数下标=gap 段（跳过）。
+            // 旧实现每段都落笔 → 简单虚线（DASHED 等）在 PNG 下被画成实线。
+            if (idx % 2 == 0 && span > 1e-9)
             {
                 var sub = new List<RasterCanvas.P>();
                 AppendSpanPathPx(sub, pts, cum, pos, Math.Min(pos + span, L));
@@ -701,8 +705,10 @@ internal partial class ImageEngine
         double ang;
         switch (seg.RotType)
         {
-            case 1: ang = Math.Atan2(ty, tx); break;   // relative：字形 X 轴沿路径切向
-            case 2: ang = seg.ShapeRot * Math.PI / 180.0; break; // absolute
+            // relative（74 bit0=0）：字形角 = 切向角 + 组码50 偏移。漏加 ShapeRot 会让
+            // "180° 交替"线型（BATTING 弹簧）两个 shape 同向画成锯齿。
+            case 1: ang = Math.Atan2(ty, tx) + seg.ShapeRot * Math.PI / 180.0; break;
+            case 2: ang = seg.ShapeRot * Math.PI / 180.0; break; // absolute（74 bit0=1）
             default: ang = 0; break;                   // upright
         }
         double ca = Math.Cos(ang), sa = Math.Sin(ang);

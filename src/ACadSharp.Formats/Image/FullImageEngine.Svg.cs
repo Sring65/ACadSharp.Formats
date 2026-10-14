@@ -651,8 +651,11 @@ internal partial class ImageEngine
         double ang;
         switch (seg.RotType)
         {
-            case 1: ang = Math.Atan2(ty, tx); break;   // relative：字形 X 轴沿路径切向
-            case 2: ang = seg.ShapeRot * Math.PI / 180.0; break; // absolute
+            // relative（74 bit0=0）：字形角 = 路径切向角 + 组码50 偏移（Rotation）。
+            // 旧实现漏加 ShapeRot → BATTING 等"180° 交替"线型两个 shape 同向（∩∩∩）画成锯齿，
+            // 正确应 ∩(切向) 与 ∪(切向+180°) 交替成弹簧。
+            case 1: ang = Math.Atan2(ty, tx) + seg.ShapeRot * Math.PI / 180.0; break;
+            case 2: ang = seg.ShapeRot * Math.PI / 180.0; break; // absolute（74 bit0=1）
             default: ang = 0; break;                   // upright
         }
         double ca = Math.Cos(ang), sa = Math.Sin(ang);

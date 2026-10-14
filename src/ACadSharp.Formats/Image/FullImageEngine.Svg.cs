@@ -2719,22 +2719,25 @@ internal partial class ImageEngine
         }
     }
 
-    // bulge 分解：p1→p2 弦 + bulge=tan(θ/4) → 弧（逆时针 θ=4*atan(bulge)）
+    // bulge 分解：p1→p2 弦 + bulge=tan(θ/4) → 弧（带符号 sweep θ=4*atan(bulge)）。
+    // 圆心计算与 ACadSharp.Arc.GetCenter **逐字一致**（权威参考，PolylineExtensions.GetPoints 同源）：
+    // 从 p1 起、沿 p1→p2 方向角偏转 sign(bulge)*gamma 定位圆心。
+    // 旧"弦中垂线"版本把圆心取到弦的**错误一侧**（sgn*h 符号反了），导致采样时
+    // a1+θ 的落点偏离分段第二点 ≈ 弦长（实测云形段偏离 18.68），弧线终点对不上 V2，
+    // 留下缺口被折线补成直线弦 = 用户所见"凸度弧度多渲染了线段 / 云形出现直线尖刺"。
+    // 修复后 a1+θ ≡ a2 精确命中 V2，相邻弧段首尾相接、无直线弦。
     private static (XY Center, double Radius, double StartDeg, double EndDeg) ArcFromBulge(XY p1, XY p2, double bulge)
     {
         double dx = p2.X - p1.X, dy = p2.Y - p1.Y;
         double chord = Math.Sqrt(dx * dx + dy * dy);
         if (chord < 1e-12) return (p1, 0, 0, 0);
-        double theta = 4.0 * Math.Atan(bulge);
-        double r = chord / (2.0 * Math.Abs(Math.Sin(theta / 2.0)));
+        double theta = 4.0 * Math.Atan(Math.Abs(bulge));            // 正角（绝对值）
+        double r = chord / (2.0 * Math.Sin(theta / 2.0));
         if (!double.IsFinite(r) || r <= 0) return (p1, 0, 0, 0);
-        double midX = (p1.X + p2.X) / 2, midY = (p1.Y + p2.Y) / 2;
-        // 圆心在弦中垂线上，距离 h = |r*cos(theta/2)|，方向取决于 bulge 符号
-        double h = r * Math.Abs(Math.Cos(theta / 2.0));
-        double ux = dx / chord, uy = dy / chord;
-        double sgn = bulge >= 0 ? 1.0 : -1.0;
-        double cx = midX - sgn * h * (-uy);
-        double cy = midY - sgn * h * (ux);
+        double gamma = (Math.PI - theta) / 2.0;
+        double phi = Math.Atan2(dy, dx) + Math.Sign(bulge) * gamma; // p1→p2 方向 + 符号偏转
+        double cx = p1.X + r * Math.Cos(phi);
+        double cy = p1.Y + r * Math.Sin(phi);
         double a1 = Math.Atan2(p1.Y - cy, p1.X - cx) * 180.0 / Math.PI;
         double a2 = Math.Atan2(p2.Y - cy, p2.X - cx) * 180.0 / Math.PI;
         return (new XY(cx, cy), r, a1, a2);

@@ -2772,9 +2772,19 @@ internal partial class ImageEngine
                 var (c, r, sdeg, edeg) = ArcFromBulge(new XY(v1.X, v1.Y), new XY(v2.X, v2.Y), bulge);
                 if (r > 0 && xy.Count > 0)
                 {
-                    // 去掉当前弧起点 v1（=xy 末点），由 AppendArcPoints 从 v1 重新采样（避免重复点）
-                    xy.RemoveAt(xy.Count - 1);
-                    AppendArcPoints(xy, c, r, sdeg, edeg, bulge >= 0, tr);
+                    // 用**带符号 sweep 角** theta=4·atan(bulge) 从起始角 a1 直接采样到 a2：
+                    // AppendArcPoints 会把 span 无条件规整到 [0,2π]（假设逆时针），对 bulge<0 的
+                    // 顺时针小弧（如 -90°）误画成 270° 补大弧 → 全 bulge 圆环渲染成波浪形。
+                    // a1+theta ≡ a2（mod 2π），故从 a1 沿符号方向走 theta 正好 p1→p2。
+                    xy.RemoveAt(xy.Count - 1); // 去掉 v1（弧从 v1 重新采样）
+                    double theta = 4.0 * Math.Atan(bulge); // 带符号 sweep（弧度）
+                    double a1 = sdeg * Math.PI / 180.0;
+                    int seg = Math.Max(8, (int)Math.Ceiling(Math.Abs(theta) / (Math.PI / 90.0))); // 每 2°
+                    for (int k = 0; k <= seg; k++)
+                    {
+                        double ang = a1 + theta * k / seg;
+                        Push(c.X + r * Math.Cos(ang), c.Y + r * Math.Sin(ang));
+                    }
                     continue;
                 }
             }

@@ -517,19 +517,21 @@ internal partial class ImageEngine
                         }
                     if (pts.Count >= 2)
                     {
-                        var d = new StringBuilder();
-                        for (int i = 0; i < pts.Count; i++)
-                            d.Append(F(Sx(pts[i].X)) + " " + F(Py(pts[i].Y)) + " " + (i == 0 ? "m" : "l") + " ");
-                        PdfStroke(cs, col, w, dash, d + "S");
-                        // 箭头（尖端 pts[0]）
                         double alen = ld.TextHeight > 1e-9 ? ld.TextHeight * scaleMul : Math.Max(w * 6.0, 4.0 * (tr?.Scale ?? 1.0));
-                        if (LeaderArrowWings(ld, pts, alen, out var w1x, out var w1y, out var w2x, out var w2y))
+                        // 引线：起点移到箭头底边中心，避免细线穿入实心三角内部
+                        var linePts = pts;
+                        if (LeaderArrowBase(pts, alen, out var lbx, out var lby))
                         {
-                            var da = new StringBuilder();
-                            da.Append(F(Sx(w1x)) + " " + F(Py(w1y)) + " m " + F(Sx(pts[0].X)) + " " + F(Py(pts[0].Y)) + " l ");
-                            da.Append(F(Sx(pts[0].X)) + " " + F(Py(pts[0].Y)) + " m " + F(Sx(w2x)) + " " + F(Py(w2y)) + " l S");
-                            PdfStroke(cs, col, w, null, da.ToString());
+                            linePts = new List<(double X, double Y)>(pts);
+                            linePts[0] = (lbx, lby);
                         }
+                        var d = new StringBuilder();
+                        for (int i = 0; i < linePts.Count; i++)
+                            d.Append(F(Sx(linePts[i].X)) + " " + F(Py(linePts[i].Y)) + " " + (i == 0 ? "m" : "l") + " ");
+                        PdfStroke(cs, col, w, dash, d + "S");
+                        // 实心箭头三角（AutoCAD LEADER 默认实心；尖端 pts[0] 指向目标端）
+                        if (LeaderArrowWings(ld, pts, alen, out var w1x, out var w1y, out var w2x, out var w2y))
+                            PdfQuadFill(cs, col, new List<(double X, double Y)> { (pts[0].X, pts[0].Y), (w1x, w1y), (w2x, w2y) });
                     }
                 }
                 break;

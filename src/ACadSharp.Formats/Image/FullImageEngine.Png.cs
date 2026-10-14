@@ -484,13 +484,19 @@ internal partial class ImageEngine
                         }
                     if (pts.Count >= 2)
                     {
-                        StrokePts(pts, false, col, w, dash);
                         double alen = ld.TextHeight > 1e-9 ? ld.TextHeight * scaleMul : Math.Max(w * 6.0, 4.0 * (tr?.Scale ?? 1.0));
-                        if (LeaderArrowWings(ld, pts, alen, out var w1x, out var w1y, out var w2x, out var w2y))
+                        // 引线：起点移到箭头底边中心，避免细线穿入实心三角内部
+                        if (LeaderArrowBase(pts, alen, out var lbx, out var lby))
                         {
-                            StrokePts(new List<(double X, double Y)> { (w1x, w1y), (pts[0].X, pts[0].Y) }, false, col, w, null);
-                            StrokePts(new List<(double X, double Y)> { (w2x, w2y), (pts[0].X, pts[0].Y) }, false, col, w, null);
+                            var lp = new List<(double X, double Y)>(pts);
+                            lp[0] = (lbx, lby);
+                            StrokePts(lp, false, col, w, dash);
                         }
+                        else
+                            StrokePts(pts, false, col, w, dash);
+                        // 实心箭头三角（AutoCAD LEADER 默认实心；尖端 pts[0] 指向目标端）
+                        if (LeaderArrowWings(ld, pts, alen, out var w1x, out var w1y, out var w2x, out var w2y))
+                            EmitQuadFillPng(new List<(double X, double Y)> { (pts[0].X, pts[0].Y), (w1x, w1y), (w2x, w2y) }, col);
                     }
                 }
                 break;

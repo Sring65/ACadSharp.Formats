@@ -1126,8 +1126,9 @@ internal partial class ImageEngine
         return pts;
     }
 
-    // Leader 箭头两翼（三引擎共享）：尖端 pts[0]，沿 pts[0]→pts[1] 反方向张开 ±angle 的两翼。
-    // 返回 (左翼世界点, 右翼世界点)；顶点不足或退化返回 false。箭头长 = TextHeight（>0 时）否则线宽倍数。
+    // Leader 实心箭头两翼（三引擎共享）：尖端 pts[0]（指向目标点），两翼沿 pts[0]→pts[1] 方向张开 ±30°，
+    // 与尖端构成实心三角（尖端在 pts[0]、底边在两翼之间）。返回 (左翼, 右翼)；顶点不足或退化返回 false。
+    // 箭头长 arrowLen = TextHeight（>0 时）否则线宽倍数。底边中心（折线止点）= 尖端 + (pts[0]→pts[1])方向 * arrowLen*cos30°。
     private static bool LeaderArrowWings(Leader ld, List<(double X, double Y)> pts, double arrowLen,
         out double w1x, out double w1y, out double w2x, out double w2y)
     {
@@ -1142,6 +1143,22 @@ internal partial class ImageEngine
         double a2 = baseAng - 0.5236; // -30°
         w1x = ax - arrowLen * Math.Cos(a1); w1y = ay - arrowLen * Math.Sin(a1);
         w2x = ax - arrowLen * Math.Cos(a2); w2y = ay - arrowLen * Math.Sin(a2);
+        return true;
+    }
+
+    // 箭头底边中心（折线止点）：尖端 pts[0] 沿指向 pts[1] 方向推进 arrowLen*cos30°。
+    // 实心三角（尖端+两翼）的底边中点即此处，引线止于该点避免细线穿入三角内部。
+    private static bool LeaderArrowBase(List<(double X, double Y)> pts, double arrowLen, out double bx, out double by)
+    {
+        bx = by = 0;
+        if (pts == null || pts.Count < 2) return false;
+        double dx = pts[1].X - pts[0].X, dy = pts[1].Y - pts[0].Y;
+        double len = Math.Sqrt(dx * dx + dy * dy);
+        if (len < 1e-9) return false;
+        // 推进距离 = arrowLen*cos30，钳制不超过首段长度（箭头比首段长时折线止于 pts[1]，避免反向）
+        double adv = Math.Min(arrowLen * Math.Cos(0.5236), len);
+        bx = pts[0].X + dx / len * adv;
+        by = pts[0].Y + dy / len * adv;
         return true;
     }
 
@@ -1657,14 +1674,19 @@ internal partial class ImageEngine
                         }
                     if (pts.Count >= 2)
                     {
-                        EmitPolyline(sb, pts, col, w, false, dash);
-                        // 箭头（仅首段，尖端 pts[0]）
                         double alen = ld.TextHeight > 1e-9 ? ld.TextHeight * scaleMul : Math.Max(w * 6.0, 4.0 * (tr?.Scale ?? 1.0));
-                        if (LeaderArrowWings(ld, pts, alen, out var w1x, out var w1y, out var w2x, out var w2y))
+                        // 引线：起点移到箭头底边中心，避免细线穿入实心三角内部
+                        if (LeaderArrowBase(pts, alen, out var lbx, out var lby))
                         {
-                            EmitLine(sb, w1x, w1y, pts[0].X, pts[0].Y, col, w, null);
-                            EmitLine(sb, w2x, w2y, pts[0].X, pts[0].Y, col, w, null);
+                            var lp = new List<(double X, double Y)>(pts);
+                            lp[0] = (lbx, lby);
+                            EmitPolyline(sb, lp, col, w, false, dash);
                         }
+                        else
+                            EmitPolyline(sb, pts, col, w, false, dash);
+                        // 实心箭头三角（AutoCAD LEADER 默认实心；尖端 pts[0] 指向目标端）
+                        if (LeaderArrowWings(ld, pts, alen, out var w1x, out var w1y, out var w2x, out var w2y))
+                            EmitQuadFill(sb, new List<(double X, double Y)> { (pts[0].X, pts[0].Y), (w1x, w1y), (w2x, w2y) }, col);
                     }
                 }
                 break;

@@ -341,8 +341,9 @@ internal partial class ImageEngine
                     string col = ColorOf(EntityAciIndex(ent), layerAci, byBlockAci);
                     if (TryEmitComplexPng(ent, tr, pat, col, StrokeWidth(ent, scaleMul))) break;
                     var (cx, cy) = tr == null ? (el.Center.X, el.Center.Y) : tr.Apply(el.Center.X, el.Center.Y);
-                    double rx = el.MajorAxis * (tr?.Scale ?? 1.0);
-                    double ry = el.MinorAxis * (tr?.Scale ?? 1.0);
+                    // fork MajorAxis/MinorAxis 为主/短轴全长(2a/2b)，采样点用半轴 → 各除以 2
+                    double rx = el.MajorAxis / 2.0 * (tr?.Scale ?? 1.0);
+                    double ry = el.MinorAxis / 2.0 * (tr?.Scale ?? 1.0);
                     if (rx > 0 && ry > 0)
                     {
                         double rot = el.Rotation * 180.0 / Math.PI + (tr?.Rotation ?? 0.0);

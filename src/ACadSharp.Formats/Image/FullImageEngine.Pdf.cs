@@ -389,7 +389,8 @@ internal partial class ImageEngine
                 {
                     if (TryEmitComplexPdf(cs, ent, tr, pat, col, StrokeWidth(ent, scaleMul))) break;
                     var (cx, cy) = tr == null ? (el.Center.X, el.Center.Y) : tr.Apply(el.Center.X, el.Center.Y);
-                    double rx = el.MajorAxis * (tr?.Scale ?? 1.0), ry = el.MinorAxis * (tr?.Scale ?? 1.0);
+                    // fork MajorAxis/MinorAxis 为主/短轴全长(2a/2b)，PdfEllipse 用半轴 → 各除以 2
+                    double rx = el.MajorAxis / 2.0 * (tr?.Scale ?? 1.0), ry = el.MinorAxis / 2.0 * (tr?.Scale ?? 1.0);
                     double rot = el.Rotation * 180.0 / Math.PI + (tr?.Rotation ?? 0.0); // fork 弧度 → 度
                     PdfEllipse(cs, col, StrokeWidth(ent, scaleMul), dash, Sx(cx), Py(cy), rx, ry, rot);
                 }

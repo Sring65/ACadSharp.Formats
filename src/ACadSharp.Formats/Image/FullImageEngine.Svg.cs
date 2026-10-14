@@ -68,12 +68,14 @@ internal partial class ImageEngine
         return t;
     }
 
-    // ACI 索引 → 十六进制颜色。ACI 7 是 AutoCAD 的"白/黑"色：
-    // 黑底显示白色，白底显示黑色（与 AutoCAD 模型空间切换布局背景的行为一致）。
+    // ACI 索引 → 十六进制颜色。ACI 7 是 AutoCAD 的"白/黑"自适应色：
+    // 黑底显示白色；白底（--white）或透明底（--transparent，叠加到未知/通常浅色页面）显示黑色，
+    // 与 AutoCAD 模型空间切换布局背景的行为一致。此前仅白底映射黑、透明底仍映射白 →
+    // 透明底 PNG/SVG 上 ACI7 图元（图层 0/Defpoints 的线、ByBlock 文字等）不可见。
     private string AciColor(int idx)
     {
         if (idx <= 0 || idx >= 256) idx = 7;
-        if (_whiteBg && idx == 7) return "#000000";
+        if (idx == 7 && (_whiteBg || _transparentBg)) return "#000000";
         return AciHex[idx];
     }
 
@@ -1120,7 +1122,7 @@ internal partial class ImageEngine
                 case Wipeout wo: foreach (var p in WipeoutWorldPoly(wo, null)) Expand(p.X, p.Y); break;
                 case Arc a: ExpandCircle(a.Center.X, a.Center.Y, a.Radius); break; // 必须先于 Circle（fork 继承）
                 case Circle c: ExpandCircle(c.Center.X, c.Center.Y, c.Radius); break;
-                case Ellipse el: ExpandCircle(el.Center.X, el.Center.Y, Math.Max(el.MajorAxis, el.MinorAxis)); break;
+                case Ellipse el: ExpandCircle(el.Center.X, el.Center.Y, Math.Max(el.MajorAxis, el.MinorAxis) / 2.0); break;
                 case TextEntity t: Expand(t.InsertPoint.X, t.InsertPoint.Y); break;
                 case MText mt: Expand(mt.InsertPoint.X, mt.InsertPoint.Y); break;
                 case Solid sd:
@@ -1422,9 +1424,10 @@ internal partial class ImageEngine
                     string col = ColorOf(EntityAciIndex(ent), layerAci, byBlockAci);
                     if (TryEmitComplexSvg(sb, ent, tr, pat, col, StrokeWidth(ent, scaleMul))) break;
                     var (cx, cy) = tr == null ? (el.Center.X, el.Center.Y) : tr.Apply(el.Center.X, el.Center.Y);
-                    // 注意：与参考实现一致——netDxf MajorAxis=全长(2a)，此处 fork MajorAxis 同为全长（像素 parity）
-                    double rx = el.MajorAxis * (tr?.Scale ?? 1.0);
-                    double ry = el.MinorAxis * (tr?.Scale ?? 1.0);
+                    // fork MajorAxis=主轴全长(2a)、MinorAxis=短轴全长(2b)；EmitEllipse 的 rx/ry 是半轴
+                    // → 各除以 2（此前误用全长当半轴，椭圆画成 2 倍大小，与 AutoCAD 不一致）
+                    double rx = el.MajorAxis / 2.0 * (tr?.Scale ?? 1.0);
+                    double ry = el.MinorAxis / 2.0 * (tr?.Scale ?? 1.0);
                     double rot = el.Rotation * 180.0 / Math.PI + (tr?.Rotation ?? 0.0); // fork 弧度 → 度
                     EmitEllipse(sb, cx, cy, rx, ry, rot, col, StrokeWidth(ent, scaleMul), dash);
                 }
@@ -2599,8 +2602,10 @@ internal partial class ImageEngine
         sb.AppendLine($"  <text x=\"{F(sx)}\" y=\"{F(sy)}\" font-family=\"{fontFamily}\" font-size=\"{F(fs)}\" fill=\"{fill}\"{trs}>{esc}</text>");
     }
 
+    // Solid/Face3D 四角（DXF 组码 10/11/12/13 = 角1..4）的 CAD 绕序是 1→2→4→3（对角配对 1-2 与 3-4 为两条对边）。
+    // 直接按 1→2→3→4 连会画成对角交叉的沙漏形（典型：表格蓝色背景行被填成交叉状）。
     private static List<(double X, double Y)> QuadPts(XYZ a, XYZ b, XYZ c, XYZ d, Transform2D tr)
-        => new[] { a, b, c, d }.Select(v => tr == null ? (v.X, v.Y) : tr.Apply(v.X, v.Y)).ToList();
+        => new[] { a, b, d, c }.Select(v => tr == null ? (v.X, v.Y) : tr.Apply(v.X, v.Y)).ToList();
 
     private void EmitQuadFill(StringBuilder sb, List<(double X, double Y)> pts, string color)
     {

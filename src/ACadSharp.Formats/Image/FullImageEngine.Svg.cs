@@ -2611,11 +2611,37 @@ internal partial class ImageEngine
     private static List<(double X, double Y)> QuadPts(XYZ a, XYZ b, XYZ c, XYZ d, Transform2D tr)
         => new[] { a, b, c, d }.Select(v => tr == null ? (v.X, v.Y) : tr.Apply(v.X, v.Y)).ToList();
 
-    // Solid(TRACE) 四角语义与 3DFACE 不同：角1-2 与 角3-4 是两条**对边**（对角配对），
-    // 填充绕序须 1→2→4→3（对角 3-4 跳连）。直接 1→2→3→4 会画成对角交叉沙漏（典型：表格蓝色背景行交叉）。
-    // 故 Solid 专用此 helper，与 Face3D 的 QuadPts 区分（上轮误统一为 1→2→4→3 致 Face3D 交叉回归）。
+    // Solid(TRACE) 四角：不同导出器写入约定不一——有的按**顺序四边形**（边 1-2、2-3、3-4、4-1），
+    // 有的按**对角配对**（角1-2 与角3-4 为对边）。两种约定下「角1-2 恒为一条边」，故候选绕序仅两种：
+    //   周长序 1→2→3→4 与 对角序 1→2→4→3，二者**恰有一个**是不自交的简单多边形。
+    // 自交「蝴蝶结」的有向面积相互抵消(趋近 0)，简单多边形面积=真实面积，故取 |有向面积| 较大者即自动选对。
+    // 三角形退化(角4=角1，如 sample-hatch GC526 倒三角)：对角序面积=0、周长序=真实三角面积，自动选周长序。
+    // （历史：硬编码 1→2→4→3 修过"表格蓝底行交叉"，却把顺序四边形的三角 SOLID 画成零面积，故改为自动判别。）
     private static List<(double X, double Y)> SolidQuadPts(XYZ a, XYZ b, XYZ c, XYZ d, Transform2D tr)
-        => new[] { a, b, d, c }.Select(v => tr == null ? (v.X, v.Y) : tr.Apply(v.X, v.Y)).ToList();
+    {
+        (double X, double Y) T(XYZ v) => tr == null ? (v.X, v.Y) : tr.Apply(v.X, v.Y);
+        var pa = T(a);
+        var pb = T(b);
+        var pc = T(c);
+        var pd = T(d);
+        var perimeter = new[] { pa, pb, pc, pd };
+        var diagonal = new[] { pa, pb, pd, pc };
+        var pick = Math.Abs(PolySignedArea(diagonal)) > Math.Abs(PolySignedArea(perimeter)) ? diagonal : perimeter;
+        return pick.ToList();
+    }
+
+    // 多边形有向面积（Shoelace）；自交蝴蝶结因方向相反的叶瓣相消而趋近 0。
+    private static double PolySignedArea((double X, double Y)[] p)
+    {
+        double s = 0;
+        int n = p.Length;
+        for (int i = 0; i < n; i++)
+        {
+            var q = p[(i + 1) % n];
+            s += p[i].X * q.Y - q.X * p[i].Y;
+        }
+        return s / 2.0;
+    }
 
     private void EmitQuadFill(StringBuilder sb, List<(double X, double Y)> pts, string color)
     {

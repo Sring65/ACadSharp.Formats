@@ -802,7 +802,10 @@ internal partial class ImageEngine
             if (gi != 0)
             {
                 var sink = new GlyphSink();
-                fr.TryGetGlyph(gi, sink);
+                // gi 是字形索引（glyph index），必须显式 (ushort) 命中 TryGetGlyph(ushort) 重载。
+                // 若传 int 会选中 TryGetGlyph(int codepoint) 重载，内部把 gi 当 Unicode 码点再查一次
+                // cmap → 取错字形（多个字符 gi 作码点映射到同一/默认 glyph）→ 文字乱码/竖条纹。
+                fr.TryGetGlyph((ushort)gi, sink);
                 foreach (var contour in sink.Contours)
                 {
                     if (contour.Count < 3) continue;

@@ -1313,6 +1313,15 @@ internal partial class ImageEngine
                         // DWG 往返：全顶点等宽被归一为 ConstantWidth（逐顶点置 0）→ 物化为逐顶点宽度
                         foreach (var v in pl.Vertices) { v.StartWidth = pl.ConstantWidth; v.EndWidth = pl.ConstantWidth; }
                     }
+                    // 宽度仅记录在终宽(41)、起宽(40)全 0 的多段线（如云形 0→0.85 均匀宽）：
+                    // 物化起宽=终宽走变宽路径渲染成均匀宽度带，否则按默认线宽细线描边、几何宽度丢失
+                    // （用户反馈"宽度未正常渲染"）。EndWidth 不触发变宽的旧约束在此放宽：只有"全起宽=0
+                    // 且存在终宽>0"才物化，真正的细线（41 也=0）仍走描边，避免误判。
+                    if (!hasTaper && pl.Vertices.Any(v => v.EndWidth > 0))
+                    {
+                        foreach (var v in pl.Vertices) v.StartWidth = Math.Max(v.StartWidth, v.EndWidth);
+                        hasTaper = true;
+                    }
                     if (hasTaper && pts.Count >= 2)
                     {
                         EmitTaperedPolyline(sb, pl, tr, col, scaleMul, dash);

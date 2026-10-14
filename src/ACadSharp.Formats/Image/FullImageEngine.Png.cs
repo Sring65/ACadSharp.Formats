@@ -188,6 +188,13 @@ internal partial class ImageEngine
                     bool hasTaper = pl.Vertices.Any(v => v.StartWidth > 0) || pl.ConstantWidth > 0;
                     if (hasTaper && pl.ConstantWidth > 0 && !pl.Vertices.Any(v => v.StartWidth > 0))
                         foreach (var v in pl.Vertices) { v.StartWidth = pl.ConstantWidth; v.EndWidth = pl.ConstantWidth; }
+                    // 宽度仅记录在终宽(41)、起宽(40)全 0 的多段线（如云形 0→0.85 均匀宽）：物化起宽=终宽走变宽路径
+                    // 渲染成均匀宽度带，否则按默认线宽细线描边、几何宽度丢失（用户反馈"宽度未正常渲染"）。
+                    if (!hasTaper && pl.Vertices.Any(v => v.EndWidth > 0))
+                    {
+                        foreach (var v in pl.Vertices) v.StartWidth = Math.Max(v.StartWidth, v.EndWidth);
+                        hasTaper = true;
+                    }
                     if (hasTaper && pts.Count >= 2)
                     {
                         EmitTaperedPng(pl, tr, col, scaleMul);

@@ -185,16 +185,12 @@ internal partial class ImageEngine
                     var pts = LwPolylineSamplePoints(pl, tr);
                     // 变宽判断看**任意**顶点 StartWidth(40) 或 ConstantWidth(43)（首顶点窄端 sw=0 的纺锤形不能漏判）；
                     // EndWidth(41) 不单独触发（闭合圆环全 sw=0/ew=常数 应走描边+bulge 弧，否则变宽路径退化成 0 宽消失）。
-                    bool hasTaper = pl.Vertices.Any(v => v.StartWidth > 0) || pl.ConstantWidth > 0;
-                    if (hasTaper && pl.ConstantWidth > 0 && !pl.Vertices.Any(v => v.StartWidth > 0))
+                    // 常数宽(43)：全顶点等宽归一形式 → 物化为逐顶点
+                    if (pl.ConstantWidth > 0 && !pl.Vertices.Any(v => v.StartWidth > 0))
                         foreach (var v in pl.Vertices) { v.StartWidth = pl.ConstantWidth; v.EndWidth = pl.ConstantWidth; }
-                    // 宽度仅记录在终宽(41)、起宽(40)全 0 的多段线（如云形 0→0.85 均匀宽）：物化起宽=终宽走变宽路径
-                    // 渲染成均匀宽度带，否则按默认线宽细线描边、几何宽度丢失（用户反馈"宽度未正常渲染"）。
-                    if (!hasTaper && pl.Vertices.Any(v => v.EndWidth > 0))
-                    {
-                        foreach (var v in pl.Vertices) v.StartWidth = Math.Max(v.StartWidth, v.EndWidth);
-                        hasTaper = true;
-                    }
+                    // 变宽：任意顶点 起宽(40)/终宽(41) 非零 或 常数宽(43) 非零 → 走填充变宽路径；逐顶点有效宽度
+                    // 由 TaperedVertexWidths 计算（正确处理"每节起点/终点线宽不等"，与 SVG/PDF 一致）。
+                    bool hasTaper = pl.Vertices.Any(v => v.StartWidth > 0 || v.EndWidth > 0) || pl.ConstantWidth > 0;
                     if (hasTaper && pts.Count >= 2)
                     {
                         EmitTaperedPng(pl, tr, col, scaleMul);
@@ -1021,9 +1017,8 @@ internal partial class ImageEngine
         var verts = pl.Vertices;
         int n = verts.Count;
         if (n < 2 || _rc == null) return;
-        double[] w = new double[n];
-        for (int i = 0; i < n; i++)
-            w[i] = verts[i].StartWidth;
+        // 逐顶点有效宽度：顶点 i 宽 = 本顶点起宽(40)，起宽为0时继承入段终宽(41)
+        double[] w = TaperedVertexWidths(pl);
 
         List<(double X, double Y)> left, right;
         var taper = TryBuildTaperOffset(pl, w, tr, _opt.TaperOffsetBuilder);

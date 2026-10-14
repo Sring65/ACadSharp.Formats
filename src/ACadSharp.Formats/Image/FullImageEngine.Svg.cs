@@ -1307,21 +1307,13 @@ internal partial class ImageEngine
                     // 首顶点恰为窄端（StartWidth=0）的变宽多段线（如闭合纺锤形 0→5→0→5）会被漏判走描边，变宽丢失
                     // （用户反馈"两点间变宽没渲染"）。EndWidth(41) 不单独触发变宽（闭合圆环全 sw=0/ew=常数 应走
                     // 描边+bulge 弧，否则变宽路径会退化成 0 宽消失）。
-                    bool hasTaper = pl.Vertices.Any(v => v.StartWidth > 0) || pl.ConstantWidth > 0;
-                    if (hasTaper && pl.ConstantWidth > 0 && !pl.Vertices.Any(v => v.StartWidth > 0))
-                    {
-                        // DWG 往返：全顶点等宽被归一为 ConstantWidth（逐顶点置 0）→ 物化为逐顶点宽度
+                    // 常数宽(43)：DWG 往返常把全顶点等宽归一为 ConstantWidth（逐顶点置 0）→ 物化为逐顶点
+                    if (pl.ConstantWidth > 0 && !pl.Vertices.Any(v => v.StartWidth > 0))
                         foreach (var v in pl.Vertices) { v.StartWidth = pl.ConstantWidth; v.EndWidth = pl.ConstantWidth; }
-                    }
-                    // 宽度仅记录在终宽(41)、起宽(40)全 0 的多段线（如云形 0→0.85 均匀宽）：
-                    // 物化起宽=终宽走变宽路径渲染成均匀宽度带，否则按默认线宽细线描边、几何宽度丢失
-                    // （用户反馈"宽度未正常渲染"）。EndWidth 不触发变宽的旧约束在此放宽：只有"全起宽=0
-                    // 且存在终宽>0"才物化，真正的细线（41 也=0）仍走描边，避免误判。
-                    if (!hasTaper && pl.Vertices.Any(v => v.EndWidth > 0))
-                    {
-                        foreach (var v in pl.Vertices) v.StartWidth = Math.Max(v.StartWidth, v.EndWidth);
-                        hasTaper = true;
-                    }
+                    // 变宽：任意顶点 起宽(40)/终宽(41) 非零，或 常数宽(43) 非零 → 走填充多边形（变宽）路径；
+                    // 全 0 才按默认线宽(370)细线描边。逐顶点有效宽度由 TaperedVertexWidths 计算
+                    // （顶点宽=本顶点起宽40，起宽为0时继承入段终宽41，正确处理"每节起点/终点线宽不等"）。
+                    bool hasTaper = pl.Vertices.Any(v => v.StartWidth > 0 || v.EndWidth > 0) || pl.ConstantWidth > 0;
                     if (hasTaper && pts.Count >= 2)
                     {
                         EmitTaperedPolyline(sb, pl, tr, col, scaleMul, dash);
@@ -2453,10 +2445,9 @@ internal partial class ImageEngine
         var verts = pl.Vertices;
         int n = verts.Count;
         if (n < 2) return;
-        // 逐顶点宽度（数据单位）：顶点 i 处线宽 = 该顶点 StartWidth
-        double[] w = new double[n];
-        for (int i = 0; i < n; i++)
-            w[i] = verts[i].StartWidth;
+        // 逐顶点有效宽度（数据单位）：顶点 i 宽 = 本顶点起宽(40)，起宽为0时继承入段终宽(41)。
+        // 统一处理"每节起点(40)/终点(41)线宽不等"（云形全 40=0/41=0.85 → 每顶点 0.85 均匀带）。
+        double[] w = TaperedVertexWidths(pl);
 
         List<(double X, double Y)> left, right;
         var taper = TryBuildTaperOffset(pl, w, tr, _opt.TaperOffsetBuilder);
@@ -2750,6 +2741,27 @@ internal partial class ImageEngine
         double a1 = Math.Atan2(p1.Y - cy, p1.X - cx) * 180.0 / Math.PI;
         double a2 = Math.Atan2(p2.Y - cy, p2.X - cx) * 180.0 / Math.PI;
         return (new XY(cx, cy), r, a1, a2);
+    }
+
+    // 变宽折线逐顶点有效宽度（三引擎共享）：AutoCAD 语义——顶点 i 宽度 = 本顶点起宽(40)；
+    // 起宽为 0 时继承入段（顶点 i-1→i）终宽(41)。
+    //  · 连续折线（41[i-1]==40[i]，如纺锤形 40=[0,5,0,5]）：两式等价，w=[0,5,0,5]（零回归）。
+    //  · 不连续折线（如云形全 40=0/41=0.85）：取入段终宽 → 每顶点 0.85，渲染为**均匀带**
+    //    （AutoCAD 实测 4-6px 均匀，非 0→W 楔形锯齿）——旧"物化 max(40,41)"捷径会把真楔形
+    //    （40=0/41=5）也错画成均匀 5，本模型对真楔形正确渐变。
+    //  · 开放折线首顶点无入段 → 用其自身起宽(40)。
+    private static double[] TaperedVertexWidths(LwPolyline pl)
+    {
+        var verts = pl.Vertices;
+        int n = verts.Count;
+        var w = new double[n];
+        for (int i = 0; i < n; i++)
+        {
+            if (verts[i].StartWidth > 0) { w[i] = verts[i].StartWidth; continue; }
+            int pi = pl.IsClosed ? (i - 1 + n) % n : (i - 1);
+            w[i] = (pi >= 0) ? verts[pi].EndWidth : verts[i].StartWidth;
+        }
+        return w;
     }
 
     // LwPolyline 采样为世界系折线点（三引擎共享，含 bulge 弧段）：

@@ -283,11 +283,15 @@ internal partial class ImageEngine
             case Polyline3D p3:
                 {
                     if (TryEmitComplexPdf(cs, ent, tr, pat, col, StrokeWidth(ent, scaleMul))) break;
-                    var pts = p3.Vertices.Select(v => tr == null ? (v.Location.X, v.Location.Y) : tr.Apply(v.Location.X, v.Location.Y)).ToList();
-                    var d = new StringBuilder();
-                    for (int i = 0; i < pts.Count; i++) d.Append(F(Sx(pts[i].X)) + " " + F(Py(pts[i].Y)) + " " + (i == 0 ? "m" : "l") + " ");
-                    if (p3.IsClosed) d.Append("h "); // 闭合 3D 折线补闭合段
-                    PdfStroke(cs, col, StrokeWidth(ent, scaleMul), dash, d + "S");
+                    var pts = p3.Vertices.Where(v => IsDisplayVertex(v)) // 跳过样条框架控制点（不显示）
+                        .Select(v => tr == null ? (v.Location.X, v.Location.Y) : tr.Apply(v.Location.X, v.Location.Y)).ToList();
+                    if (pts.Count >= 2)
+                    {
+                        var d = new StringBuilder();
+                        for (int i = 0; i < pts.Count; i++) d.Append(F(Sx(pts[i].X)) + " " + F(Py(pts[i].Y)) + " " + (i == 0 ? "m" : "l") + " ");
+                        if (p3.IsClosed) d.Append("h "); // 闭合 3D 折线补闭合段
+                        PdfStroke(cs, col, StrokeWidth(ent, scaleMul), dash, d + "S");
+                    }
                 }
                 break;
 
@@ -298,13 +302,17 @@ internal partial class ImageEngine
                     var pts2d = new List<(double X, double Y)>(p2d.Vertices.Count);
                     foreach (var v in p2d.Vertices)
                     {
+                        if (!IsDisplayVertex(v)) continue; // 跳过样条框架控制点（不显示）
                         if (tr == null) pts2d.Add((v.Location.X, v.Location.Y));
                         else { var a = tr.Apply(v.Location.X, v.Location.Y); pts2d.Add((a.Item1, a.Item2)); }
                     }
-                    var d2d = new StringBuilder();
-                    for (int i = 0; i < pts2d.Count; i++) d2d.Append(F(Sx(pts2d[i].X)) + " " + F(Py(pts2d[i].Y)) + " " + (i == 0 ? "m" : "l") + " ");
-                    if (p2d.IsClosed) d2d.Append("h ");
-                    PdfStroke(cs, col, StrokeWidth(ent, scaleMul), dash, d2d + "S");
+                    if (pts2d.Count >= 2)
+                    {
+                        var d2d = new StringBuilder();
+                        for (int i = 0; i < pts2d.Count; i++) d2d.Append(F(Sx(pts2d[i].X)) + " " + F(Py(pts2d[i].Y)) + " " + (i == 0 ? "m" : "l") + " ");
+                        if (p2d.IsClosed) d2d.Append("h ");
+                        PdfStroke(cs, col, StrokeWidth(ent, scaleMul), dash, d2d + "S");
+                    }
                 }
                 break;
 

@@ -207,10 +207,11 @@ internal partial class ImageEngine
                     var pts = new List<(double X, double Y)>(p3.Vertices.Count);
                     foreach (var v in p3.Vertices)
                     {
+                        if (!IsDisplayVertex(v)) continue; // 跳过样条框架控制点（不显示）
                         if (tr == null) pts.Add((v.Location.X, v.Location.Y));
                         else { var a = tr.Apply(v.Location.X, v.Location.Y); pts.Add((a.Item1, a.Item2)); }
                     }
-                    StrokePts(pts, p3.IsClosed, col, StrokeWidth(ent, scaleMul), dash);
+                    if (pts.Count >= 2) StrokePts(pts, p3.IsClosed, col, StrokeWidth(ent, scaleMul), dash);
                 }
                 break;
 
@@ -221,10 +222,11 @@ internal partial class ImageEngine
                     var pts = new List<(double X, double Y)>(p2d.Vertices.Count);
                     foreach (var v in p2d.Vertices)
                     {
+                        if (!IsDisplayVertex(v)) continue; // 跳过样条框架控制点（不显示）
                         if (tr == null) pts.Add((v.Location.X, v.Location.Y));
                         else { var a = tr.Apply(v.Location.X, v.Location.Y); pts.Add((a.Item1, a.Item2)); }
                     }
-                    StrokePts(pts, p2d.IsClosed, col, StrokeWidth(ent, scaleMul), dash);
+                    if (pts.Count >= 2) StrokePts(pts, p2d.IsClosed, col, StrokeWidth(ent, scaleMul), dash);
                 }
                 break;
 

@@ -752,7 +752,11 @@ internal partial class ImageEngine
         if (ent is Polyline3D p3)
         {
             var l3 = new List<(double X, double Y)>(p3.Vertices.Count);
-            foreach (var v in p3.Vertices) { Apply(v.Location.X, v.Location.Y, out double x, out double y); l3.Add((x, y)); }
+            foreach (var v in p3.Vertices)
+            {
+                if (!IsDisplayVertex(v)) continue; // 跳过样条框架控制点（不显示）
+                Apply(v.Location.X, v.Location.Y, out double x, out double y); l3.Add((x, y));
+            }
             if (p3.IsClosed && l3.Count >= 3) l3.Add(l3[0]);
             pts = l3;
             return l3.Count >= 2;
@@ -1162,6 +1166,14 @@ internal partial class ImageEngine
         return true;
     }
 
+    // spline-fit（样条拟合）多段线（POLYLINE 组码 70 bit2=curved）的顶点混合两类：
+    //   SplineVertexFromSplineFitting —— 样条拟合点，AutoCAD 实际渲染的显示路径；
+    //   SplineFrameControlPoint      —— 样条框架控制点，AutoCAD 不显示（仅定义拟合曲线）。
+    // 渲染/范围计算只取拟合点，否则控制点之间的连线会画出超长直线（"多段线多渲染控制线"）。
+    // 普通（非拟合）多段线顶点不带该标志，不受影响。
+    private static bool IsDisplayVertex(ACadSharp.Entities.Vertex v)
+        => v != null && !v.Flags.HasFlag(ACadSharp.Entities.VertexFlags.SplineFrameControlPoint);
+
     private IEnumerable<Entity> AllEntities()
     {
         foreach (var e in _doc.ModelSpace.Entities)
@@ -1194,8 +1206,8 @@ internal partial class ImageEngine
                 case Point pt: Expand(pt.Location.X, pt.Location.Y); break;
                 case Line ln: Expand(ln.StartPoint.X, ln.StartPoint.Y); Expand(ln.EndPoint.X, ln.EndPoint.Y); break;
                 case LwPolyline p2: foreach (var p in LwPolylineSamplePoints(p2, null)) Expand(p.X, p.Y); break; // 含 bulge 弧段范围
-                case Polyline3D p3: foreach (var v in p3.Vertices) Expand(v.Location.X, v.Location.Y); break;
-                case Polyline2D p2d: foreach (var v in p2d.Vertices) Expand(v.Location.X, v.Location.Y); break;
+                case Polyline3D p3: foreach (var v in p3.Vertices) if (IsDisplayVertex(v)) Expand(v.Location.X, v.Location.Y); break;
+                case Polyline2D p2d: foreach (var v in p2d.Vertices) if (IsDisplayVertex(v)) Expand(v.Location.X, v.Location.Y); break;
                 case Mesh mesh: if (mesh.Vertices != null) foreach (var v in mesh.Vertices) Expand(v.X, v.Y); break;
                 case PolyfaceMesh pf: if (pf.Vertices != null) foreach (var v in pf.Vertices) Expand(v.Location.X, v.Location.Y); break;
                 case PolygonMesh pm: if (pm.Vertices != null) foreach (var v in pm.Vertices) Expand(v.Location.X, v.Location.Y); break;
@@ -1312,7 +1324,7 @@ internal partial class ImageEngine
         if (e is Point pt) yield return new XY(pt.Location.X, pt.Location.Y);
         else if (e is Line ln) { yield return new XY(ln.StartPoint.X, ln.StartPoint.Y); yield return new XY(ln.EndPoint.X, ln.EndPoint.Y); }
         else if (e is LwPolyline p2) foreach (var v in p2.Vertices) yield return new XY(v.Location.X, v.Location.Y);
-        else if (e is Polyline3D p3) foreach (var v in p3.Vertices) yield return new XY(v.Location.X, v.Location.Y);
+        else if (e is Polyline3D p3) foreach (var v in p3.Vertices) if (IsDisplayVertex(v)) yield return new XY(v.Location.X, v.Location.Y);
         else if (e is Circle c) { yield return new XY(c.Center.X - c.Radius, c.Center.Y - c.Radius); yield return new XY(c.Center.X + c.Radius, c.Center.Y + c.Radius); }
         else if (e is Arc a) { yield return new XY(a.Center.X - a.Radius, a.Center.Y - a.Radius); yield return new XY(a.Center.X + a.Radius, a.Center.Y + a.Radius); }
         else if (e is Ellipse el) { double r = Math.Max(el.MajorAxis, el.MinorAxis); yield return new XY(el.Center.X - r, el.Center.Y - r); yield return new XY(el.Center.X + r, el.Center.Y + r); }
@@ -1451,9 +1463,10 @@ internal partial class ImageEngine
                 {
                     string col = ColorOf(EntityAciIndex(ent), layerAci, byBlockAci);
                     if (TryEmitComplexSvg(sb, ent, tr, pat, col, StrokeWidth(ent, scaleMul))) break;
-                    var pts = p3.Vertices.Select(v => tr == null ? (v.Location.X, v.Location.Y) : tr.Apply(v.Location.X, v.Location.Y)).ToList();
+                    var pts = p3.Vertices.Where(v => IsDisplayVertex(v)) // 跳过样条框架控制点（不显示）
+                        .Select(v => tr == null ? (v.Location.X, v.Location.Y) : tr.Apply(v.Location.X, v.Location.Y)).ToList();
                     // 闭合 3D 折线需补闭合段（旧版硬编码 false 会漏最后一段）
-                    EmitPolyline(sb, pts, col, StrokeWidth(ent, scaleMul), p3.IsClosed, dash);
+                    if (pts.Count >= 2) EmitPolyline(sb, pts, col, StrokeWidth(ent, scaleMul), p3.IsClosed, dash);
                 }
                 break;
 
@@ -1465,10 +1478,11 @@ internal partial class ImageEngine
                     var pts = new List<(double X, double Y)>(p2d.Vertices.Count);
                     foreach (var v in p2d.Vertices)
                     {
+                        if (!IsDisplayVertex(v)) continue; // 跳过样条框架控制点（不显示）
                         var p = tr == null ? (v.Location.X, v.Location.Y) : tr.Apply(v.Location.X, v.Location.Y);
                         pts.Add(p);
                     }
-                    EmitPolyline(sb, pts, col, StrokeWidth(ent, scaleMul), p2d.IsClosed, dash);
+                    if (pts.Count >= 2) EmitPolyline(sb, pts, col, StrokeWidth(ent, scaleMul), p2d.IsClosed, dash);
                 }
                 break;
 

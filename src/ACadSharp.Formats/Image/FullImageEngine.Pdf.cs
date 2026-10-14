@@ -258,16 +258,12 @@ internal partial class ImageEngine
             case LwPolyline pl:
                 {
                     if (TryEmitComplexPdf(cs, ent, tr, pat, col, StrokeWidth(ent, scaleMul))) break;
-                    // 几何宽度（组码43，数据单位，真实加粗）：>0 时按 CAD 语义渲染为填充多边形
-                    // DWG 往返：全顶点等宽被归一为 ConstantWidth（逐顶点置 0）——先物化为逐顶点宽度，
-                    // 再走与 OFF 路由（netDxf 逐顶点 StartWidth）完全相同的 tapered 逻辑。
-                    double sw = pl.Vertices.FirstOrDefault()?.StartWidth ?? 0;
-                    if (sw <= 0 && pl.ConstantWidth > 0)
-                    {
+                    // 变宽判断看**任意**顶点 StartWidth(40) 或 ConstantWidth(43)（首顶点窄端 sw=0 的纺锤形不能漏判）；
+                    // EndWidth(41) 不单独触发（闭合圆环全 sw=0/ew=常数 应走描边+bulge 弧，否则变宽路径退化成 0 宽消失）。
+                    bool hasTaper = pl.Vertices.Any(v => v.StartWidth > 0) || pl.ConstantWidth > 0;
+                    if (hasTaper && pl.ConstantWidth > 0 && !pl.Vertices.Any(v => v.StartWidth > 0))
                         foreach (var v in pl.Vertices) { v.StartWidth = pl.ConstantWidth; v.EndWidth = pl.ConstantWidth; }
-                        sw = pl.ConstantWidth;
-                    }
-                    if (sw > 0 && pl.Vertices.Count >= 2)
+                    if (hasTaper && pl.Vertices.Count >= 2)
                     {
                         PdfTaperedPolyline(cs, pl, tr, col, dash);
                         break;

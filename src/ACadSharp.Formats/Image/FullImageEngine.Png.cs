@@ -183,14 +183,12 @@ internal partial class ImageEngine
                     if (TryEmitComplexPng(ent, tr, pat, col, StrokeWidth(ent, scaleMul))) break;
                     // 普通描边路径采样世界折线点（含 bulge 弧段）；变宽路径走 EmitTaperedPng（自有 bulge 逻辑）
                     var pts = LwPolylineSamplePoints(pl, tr);
-                    // 几何宽度（组码43，数据单位，真实加粗）：>0 时按 CAD 语义渲染为"填充多边形"；否则按线宽(370)描边。
-                    double sw = pl.Vertices.FirstOrDefault()?.StartWidth ?? 0;
-                    if (sw <= 0 && pl.ConstantWidth > 0)
-                    {
+                    // 变宽判断看**任意**顶点 StartWidth(40) 或 ConstantWidth(43)（首顶点窄端 sw=0 的纺锤形不能漏判）；
+                    // EndWidth(41) 不单独触发（闭合圆环全 sw=0/ew=常数 应走描边+bulge 弧，否则变宽路径退化成 0 宽消失）。
+                    bool hasTaper = pl.Vertices.Any(v => v.StartWidth > 0) || pl.ConstantWidth > 0;
+                    if (hasTaper && pl.ConstantWidth > 0 && !pl.Vertices.Any(v => v.StartWidth > 0))
                         foreach (var v in pl.Vertices) { v.StartWidth = pl.ConstantWidth; v.EndWidth = pl.ConstantWidth; }
-                        sw = pl.ConstantWidth;
-                    }
-                    if (sw > 0 && pts.Count >= 2)
+                    if (hasTaper && pts.Count >= 2)
                     {
                         EmitTaperedPng(pl, tr, col, scaleMul);
                         break;

@@ -1302,16 +1302,18 @@ internal partial class ImageEngine
                     if (TryEmitComplexSvg(sb, ent, tr, pat, col, StrokeWidth(ent, scaleMul))) break;
                     // 普通描边路径采样世界折线点（含 bulge 弧段）；变宽路径走 EmitTaperedPolyline（自有 bulge 逻辑）
                     var pts = LwPolylineSamplePoints(pl, tr);
-                    // 几何宽度（组码43，数据单位，真实加粗）：>0 时按 CAD 语义渲染为"填充多边形"；否则按线宽(370)描边。
-                    // DWG 往返：全顶点等宽被 DwgStreamExporter/AcadDwgOperator 归一为 ConstantWidth（逐顶点置 0）——
-                    // 先物化为逐顶点宽度，再走与 OFF 路由（netDxf 逐顶点 StartWidth）完全相同的 tapered 逻辑。
-                    double sw = pl.Vertices.FirstOrDefault()?.StartWidth ?? 0;
-                    if (sw <= 0 && pl.ConstantWidth > 0)
+                    // 几何宽度（组码43 常数宽 / 40 逐顶点起宽）：>0 时按 CAD 语义渲染为"填充多边形"（变宽）；否则按线宽(370)描边。
+                    // 关键：判断"是否变宽"须看**任意**顶点 StartWidth(40) 或 ConstantWidth(43)，不能只看首顶点——
+                    // 首顶点恰为窄端（StartWidth=0）的变宽多段线（如闭合纺锤形 0→5→0→5）会被漏判走描边，变宽丢失
+                    // （用户反馈"两点间变宽没渲染"）。EndWidth(41) 不单独触发变宽（闭合圆环全 sw=0/ew=常数 应走
+                    // 描边+bulge 弧，否则变宽路径会退化成 0 宽消失）。
+                    bool hasTaper = pl.Vertices.Any(v => v.StartWidth > 0) || pl.ConstantWidth > 0;
+                    if (hasTaper && pl.ConstantWidth > 0 && !pl.Vertices.Any(v => v.StartWidth > 0))
                     {
+                        // DWG 往返：全顶点等宽被归一为 ConstantWidth（逐顶点置 0）→ 物化为逐顶点宽度
                         foreach (var v in pl.Vertices) { v.StartWidth = pl.ConstantWidth; v.EndWidth = pl.ConstantWidth; }
-                        sw = pl.ConstantWidth;
                     }
-                    if (sw > 0 && pts.Count >= 2)
+                    if (hasTaper && pts.Count >= 2)
                     {
                         EmitTaperedPolyline(sb, pl, tr, col, scaleMul, dash);
                         break;

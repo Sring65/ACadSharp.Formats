@@ -1113,7 +1113,7 @@ internal partial class ImageEngine
             {
                 case Point pt: Expand(pt.Location.X, pt.Location.Y); break;
                 case Line ln: Expand(ln.StartPoint.X, ln.StartPoint.Y); Expand(ln.EndPoint.X, ln.EndPoint.Y); break;
-                case LwPolyline p2: foreach (var v in p2.Vertices) Expand(v.Location.X, v.Location.Y); break;
+                case LwPolyline p2: foreach (var p in LwPolylineSamplePoints(p2, null)) Expand(p.X, p.Y); break; // 含 bulge 弧段范围
                 case Polyline3D p3: foreach (var v in p3.Vertices) Expand(v.Location.X, v.Location.Y); break;
                 case Polyline2D p2d: foreach (var v in p2d.Vertices) Expand(v.Location.X, v.Location.Y); break;
                 case Mesh mesh: if (mesh.Vertices != null) foreach (var v in mesh.Vertices) Expand(v.X, v.Y); break;
@@ -1300,7 +1300,8 @@ internal partial class ImageEngine
                 {
                     string col = ColorOf(EntityAciIndex(ent), layerAci, byBlockAci);
                     if (TryEmitComplexSvg(sb, ent, tr, pat, col, StrokeWidth(ent, scaleMul))) break;
-                    var pts = pl.Vertices.Select(v => tr == null ? (v.Location.X, v.Location.Y) : tr.Apply(v.Location.X, v.Location.Y)).ToList();
+                    // 普通描边路径采样世界折线点（含 bulge 弧段）；变宽路径走 EmitTaperedPolyline（自有 bulge 逻辑）
+                    var pts = LwPolylineSamplePoints(pl, tr);
                     // 几何宽度（组码43，数据单位，真实加粗）：>0 时按 CAD 语义渲染为"填充多边形"；否则按线宽(370)描边。
                     // DWG 往返：全顶点等宽被 DwgStreamExporter/AcadDwgOperator 归一为 ConstantWidth（逐顶点置 0）——
                     // 先物化为逐顶点宽度，再走与 OFF 路由（netDxf 逐顶点 StartWidth）完全相同的 tapered 逻辑。
@@ -2729,6 +2730,50 @@ internal partial class ImageEngine
         double a1 = Math.Atan2(p1.Y - cy, p1.X - cx) * 180.0 / Math.PI;
         double a2 = Math.Atan2(p2.Y - cy, p2.X - cx) * 180.0 / Math.PI;
         return (new XY(cx, cy), r, a1, a2);
+    }
+
+    // LwPolyline 采样为世界系折线点（三引擎共享，含 bulge 弧段）：
+    // 逐顶点处理，bulge≠0 的段用 ArcFromBulge+AppendArcPoints 采样为弧（每 2° 一段），否则直线弦。
+    // tr 非空时所有点世界化。此前普通路径只取 v.Location.X/Y 丢 Bulge → 带凸度的圆环/弧段
+    // （如 verts=35 全 bulge 的圆、verts=27 带 26 个 bulge 的弧）被画成顶点折线 = "控制点连线"。
+    // 变宽（ConstantWidth/StartWidth>0）路径不经过本方法（走 EmitTaperedPolyline 自有 bulge 偏移逻辑）。
+    private static List<(double X, double Y)> LwPolylineSamplePoints(LwPolyline pl, Transform2D tr)
+    {
+        var res = new List<(double X, double Y)>();
+        var verts = pl?.Vertices;
+        if (verts == null) return res;
+        int n = verts.Count;
+        if (n < 2) return res;
+        var xy = new List<XY>(n * 2);
+        void Push(double x, double y)
+        {
+            if (!double.IsFinite(x) || !double.IsFinite(y)) return;
+            if (tr == null) xy.Add(new XY(x, y));
+            else { var a = tr.Apply(x, y); xy.Add(new XY(a.Item1, a.Item2)); }
+        }
+        Push(verts[0].Location.X, verts[0].Location.Y);
+        int last = pl.IsClosed ? n : n - 1;
+        for (int i = 0; i < last; i++)
+        {
+            int ni = (i + 1) % n;
+            var v1 = verts[i].Location;
+            var v2 = verts[ni].Location;
+            double bulge = verts[i].Bulge;
+            if (Math.Abs(bulge) > 1e-9)
+            {
+                var (c, r, sdeg, edeg) = ArcFromBulge(new XY(v1.X, v1.Y), new XY(v2.X, v2.Y), bulge);
+                if (r > 0 && xy.Count > 0)
+                {
+                    // 去掉当前弧起点 v1（=xy 末点），由 AppendArcPoints 从 v1 重新采样（避免重复点）
+                    xy.RemoveAt(xy.Count - 1);
+                    AppendArcPoints(xy, c, r, sdeg, edeg, bulge >= 0, tr);
+                    continue;
+                }
+            }
+            Push(v2.X, v2.Y);
+        }
+        foreach (var p in xy) res.Add((p.X, p.Y));
+        return res;
     }
 
     // hatch 边界样条边：控制点 Z=权重（DXF 规定），NURBS 采样

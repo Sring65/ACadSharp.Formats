@@ -181,12 +181,8 @@ internal partial class ImageEngine
                 {
                     string col = ColorOf(EntityAciIndex(ent), layerAci, byBlockAci);
                     if (TryEmitComplexPng(ent, tr, pat, col, StrokeWidth(ent, scaleMul))) break;
-                    var pts = new List<(double X, double Y)>(pl.Vertices.Count);
-                    foreach (var v in pl.Vertices)
-                    {
-                        if (tr == null) pts.Add((v.Location.X, v.Location.Y));
-                        else { var a = tr.Apply(v.Location.X, v.Location.Y); pts.Add((a.Item1, a.Item2)); }
-                    }
+                    // 普通描边路径采样世界折线点（含 bulge 弧段）；变宽路径走 EmitTaperedPng（自有 bulge 逻辑）
+                    var pts = LwPolylineSamplePoints(pl, tr);
                     // 几何宽度（组码43，数据单位，真实加粗）：>0 时按 CAD 语义渲染为"填充多边形"；否则按线宽(370)描边。
                     double sw = pl.Vertices.FirstOrDefault()?.StartWidth ?? 0;
                     if (sw <= 0 && pl.ConstantWidth > 0)

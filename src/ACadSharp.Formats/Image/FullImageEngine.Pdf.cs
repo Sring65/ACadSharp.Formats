@@ -272,7 +272,8 @@ internal partial class ImageEngine
                         PdfTaperedPolyline(cs, pl, tr, col, dash);
                         break;
                     }
-                    var pts = pl.Vertices.Select(v => tr == null ? (v.Location.X, v.Location.Y) : tr.Apply(v.Location.X, v.Location.Y)).ToList();
+                    // 普通描边路径采样世界折线点（含 bulge 弧段）；变宽路径走 PdfTaperedPolyline（自有 bulge 逻辑）
+                    var pts = LwPolylineSamplePoints(pl, tr);
                     var d = new StringBuilder();
                     for (int i = 0; i < pts.Count; i++) d.Append(F(Sx(pts[i].X)) + " " + F(Py(pts[i].Y)) + " " + (i == 0 ? "m" : "l") + " ");
                     if (pl.IsClosed) d.Append("h ");

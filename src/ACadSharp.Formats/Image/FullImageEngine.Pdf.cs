@@ -544,6 +544,29 @@ internal partial class ImageEngine
                 }
                 break;
 
+            case Dimension dim:
+                {
+                    // 标注：递归渲染 dim.Block 内实体（尺寸线/箭头/文字/弧/Insert 均为世界坐标）。
+                    // 跳过 Defpoints 图层的参考点（AutoCAD 不显示）。
+                    if (dim.Block != null && dim.Block.Entities.Count > 0)
+                    {
+                        short dimAci = EffectiveAci(ent, byBlockAci);
+                        short dimLayerAci = 7;
+                        try { dimLayerAci = LayerAciIndex(dim.Layer); } catch { }
+                        foreach (var be in dim.Block.Entities)
+                        {
+                            if (be is Point)
+                            {
+                                try { if (be.Layer != null && be.Layer.Name.Equals("Defpoints", StringComparison.OrdinalIgnoreCase)) continue; } catch { }
+                            }
+                            EmitEntityPdf(cs, be, null, 1.0, dimAci, null, null, ltMul, dimLayerAci);
+                        }
+                    }
+                    else
+                        RecordSkip(ent.GetType().Name);
+                }
+                break;
+
             default:
                 RecordSkip(ent.GetType().Name);
                 break;

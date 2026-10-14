@@ -412,7 +412,7 @@ internal partial class ImageEngine
                 break;
 
             case Solid so:
-                EmitQuadFillPng(QuadPts(so.FirstCorner, so.SecondCorner, so.ThirdCorner, so.FourthCorner, tr),
+                EmitQuadFillPng(SolidQuadPts(so.FirstCorner, so.SecondCorner, so.ThirdCorner, so.FourthCorner, tr),
                     ColorOf(EntityAciIndex(ent), layerAci, byBlockAci));
                 break;
 

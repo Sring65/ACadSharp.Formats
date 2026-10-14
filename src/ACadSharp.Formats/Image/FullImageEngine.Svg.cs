@@ -1479,7 +1479,7 @@ internal partial class ImageEngine
                 break;
 
             case Solid so:
-                EmitQuadFill(sb, QuadPts(so.FirstCorner, so.SecondCorner, so.ThirdCorner, so.FourthCorner, tr), ColorOf(EntityAciIndex(ent), layerAci, byBlockAci));
+                EmitQuadFill(sb, SolidQuadPts(so.FirstCorner, so.SecondCorner, so.ThirdCorner, so.FourthCorner, tr), ColorOf(EntityAciIndex(ent), layerAci, byBlockAci));
                 break;
 
             case Face3D fd:
@@ -2603,9 +2603,15 @@ internal partial class ImageEngine
         sb.AppendLine($"  <text x=\"{F(sx)}\" y=\"{F(sy)}\" font-family=\"{fontFamily}\" font-size=\"{F(fs)}\" fill=\"{fill}\"{trs}>{esc}</text>");
     }
 
-    // Solid/Face3D 四角（DXF 组码 10/11/12/13 = 角1..4）的 CAD 绕序是 1→2→4→3（对角配对 1-2 与 3-4 为两条对边）。
-    // 直接按 1→2→3→4 连会画成对角交叉的沙漏形（典型：表格蓝色背景行被填成交叉状）。
+    // Face3D(3DFACE) 四角（DXF 组码 10/11/12/13 = 角1..4）按**周长顺序**存储：角1-2、2-3、3-4、4-1 是四条边，
+    // 直接 1→2→3→4 连线即正确边界（不可对角跳连，否则三维面交叉）。
     private static List<(double X, double Y)> QuadPts(XYZ a, XYZ b, XYZ c, XYZ d, Transform2D tr)
+        => new[] { a, b, c, d }.Select(v => tr == null ? (v.X, v.Y) : tr.Apply(v.X, v.Y)).ToList();
+
+    // Solid(TRACE) 四角语义与 3DFACE 不同：角1-2 与 角3-4 是两条**对边**（对角配对），
+    // 填充绕序须 1→2→4→3（对角 3-4 跳连）。直接 1→2→3→4 会画成对角交叉沙漏（典型：表格蓝色背景行交叉）。
+    // 故 Solid 专用此 helper，与 Face3D 的 QuadPts 区分（上轮误统一为 1→2→4→3 致 Face3D 交叉回归）。
+    private static List<(double X, double Y)> SolidQuadPts(XYZ a, XYZ b, XYZ c, XYZ d, Transform2D tr)
         => new[] { a, b, d, c }.Select(v => tr == null ? (v.X, v.Y) : tr.Apply(v.X, v.Y)).ToList();
 
     private void EmitQuadFill(StringBuilder sb, List<(double X, double Y)> pts, string color)

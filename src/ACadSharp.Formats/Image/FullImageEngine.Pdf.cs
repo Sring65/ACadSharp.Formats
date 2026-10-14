@@ -458,7 +458,7 @@ internal partial class ImageEngine
                 break;
 
             case Solid so:
-                PdfQuadFill(cs, col, QuadPts(so.FirstCorner, so.SecondCorner, so.ThirdCorner, so.FourthCorner, tr));
+                PdfQuadFill(cs, col, SolidQuadPts(so.FirstCorner, so.SecondCorner, so.ThirdCorner, so.FourthCorner, tr));
                 break;
             case Face3D fd:
                 PdfQuadFill(cs, col, QuadPts(fd.FirstCorner, fd.SecondCorner, fd.ThirdCorner, fd.FourthCorner, tr));

@@ -1012,17 +1012,21 @@ internal partial class ImageEngine
             var p = tr == null ? (v.Position.X, v.Position.Y) : tr.Apply(v.Position.X, v.Position.Y);
             wp.Add(p);
         }
-        // 每顶点法向（角平分法向，近似 miter 拐角）
+        // 每顶点偏移位置（miter 尖接，对齐 AutoCAD MLine 拐角）：
+        //   - 端点（i=0 / i=n-1）：沿该端唯一线段法向偏移
+        //   - 中间点：取「进入段子线」(过 V_{i-1}+n_{i-1}*off，方向 d_{i-1}) 与「离开段子线」
+        //     (过 V_i+n_i*off，方向 d_i) 的交点作为尖接点，保证子线拐角延伸相交、
+        //     间距与直线段一致；交点过尖（|p-V_i|>|off|/sin(θ/2)）则回退 bevel。
         int n = wp.Count;
-        var normals = new (double X, double Y)[n];
-        for (int i = 0; i < n; i++)
+        // 各段单位方向与法向（段 k：V_k→V_{k+1}）
+        var d = new (double X, double Y)[n - 1];
+        var nm = new (double X, double Y)[n - 1];
+        for (int k = 0; k < n - 1; k++)
         {
-            double dx, dy;
-            if (i == 0) { dx = wp[1].X - wp[0].X; dy = wp[1].Y - wp[0].Y; }
-            else if (i == n - 1) { dx = wp[n - 1].X - wp[n - 2].X; dy = wp[n - 1].Y - wp[n - 2].Y; }
-            else { dx = (wp[i].X - wp[i - 1].X) + (wp[i + 1].X - wp[i].X); dy = (wp[i].Y - wp[i - 1].Y) + (wp[i + 1].Y - wp[i].Y); }
+            double dx = wp[k + 1].X - wp[k].X, dy = wp[k + 1].Y - wp[k].Y;
             double len = Math.Sqrt(dx * dx + dy * dy);
-            normals[i] = len < 1e-12 ? (0, 0) : (-dy / len, dx / len);
+            if (len < 1e-12) { d[k] = (0, 0); nm[k] = (0, 0); }
+            else { d[k] = (dx / len, dy / len); nm[k] = (-dy / len, dx / len); }
         }
         double offScale = tr?.Scale ?? 1.0;
         var style = ml.Style ?? ACadSharp.Objects.MLineStyle.Default;
@@ -1037,13 +1041,57 @@ internal partial class ImageEngine
             double off = el.Offset * offScale;
             var poly = new List<(double X, double Y)>(n);
             for (int i = 0; i < n; i++)
-                poly.Add((wp[i].X + normals[i].X * off, wp[i].Y + normals[i].Y * off));
+            {
+                double px, py;
+                if (i == 0)
+                { px = wp[0].X + nm[0].X * off; py = wp[0].Y + nm[0].Y * off; }
+                else if (i == n - 1)
+                { int k = n - 2; px = wp[i].X + nm[k].X * off; py = wp[i].Y + nm[k].Y * off; }
+                else
+                {
+                    int k1 = i - 1, k2 = i;
+                    // 进入段子线：P1=V_{i-1}+n_{k1}*off, 方向 d_{k1}
+                    double p1x = wp[i - 1].X + nm[k1].X * off, p1y = wp[i - 1].Y + nm[k1].Y * off;
+                    // 离开段子线：P2=V_i+n_{k2}*off, 方向 d_{k2}
+                    double p2x = wp[i].X + nm[k2].X * off, p2y = wp[i].Y + nm[k2].Y * off;
+                    double denom = d[k1].X * d[k2].Y - d[k1].Y * d[k2].X;
+                    if (Math.Abs(denom) < 1e-12)
+                    {
+                        // 平行/反向 → 无 miter 交点，回退 bevel
+                        (px, py) = MLineBevelPoint(wp[i], d[k1], d[k2], off);
+                    }
+                    else
+                    {
+                        double t = ((p2x - p1x) * d[k2].Y - (p2y - p1y) * d[k2].X) / denom;
+                        double mx = p1x + d[k1].X * t, my = p1y + d[k1].Y * t;
+                        double ddx = mx - wp[i].X, ddy = my - wp[i].Y;
+                        double dist = Math.Sqrt(ddx * ddx + ddy * ddy);
+                        // miter 长度限制：|off|/|sin(θ/2)|，过尖回退 bevel
+                        double cross = d[k1].X * d[k2].Y - d[k1].Y * d[k2].X;
+                        double sinHalf = Math.Abs(cross) / 2.0;
+                        if (sinHalf > 1e-9 && dist <= Math.Abs(off) / sinHalf + 1e-6) { px = mx; py = my; }
+                        else { (px, py) = MLineBevelPoint(wp[i], d[k1], d[k2], off); }
+                    }
+                }
+                poly.Add((px, py));
+            }
             short aci;
             try { aci = el.Color.IsTrueColor ? TrueColorToAci(el.Color.R, el.Color.G, el.Color.B) : el.Color.Index; }
             catch { aci = 256; }
             result.Add((poly, aci));
         }
         return result;
+    }
+
+    // MLine 拐角 bevel 回退点：当 miter 交点平行/过尖时，用两段方向角平分线的法向偏移。
+    // 方向单位化后相加得角平分向量，取其法向（单位）* off 即 bevel 拐角位置。
+    private static (double X, double Y) MLineBevelPoint((double X, double Y) v, (double X, double Y) d1, (double X, double Y) d2, double off)
+    {
+        double dx = d1.X + d2.X, dy = d1.Y + d2.Y;
+        double len = Math.Sqrt(dx * dx + dy * dy);
+        if (len < 1e-12) return v; // 反向（180°）→ 无法向，落在顶点
+        // 角平分法向 = 平分向量的左法向，单位化
+        return (v.X + (-dy / len) * off, v.Y + (dx / len) * off);
     }
 
     // PolyfaceMesh 线框（三引擎共享）：旧式 3D 多面体网格。每个 Face（VertexFaceRecord.Index1-4，

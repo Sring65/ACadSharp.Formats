@@ -201,8 +201,10 @@ internal partial class ImageEngine
                 seglist = seglist0;
             }
 
-            // 复杂线型（含 SHX Shape 段）：构建"模式段序列"供沿路径真实渲染（严格遵循 LTYPE 定义）
-            if (lt.HasShapes)
+            // 复杂线型（含 SHX Shape 段 / 文字段）：构建"模式段序列"供沿路径真实渲染（严格遵循 LTYPE 定义）。
+            // 触发条件须含文字段（----GAS---- 等纯文字线型 HasShapes=false，旧实现被当实线、文字段丢失）。
+            bool hasComplex = seglist0.Any(s => s != null && (s.IsShape || s.IsText));
+            if (hasComplex)
             {
                 int n0 = seglist.Count;
                 var pat = new LtpPattern();
@@ -230,8 +232,22 @@ internal partial class ImageEngine
                     }
                     else if (s0.IsText)
                     {
-                        // 文字段：不绘制文字本身，线在文字处断开 → 空隙
-                        pat.Segs.Add(new LtpSeg { Kind = LtpSeg.Gap, Len = Math.Abs(l) });
+                        // 文字段：线在文字处断开，并在段中点沿切向渲染文字（如 ----GAS---- 的 GAS）。
+                        // 旧实现只当空隙、不画文字 → GAS 文字线型渲染成实线（#55）。
+                        string tf = s0.Style?.Filename ?? "";
+                        // 字体族名：TTF 去扩展名；SHX 直接用文件名（渲染端 ResolveFontFamily 兜底）
+                        int dotI = tf.LastIndexOf('.');
+                        string fam = dotI > 0 ? tf.Substring(0, dotI) : tf;
+                        pat.Segs.Add(new LtpSeg
+                        {
+                            Kind = LtpSeg.Text,
+                            Len = Math.Abs(l),
+                            InGap = l <= 1e-9,
+                            TextContent = s0.Text,
+                            TextScale = s0.Scale > 0 ? s0.Scale : 1.0,
+                            TextRot = s0.Rotation * 180.0 / Math.PI,
+                            TextFont = fam,
+                        });
                     }
                     else if (l > 1e-9) pat.Segs.Add(new LtpSeg { Kind = LtpSeg.Dash, Len = l });
                     else if (l < -1e-9) pat.Segs.Add(new LtpSeg { Kind = LtpSeg.Gap, Len = -l });
@@ -244,24 +260,24 @@ internal partial class ImageEngine
                             pat.Segs.Add(new LtpSeg { Kind = LtpSeg.Dash, Len = dot });
                     }
                 }
-                // 合并连续同类型段（形状段永不合并——每个都是独立放置）
+                // 合并连续同类型段（Shape/Text 段永不合并——每个都是独立放置）
                 var pm = new List<LtpSeg>();
                 foreach (var s0 in pat.Segs)
                 {
-                    if (pm.Count > 0 && s0.Kind != LtpSeg.Shape && pm[pm.Count - 1].Kind == s0.Kind)
+                    if (pm.Count > 0 && s0.Kind != LtpSeg.Shape && s0.Kind != LtpSeg.Text && pm[pm.Count - 1].Kind == s0.Kind)
                         pm[pm.Count - 1].Len += s0.Len;
                     else pm.Add(s0);
                 }
                 pat.Segs.Clear();
                 pat.Segs.AddRange(pm);
-                // 形状放置位置（相对段起点）：
+                // Shape/Text 放置位置（相对段起点）：
                 //  - 笔落型（段长>0，符号落在实线上）：居中于自身段；
                 //  - 间隙型（段长≤0，符号在空隙内，如 914C 的"点"）：居中于"总空隙"（AutoCAD 一致）。
                 int pn = pat.Segs.Count;
                 for (int j = 0; j < pn; j++)
                 {
                     var s0 = pat.Segs[j];
-                    if (s0.Kind != LtpSeg.Shape) continue;
+                    if (s0.Kind != LtpSeg.Shape && s0.Kind != LtpSeg.Text) continue;
                     if (!s0.InGap) { s0.CenterOffset = s0.Len / 2; continue; }
                     double gapBefore = pat.Segs[(j - 1 + pn) % pn].Kind == LtpSeg.Gap ? pat.Segs[(j - 1 + pn) % pn].Len : 0;
                     double gapAfter = pat.Segs[(j + 1) % pn].Kind == LtpSeg.Gap ? pat.Segs[(j + 1) % pn].Len : 0;
@@ -558,7 +574,7 @@ internal partial class ImageEngine
 
     // 沿路径走查模式：dash 段→线子路径；gap 段→留空；shape 段→段中点处真实 SHX 字形（沿切向）。
     private void WalkPattern(StringBuilder d, List<(double X, double Y)> pts, double[] cum, LtpPattern pat,
-        Func<double, double> fx, Func<double, double> fy, bool pdf)
+        Func<double, double> fx, Func<double, double> fy, bool pdf, List<LtpTextPlace> textOut = null)
     {
         double L = cum[cum.Length - 1];
         var segs = pat.Segs;
@@ -581,9 +597,33 @@ internal partial class ImageEngine
                 PathPointAt(pts, cum, at, out double px, out double py, out double tx, out double ty);
                 EmitShapeGlyph(d, pts, cum, at, px, py, tx, ty, seg, fx, fy, pdf);
             }
+            else if (seg.Kind == LtpSeg.Text && textOut != null && !string.IsNullOrEmpty(seg.TextContent))
+            {
+                // 文字段：段中点沿切向放置，基线居中、旋转=切向角+绝对旋转（数据系，CCW 正）。
+                double at = pos + seg.CenterOffset;
+                PathPointAt(pts, cum, at, out double cx, out double cy, out double tx, out double ty);
+                textOut.Add(BuildTextPlace(cx, cy, tx, ty, seg));
+            }
             pos += span;
             i++;
         }
+    }
+
+    // 文字段放置：以段中心 (cx,cy) 为基线中心，文字宽估算 0.6em·字数·字高，沿切向回退半宽得基线左端；
+    // 旋转 = 切向角 + 绝对旋转（数据系 CCW 正；水平线切向 0 → 文字水平）。
+    private static LtpTextPlace BuildTextPlace(double cx, double cy, double tx, double ty, LtpSeg seg)
+    {
+        double h = seg.TextScale > 1e-9 ? seg.TextScale : 1.0;
+        int chars = Math.Max(1, seg.TextContent.Length);
+        double estW = 0.6 * h * chars;                 // 估算文字宽（数据单位）
+        double tanAng = Math.Atan2(ty, tx) * 180.0 / Math.PI; // 数据系切向角（度）
+        double rot = tanAng + seg.TextRot;
+        double rad = rot * Math.PI / 180.0;
+        double ca = Math.Cos(rad), sa = Math.Sin(rad);
+        // 基线左端 = 中心 - (estW/2) 沿切向（局部 x 轴）
+        double bx = cx - (estW / 2.0) * ca;
+        double by = cy - (estW / 2.0) * sa;
+        return new LtpTextPlace { X = bx, Y = by, RotDeg = rot, Height = h, Text = seg.TextContent, Font = seg.TextFont, WidthFactor = 1.0 };
     }
 
     // 在路径点 (px,py) 绘制真实 SHX 字形（追加到 d）：字形包围盒中心对齐路径点，
@@ -792,26 +832,47 @@ internal partial class ImageEngine
         var cum = BuildCum(pts);
         if (cum[cum.Length - 1] <= 1e-9) return false;
         var d = new StringBuilder();
-        WalkPattern(d, pts, cum, pat, Sx, Sy, false);
-        if (d.Length == 0) return false;
-        sb.AppendLine($"  <path d=\"{d}\" fill=\"none\" stroke=\"{col}\" stroke-width=\"{F(w)}\" stroke-linejoin=\"round\"/>");
+        var texts = new List<LtpTextPlace>();
+        WalkPattern(d, pts, cum, pat, Sx, Sy, false, texts);
+        if (d.Length == 0 && texts.Count == 0) return false;
+        if (d.Length > 0)
+            sb.AppendLine($"  <path d=\"{d}\" fill=\"none\" stroke=\"{col}\" stroke-width=\"{F(w)}\" stroke-linejoin=\"round\"/>");
+        // 文字段：用原生 <text> 实心渲染（旋转传 -数据系角，因 SVG y 向下）
+        foreach (var p in texts)
+            EmitText(sb, p.X, p.Y, p.Text, p.Height, col, -p.RotDeg, SvgFontFamily(ResolveFontFamily(p.Font)), p.WidthFactor);
         return true;
     }
 
-    // 复杂线型模式段（Dash/Gap/Shape 三态；Shape 段独立放置，永不合并）
+    // 复杂线型模式段（Dash/Gap/Shape/Text 四态；Shape/Text 段独立放置，永不合并）
     private class LtpSeg
     {
-        public const int Dash = 0, Gap = 1, Shape = 2;
+        public const int Dash = 0, Gap = 1, Shape = 2, Text = 3;
         public int Kind;
         public double Len;        // 段长（数据单位，正）
         public bool InGap;        // Shape：位于空隙内（间隙型）
-        public double CenterOffset; // Shape：字形中心相对段起点的偏移
+        public double CenterOffset; // Shape/Text：字形中心相对段起点的偏移
         public string ShapeName;
         public string ShapeFile;
         public double ShapeScale;
         public int RotType;       // 0=upright 1=relative 2=absolute
         public double ShapeRot;   // 绝对旋转（度）
         public double OX, OY;     // 形状偏移（字体单位）
+        public string TextContent; // Text：文字内容（组码 9）
+        public double TextScale;   // Text：字高（组码 46，数据单位）
+        public double TextRot;     // Text：绝对旋转（度，组码 50；0=沿切向）
+        public string TextFont;    // Text：字体族名（Style 解析）
+    }
+
+    // 文字段放置（WalkPattern 收集，各引擎用原生文字 API 渲染）：
+    // 基线左端 (X,Y) 数据坐标、数据系旋转角 RotDeg、字高 Height、内容/字体族/宽因子。
+    private struct LtpTextPlace
+    {
+        public double X, Y;
+        public double RotDeg;   // 数据系（CAD 约定，CCW 正）
+        public double Height;   // 数据单位
+        public string Text;
+        public string Font;
+        public double WidthFactor;
     }
 
     private class LtpPattern
@@ -823,13 +884,15 @@ internal partial class ImageEngine
             var p = new LtpPattern();
             foreach (var seg in this.Segs)
             {
-                var c = new LtpSeg
-                {
-                    Kind = seg.Kind, Len = seg.Len * s, InGap = seg.InGap,
-                    CenterOffset = seg.CenterOffset * s, ShapeName = seg.ShapeName,
-                    ShapeFile = seg.ShapeFile, ShapeScale = seg.ShapeScale * s,
-                    RotType = seg.RotType, ShapeRot = seg.ShapeRot, OX = seg.OX * s, OY = seg.OY * s,
-                };
+                    var c = new LtpSeg
+                    {
+                        Kind = seg.Kind, Len = seg.Len * s, InGap = seg.InGap,
+                        CenterOffset = seg.CenterOffset * s, ShapeName = seg.ShapeName,
+                        ShapeFile = seg.ShapeFile, ShapeScale = seg.ShapeScale * s,
+                        RotType = seg.RotType, ShapeRot = seg.ShapeRot, OX = seg.OX * s, OY = seg.OY * s,
+                        TextContent = seg.TextContent, TextScale = seg.TextScale * s,
+                        TextRot = seg.TextRot, TextFont = seg.TextFont,
+                    };
                 p.Segs.Add(c);
             }
             p.Period = this.Period * s;

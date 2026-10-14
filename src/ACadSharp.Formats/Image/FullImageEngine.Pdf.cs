@@ -548,9 +548,17 @@ internal partial class ImageEngine
         var cum = BuildCum(pts);
         if (cum[cum.Length - 1] <= 1e-9) return false;
         var d = new StringBuilder();
-        WalkPattern(d, pts, cum, pat, Sx, Py, true);
-        if (d.Length == 0) return false;
-        PdfStroke(cs, col, w, null, d + "S");
+        var texts = new List<LtpTextPlace>();
+        WalkPattern(d, pts, cum, pat, Sx, Py, true, texts);
+        if (d.Length == 0 && texts.Count == 0) return false;
+        if (d.Length > 0)
+            PdfStroke(cs, col, w, null, d + "S");
+        // 文字段：原生 PDF 文字（坐标需 Sx/Py 映射，rotDeg 数据系角）
+        foreach (var p in texts)
+        {
+            int slot = _pdfFonts != null ? _pdfFonts.GetSlot(ResolveFontFamily(p.Font)) : 0;
+            PdfText(cs, col, p.Height, Sx(p.X), Py(p.Y), p.RotDeg, p.Text, slot, p.WidthFactor);
+        }
         return true;
     }
 

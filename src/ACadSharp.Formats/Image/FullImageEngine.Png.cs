@@ -602,17 +602,21 @@ internal partial class ImageEngine
         var cum = BuildCum(pts);
         if (cum[cum.Length - 1] <= 1e-9) return false;
         var pb = new PolyBuilder();
-        WalkPatternPx(pb, pts, cum, pat);
-        if (pb.IsEmpty) return false;
+        var texts = new List<LtpTextPlace>();
+        WalkPatternPx(pb, pts, cum, pat, texts);
+        if (pb.IsEmpty && texts.Count == 0) return false;
         var colRgb = HexToRgb(col);
         float widthPx = (float)Math.Max(0.0, w * PngK);
         foreach (var pl in pb.ToPolylines(false))
             if (pl.Count >= 2) _rc.StrokePolyline(pl, false, widthPx, colRgb);
+        // 文字段：用 TTF 实心字形渲染（rotCanvas 传 -数据系角）
+        foreach (var p in texts)
+            DrawTextPng(p.X, p.Y, p.Text, p.Height, col, -p.RotDeg, ResolveFontFamily(p.Font), p.WidthFactor);
         return true;
     }
 
     // 沿路径走查模式（WalkPattern 的位图版）：dash→线子路径；gap→留空；shape→段中点真实 SHX 字形（沿切向）。
-    private void WalkPatternPx(PolyBuilder pb, List<(double X, double Y)> pts, double[] cum, LtpPattern pat)
+    private void WalkPatternPx(PolyBuilder pb, List<(double X, double Y)> pts, double[] cum, LtpPattern pat, List<LtpTextPlace> textOut = null)
     {
         double L = cum[cum.Length - 1];
         var segs = pat.Segs;
@@ -633,6 +637,12 @@ internal partial class ImageEngine
                 double at = pos + seg.CenterOffset;
                 PathPointAt(pts, cum, at, out double px, out double py, out double tx, out double ty);
                 EmitShapeGlyphPb(pb, at, px, py, tx, ty, seg);
+            }
+            else if (seg.Kind == LtpSeg.Text && textOut != null && !string.IsNullOrEmpty(seg.TextContent))
+            {
+                double at = pos + seg.CenterOffset;
+                PathPointAt(pts, cum, at, out double cx, out double cy, out double tx, out double ty);
+                textOut.Add(BuildTextPlace(cx, cy, tx, ty, seg));
             }
             pos += span;
             i++;

@@ -623,6 +623,12 @@ internal partial class ImageEngine
         // 基线左端 = 中心 - (estW/2) 沿切向（局部 x 轴）
         double bx = cx - (estW / 2.0) * ca;
         double by = cy - (estW / 2.0) * sa;
+        // 垂直居中：文字视觉中心约在基线上方 0.35*字高（大写字形 cap height≈0.7em 的一半）。
+        // 把基线沿局部 -y（数据系 = (sa,-ca)）平移 0.35h，使文字中心落在路径点上。
+        // 旧实现基线直接贴路径 → 文字主体偏路径上方、线段穿过文字底部而非中部（GAS 未居中）。
+        double vShift = 0.35 * h;
+        bx += vShift * sa;
+        by -= vShift * ca;
         return new LtpTextPlace { X = bx, Y = by, RotDeg = rot, Height = h, Text = seg.TextContent, Font = seg.TextFont, WidthFactor = 1.0 };
     }
 
@@ -659,14 +665,19 @@ internal partial class ImageEngine
             default: ang = 0; break;                   // upright
         }
         double ca = Math.Cos(ang), sa = Math.Sin(ang);
-        double ox = seg.OX * S, oy = seg.OY * S;
-        // 字形点(字体单位) → 输出坐标：平移(包围盒中心→路径点)+旋转+缩放，再经 fx/fy 映射
+        // offset（DXF 44/45）= 数据单位偏移：X 沿路径切向、Y 沿法向(-ty,tx)。
+        // 不随字形旋转、不乘字形缩放 S（字形缩放只作用于字形几何）。
+        // 旧实现 ox=seg.OX*S 多乘了缩放且被 ang 旋转（当字形局部坐标）→ BATTING 等带偏移
+        // 的复杂线型拱形相对路径错位（"缺少偏移判断"）。
+        double oxw = seg.OX * tx - seg.OY * ty;   // 切向*OX + 法向*OY → 世界 x
+        double oyw = seg.OX * ty + seg.OY * tx;   // → 世界 y
+        // 字形点(字体单位) → 输出坐标：平移(offset→路径点)+旋转+缩放，再经 fx/fy 映射
         void Xf(float gx, float gy, out double mx, out double my)
         {
-            double lx = (gx - rec.CX) * S + ox;
-            double ly = (gy - rec.CY) * S + oy;
-            double wx = px + lx * ca - ly * sa;
-            double wy = py + lx * sa + ly * ca;
+            double lx = (gx - rec.CX) * S;
+            double ly = (gy - rec.CY) * S;
+            double wx = px + oxw + lx * ca - ly * sa;
+            double wy = py + oyw + lx * sa + ly * ca;
             mx = fx(wx); my = fy(wy);
         }
         double curX = 0, curY = 0; bool haveCur = false;

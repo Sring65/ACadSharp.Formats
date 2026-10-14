@@ -712,13 +712,16 @@ internal partial class ImageEngine
             default: ang = 0; break;                   // upright
         }
         double ca = Math.Cos(ang), sa = Math.Sin(ang);
-        double ox = seg.OX * S, oy = seg.OY * S;
+        // offset（DXF 44/45）= 数据单位偏移：X 沿切向、Y 沿法向(-ty,tx)，不随字形旋转、不乘字形缩放。
+        // 旧实现 ox=seg.OX*S 多乘缩放且被 ang 旋转 → 带偏移的复杂线型拱形相对路径错位。
+        double oxw = seg.OX * tx - seg.OY * ty;
+        double oyw = seg.OX * ty + seg.OY * tx;
         void Xf(float gx, float gy, out double mx, out double my)
         {
-            double lx = (gx - rec.CX) * S + ox;
-            double ly = (gy - rec.CY) * S + oy;
-            double wx = px + lx * ca - ly * sa;
-            double wy = py + lx * sa + ly * ca;
+            double lx = (gx - rec.CX) * S;
+            double ly = (gy - rec.CY) * S;
+            double wx = px + oxw + lx * ca - ly * sa;
+            double wy = py + oyw + lx * sa + ly * ca;
             mx = wx; my = wy;
         }
         for (int k = 0; k < rec.Type.Count; k++)

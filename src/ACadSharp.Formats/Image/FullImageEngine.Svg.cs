@@ -1174,11 +1174,11 @@ internal partial class ImageEngine
 
             // 提取画线段：按 DXF 41 正式定义（AutoCAD DXF Reference）——
             //   p[0] = offset（沿 miter 的偏移，已用于定位中心线 c）
-            //   p[1] = 从顶点沿元素路径到元素【实际起点】的距离
+            //   p[1] = 从顶点沿元素路径到元素【实际起点】的距离（**对所有 MLine 生效**，
+            //          含 2 参数 [off,width] 的普通多线；NoStartCaps 抑制的正是 [V0, V0+p[1]] 端帽）
             //   p[2] = 从元素起点到【第一个断口(break/cut)】的距离
             //   p[3..] = 继续列出各断口的【起点/终点】（均相对元素起点）
-            // 即 p[2..] 是断口（间隙）区间，元素在断口【之外】的区间被画出来。
-            // 2 参数 [off,width] → 无断口，画整段；4+ 参数 → 减去断口区间。
+            // 即 p[2..] 是断口（间隙）区间，元素在 [elementStart, segEnd] 断口【之外】的区间被画出来。
             var segs = new List<(double X1, double Y1, double X2, double Y2)>();
             for (int k = 0; k < n - 1; k++)
             {
@@ -1188,11 +1188,13 @@ internal partial class ImageEngine
                 var startSeg = ml.Vertices[k].Segments.Count > e ? ml.Vertices[k].Segments[e] : null;
                 var pars = startSeg?.Parameters;
 
-                double elementStart = segStart; // 无 pattern → 从段起点画
+                double elementStart = segStart; // 无参数 → 从段起点画
                 var breaks = new List<(double a, double b)>();
-                if (pars != null && pars.Count >= 4)
+                if (pars != null && pars.Count >= 2)
                 {
-                    // 元素实际起点（绝对距离），夹到段内
+                    // 元素实际起点（绝对距离），夹到段内。
+                    // 注意：p[1] 对所有 MLine 生效（2 参数 [off,width] 也要应用），
+                    // 之前误只对 4+ 参数应用 → 普通多线从 V0 画全段 → 横档/梳齿偏长。
                     elementStart = segStart + pars[1];
                     if (elementStart < segStart) elementStart = segStart;
                     if (elementStart > segEnd) elementStart = segEnd;

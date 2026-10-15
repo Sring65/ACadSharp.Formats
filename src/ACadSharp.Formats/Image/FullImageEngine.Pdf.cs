@@ -707,9 +707,12 @@ internal partial class ImageEngine
                 return;
             }
             _pdfShadings[slot] = MakePdfShading(loops, gp);
-            // PDF sh 操作符作用于“当前填充路径”：必须先写出 HATCH 边界路径 d（m/l/h）再 sh 填充；
-            // 漏写路径会导致 shading 落到上一实体路径（如背景矩形 re f）上 → 渐变填充缺失。
-            CsAscii(cs, d + "/Sh" + slot + " sh\n");
+            // PDF sh 操作符渲染 shading 是【受当前裁剪路径约束】(Table 4.27: "subject to the current
+            // clipping path")，不是"当前填充路径"——旧注释理解错误。正确工业标准模式(iText/FOP/pagyra-js)：
+            //   q → 构造路径 → W n(设为裁剪路径,不填充不描边) → /ShN sh(裁剪区内渲染) → Q。
+            // 旧实现只写 path+sh(无 W n)→ 裁剪路径未限定到 HATCH 区域 → 查看器 sh 无有效裁剪 → 渐变空白
+            // (边框是 S 描边不依赖裁剪所以正常显示)。q/Q 包裹使裁剪路径局部化，Q 恢复避免影响后续实体。
+            CsAscii(cs, "q\n" + d + "W n\n/Sh" + slot + " sh\nQ\n");
         }
         else
         {

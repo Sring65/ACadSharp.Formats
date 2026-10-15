@@ -1082,84 +1082,6 @@ internal partial class ImageEngine
         return result;
     }
 
-    // MLine 子线变宽轮廓：把子线中心线按逐顶点宽度展开成闭合填充多边形（变宽=梯形楔形，等宽=平行带）。
-    // 上边（+法向）与下边（-法向）各自沿段法向偏移 ±(w_k+w_{k+1})/4（段 k 端点宽度均值的一半 → 梯形）；
-    // 拐角处上/下边各自 miter 尖接（与中心线一致），两端帽盖由首末上下边点连接闭合。
-    private static List<(double X, double Y)> MLineElementOutline(MLineElement el)
-    {
-        var outl = new List<(double X, double Y)>();
-        var c = el.Center; int n = c.Count;
-        if (n < 2 || el.Width == null || el.Width.Length < 2) return outl;
-        var w = el.Width;
-        // 各段单位方向与法向
-        var d = new (double X, double Y)[n - 1];
-        var nm = new (double X, double Y)[n - 1];
-        for (int k = 0; k < n - 1; k++)
-        {
-            double dx = c[k + 1].X - c[k].X, dy = c[k + 1].Y - c[k].Y;
-            double len = Math.Sqrt(dx * dx + dy * dy);
-            if (len < 1e-12) { d[k] = (0, 0); nm[k] = (0, 0); }
-            else { d[k] = (dx / len, dy / len); nm[k] = (-dy / len, dx / len); }
-        }
-        // 每顶点上/下偏移 = 该点宽度的一半（|w[i]|/2）：段内上下边自然斜切 → 变宽楔形/等宽平行带
-        var up = new (double X, double Y)[n];
-        var dn = new (double X, double Y)[n];
-        double Off(int i) => Math.Abs(w[i]) * 0.5;
-        for (int i = 0; i < n; i++)
-        {
-            (double X, double Y) pu, pd;
-            double oi = Off(i);
-            if (i == 0)
-            {
-                // 起点帽：沿段 0 法向偏移（宽度 w[0]）
-                pu = (c[0].X + nm[0].X * oi, c[0].Y + nm[0].Y * oi);
-                pd = (c[0].X - nm[0].X * oi, c[0].Y - nm[0].Y * oi);
-            }
-            else if (i == n - 1)
-            {
-                // 终点帽：沿末段法向偏移（宽度 w[n-1]）
-                int k = n - 2;
-                pu = (c[i].X + nm[k].X * oi, c[i].Y + nm[k].Y * oi);
-                pd = (c[i].X - nm[k].X * oi, c[i].Y - nm[k].Y * oi);
-            }
-            else
-            {
-                int k1 = i - 1, k2 = i;
-                double o1 = Off(i - 1); // 进入点宽度
-                // 上边 miter：线1 过 V_{i-1}+n_{k1}*o1 方向 d[k1]；线2 过 V_i+n_{k2}*oi 方向 d[k2]
-                pu = MLineMiter(
-                    c[i - 1].X + nm[k1].X * o1, c[i - 1].Y + nm[k1].Y * o1, d[k1],
-                    c[i].X + nm[k2].X * oi, c[i].Y + nm[k2].Y * oi, d[k2]);
-                // 下边 miter：线1 过 V_{i-1}-n_{k1}*o1 方向 d[k1]；线2 过 V_i-n_{k2}*oi 方向 d[k2]
-                pd = MLineMiter(
-                    c[i - 1].X - nm[k1].X * o1, c[i - 1].Y - nm[k1].Y * o1, d[k1],
-                    c[i].X - nm[k2].X * oi, c[i].Y - nm[k2].Y * oi, d[k2]);
-            }
-            up[i] = pu; dn[i] = pd;
-        }
-        // 轮廓 = 上边(0..n-1) + 下边(n-1..0) 闭合
-        for (int i = 0; i < n; i++) outl.Add(up[i]);
-        for (int i = n - 1; i >= 0; i--) outl.Add(dn[i]);
-        return outl;
-    }
-
-    // MLine 变宽轮廓的拐角 miter：两线（P1 沿 dir1、P2 沿 dir2）交点；平行/反向时回退 P2。
-    private static (double X, double Y) MLineMiter(double p1x, double p1y, (double X, double Y) dir1, double p2x, double p2y, (double X, double Y) dir2)
-    {
-        double denom = dir1.X * dir2.Y - dir1.Y * dir2.X;
-        if (Math.Abs(denom) < 1e-12) return (p2x, p2y);
-        double t = ((p2x - p1x) * dir2.Y - (p2y - p1y) * dir2.X) / denom;
-        return (p1x + dir1.X * t, p1y + dir1.Y * t);
-    }
-
-    // MLine 子线是否有可见宽度（决定描边还是填充楔形）：任一点宽度 > 阈值即按填充渲染。
-    private static bool MLineHasWidth(MLineElement el)
-    {
-        if (el.Width == null) return false;
-        foreach (double w in el.Width) if (Math.Abs(w) > 1e-6) return true;
-        return false;
-    }
-
     // PolyfaceMesh 线框（三引擎共享）：旧式 3D 多面体网格。每个 Face（VertexFaceRecord.Index1-4，
     // 1-based，0=无效）把有效顶点索引连成一条线串；3 点成三角、4 点成四边形。
     // 顶点（VertexFaceMesh.Location）经 tr 世界化，返回世界系线段列表 (a, b)。
@@ -1797,16 +1719,15 @@ internal partial class ImageEngine
 
             case MLine ml:
                 {
-                    // 多线：按每 vertex.Segments 的 offset/width 展开各子线（世界系）；
-                    // 无宽度→描边中心线，变宽→按逐顶点宽度展开成梯形楔形填充
+                    // 多线：按每 vertex.Segments 的 offset 展开各子线（世界系）→ 描边细线。
+                    // MLINE 正确语义=一组平行细线（AutoCAD 2D 渲染永不填充）。旧实现按 41 组码
+                    // (element 3D 厚度) 误判"有宽度"→ 走 EmitQuadFill 填充成实心楔形带（错误）。
+                    // DXF 41 是 3D extrusion 厚度，与 2D 线宽无关；故始终描边、不用 MLineHasWidth。
                     double w = StrokeWidth(ent, scaleMul);
                     foreach (var el in MLineElements(ml, tr))
                     {
                         string col = ColorOf(el.Aci, layerAci, byBlockAci);
-                        if (MLineHasWidth(el))
-                            EmitQuadFill(sb, MLineElementOutline(el), col);
-                        else
-                            EmitPolyline(sb, el.Center, col, w, false, dash);
+                        EmitPolyline(sb, el.Center, col, w, false, dash);
                     }
                 }
                 break;

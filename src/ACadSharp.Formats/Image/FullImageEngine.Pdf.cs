@@ -93,24 +93,21 @@ internal partial class ImageEngine
             file.Write(binHeader, 0, binHeader.Length);
 
             // HATCH 渐变 shading 对象（在对象 3 之前写出，供 Page /Shading 资源引用）。
-            // /ColorSpace /DeviceRGB 为 3 分量，shading 的 /Function 必须是【3 个标量 Type 2 函数的数组】
-            // （每个颜色分量各一个 1-in-1-out 函数）；且 Type 2 函数的 C0/C1 必须是标量数字。
-            // 旧实现用单个函数且 C0/C1 写成 3 元素数组（如 /C0 [0.298 0.373 0.6]）→ 违反 ISO 32000-1
-            // Table 80：单函数只能输出 1 分量，无法映射 RGB 三元组 → 查看器拒绝渲染整个 shading（渐变不显示）。
-            // 每个 shading 占 4 个对象：1 shading + R/G/B 3 个函数。
+            // /Function 用【单个 1-in-3-out 的 Type 2 函数】：C0/C1 是 3 元素数组（每个颜色分量各一值，
+            // ISO 32000-1 Table 11 "An array of numbers specifying the minimum/maximum values of the
+            // components"）。这是最标准、兼容性最好的写法（iText 及本仓库最小基准 minimal.pdf 均如此）。
+            // 曾误判为"必须 3 个标量函数数组"→ 改成 /Function [R G B 三个标量函数]，Chromium 系查看器
+            // 不支持该多函数数组形式 → 函数求值失败回退黑色填充（格子全黑）。回退为单函数数组 C0/C1。
+            // 每个 shading 占 2 个对象：1 shading + 1 函数。
             var shadingRes = new StringBuilder();
             foreach (var kv in _pdfShadings.OrderBy(p => p.Key))
             {
-                int shObj = shadingBase + kv.Key * 4;
-                int fnR = shObj + 1, fnG = shObj + 2, fnB = shObj + 3;
-                var c0 = kv.Value.C0.Split(' ');
-                var c1 = kv.Value.C1.Split(' ');
+                int shObj = shadingBase + kv.Key * 2;
+                int fnObj = shObj + 1;
                 shadingRes.Append("/Sh" + kv.Key + " " + shObj + " 0 R ");
                 PutObj(shObj, Encoding.ASCII.GetBytes("<< /Type /Shading /ShadingType " + kv.Value.ShadingType +
-                                                    " /Coords [" + kv.Value.Coords + "] /Function [" + fnR + " 0 R " + fnG + " 0 R " + fnB + " 0 R ] /ColorSpace /DeviceRGB /Extend [true true] >>"));
-                PutObj(fnR, Encoding.ASCII.GetBytes("<< /FunctionType 2 /Domain [0 1] /C0 " + c0[0] + " /C1 " + c1[0] + " >>"));
-                PutObj(fnG, Encoding.ASCII.GetBytes("<< /FunctionType 2 /Domain [0 1] /C0 " + c0[1] + " /C1 " + c1[1] + " >>"));
-                PutObj(fnB, Encoding.ASCII.GetBytes("<< /FunctionType 2 /Domain [0 1] /C0 " + c0[2] + " /C1 " + c1[2] + " >>"));
+                                                    " /ColorSpace /DeviceRGB /Coords [" + kv.Value.Coords + "] /Domain [0 1] /Extend [true true] /Function " + fnObj + " 0 R >>"));
+                PutObj(fnObj, Encoding.ASCII.GetBytes("<< /FunctionType 2 /Domain [0 1] /C0 [" + kv.Value.C0 + "] /C1 [" + kv.Value.C1 + "] >>"));
             }
 
             // 对象 1 Catalog / 2 Pages / 3 Page

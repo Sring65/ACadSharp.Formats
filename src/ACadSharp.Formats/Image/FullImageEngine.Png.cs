@@ -462,14 +462,18 @@ internal partial class ImageEngine
 
             case MLine ml:
                 {
-                    // 多线：按每 vertex.Segments 的 offset 展开各子线 → 描边细线。
-                    // MLINE 正确语义=一组平行细线（AutoCAD 2D 渲染永不填充）；旧实现按 41 组码
-                    // (element 3D 厚度) 误判"有宽度"走填充→实心楔形带（错误）。故始终描边。
+                    // 多线：按 DXF 41 参数化提取各子线的实际画线段（含画/断模式与开口长短），
+                    // 逐段描边细线。MLINE 正确语义=一组平行细线（AutoCAD 2D 渲染永不填充）。
                     double w = StrokeWidth(ent, scaleMul);
-                    foreach (var el in MLineElements(ml, tr))
+                    foreach (var el in MLineDrawnElements(ml, tr))
                     {
                         string col = ColorOf(el.Aci, layerAci, byBlockAci);
-                        StrokePts(el.Center, false, col, w, dash);
+                        foreach (var s in el.Segs)
+                        {
+                            var pts = new List<(double X, double Y)> { (s.X1, s.Y1), (s.X2, s.Y2) };
+                            // 画/断由 41 参数决定；线型 dash 不再叠加（避免小段被 dash 切碎）
+                            StrokePts(pts, false, col, w, null);
+                        }
                     }
                 }
                 break;

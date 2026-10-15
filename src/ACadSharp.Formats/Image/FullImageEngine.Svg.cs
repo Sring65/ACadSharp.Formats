@@ -1082,6 +1082,174 @@ internal partial class ImageEngine
         return result;
     }
 
+    // MLine 按正式定义（DXF 41 参数化）提取各子线的实际画线段。
+    // Parameters 语义（DXF MLINE 规范 + cadcodec 参考）：
+    //   p[0] = offset（子线法向偏移，世界单位，已含 ScaleFactor）
+    //   p[1] = width（子线线宽）
+    //   p[2..] = 成对 (start, end) 累计位置（沿路径从 MLine 起点 V0 起的距离），
+    //            定义画线区间。2 参数 → 画全段；4+ 参数 → 只画指定子段。
+    // 返回：每个 element 的画线段列表（每段 = (X1, Y1, X2, Y2) 扁平 4 元组）。
+    private readonly struct MLineDrawnElement
+    {
+        public readonly short Aci;
+        public readonly List<(double X1, double Y1, double X2, double Y2)> Segs;
+        public MLineDrawnElement(short aci, List<(double X1, double Y1, double X2, double Y2)> segs)
+        { Aci = aci; Segs = segs; }
+    }
+
+    private static List<MLineDrawnElement> MLineDrawnElements(MLine ml, Transform2D tr)
+    {
+        var result = new List<MLineDrawnElement>();
+        if (ml?.Vertices == null) return result;
+        int n = ml.Vertices.Count;
+        if (n < 2) return result;
+
+        // 顶点世界化
+        var wp = new (double X, double Y)[n];
+        for (int i = 0; i < n; i++)
+        {
+            var v = ml.Vertices[i];
+            wp[i] = tr == null ? (v.Position.X, v.Position.Y) : tr.Apply(v.Position.X, v.Position.Y);
+        }
+        // 各段单位法向（段 k：V_k→V_{k+1}）
+        var nm = new (double X, double Y)[n - 1];
+        double[] segLen = new double[n - 1];
+        for (int k = 0; k < n - 1; k++)
+        {
+            double dx = wp[k + 1].X - wp[k].X, dy = wp[k + 1].Y - wp[k].Y;
+            double len = Math.Sqrt(dx * dx + dy * dy);
+            segLen[k] = len;
+            if (len < 1e-12) nm[k] = (0, 0);
+            else nm[k] = (-dy / len, dx / len);
+        }
+        // miter 世界化
+        double ca = tr?.Ca ?? 1.0, sa = tr?.Sa ?? 0.0;
+        (double X, double Y) WorldMiter(XYZ m)
+        {
+            double mx = m.X, my = m.Y;
+            if (tr != null) { double rx = mx * ca - my * sa, ry = mx * sa + my * ca; mx = rx; my = ry; }
+            double l = Math.Sqrt(mx * mx + my * my);
+            return l < 1e-12 ? (0, 0) : (mx / l, my / l);
+        }
+        // 累计距离（从 V0 起）
+        double[] cumDist = new double[n];
+        cumDist[0] = 0;
+        for (int k = 0; k < n - 1; k++) cumDist[k + 1] = cumDist[k] + segLen[k];
+        double totalLen = cumDist[n - 1];
+        if (totalLen < 1e-12) return result;
+
+        // 沿偏移中心线取点：给定累计距离 t（0..totalLen），返回世界坐标
+        (double X, double Y) PointAt((double X, double Y)[] center, double t)
+        {
+            if (t <= 0) return center[0];
+            if (t >= totalLen) return center[n - 1];
+            // 找所在段
+            int k = n - 2;
+            for (int i = 1; i < n; i++) { if (t <= cumDist[i]) { k = i - 1; break; } }
+            double local = t - cumDist[k];
+            double frac = segLen[k] > 1e-12 ? local / segLen[k] : 0;
+            return (center[k].X + (center[k + 1].X - center[k].X) * frac,
+                    center[k].Y + (center[k + 1].Y - center[k].Y) * frac);
+        }
+
+        // element 数
+        int eMax = 0;
+        for (int i = 0; i < n; i++) eMax = Math.Max(eMax, ml.Vertices[i].Segments.Count);
+        var styleElems = ml.Style?.Elements?.ToList() ?? new List<ACadSharp.Objects.MLineStyle.Element>();
+
+        for (int e = 0; e < eMax; e++)
+        {
+            // 计算偏移中心线
+            var c = new (double X, double Y)[n];
+            for (int i = 0; i < n; i++)
+            {
+                var seg = ml.Vertices[i].Segments.Count > e ? ml.Vertices[i].Segments[e] : null;
+                double off = (seg != null && seg.Parameters.Count > 0) ? seg.Parameters[0] : 0;
+                (double X, double Y) dir;
+                if (i == 0) dir = nm[0];
+                else if (i == n - 1) dir = nm[n - 2];
+                else { dir = WorldMiter(ml.Vertices[i].Miter); if (dir.X == 0 && dir.Y == 0) dir = nm[i - 1]; }
+                c[i] = (wp[i].X + dir.X * off, wp[i].Y + dir.Y * off);
+            }
+
+            // 提取画线段：按 DXF 41 正式定义（AutoCAD DXF Reference）——
+            //   p[0] = offset（沿 miter 的偏移，已用于定位中心线 c）
+            //   p[1] = 从顶点沿元素路径到元素【实际起点】的距离
+            //   p[2] = 从元素起点到【第一个断口(break/cut)】的距离
+            //   p[3..] = 继续列出各断口的【起点/终点】（均相对元素起点）
+            // 即 p[2..] 是断口（间隙）区间，元素在断口【之外】的区间被画出来。
+            // 2 参数 [off,width] → 无断口，画整段；4+ 参数 → 减去断口区间。
+            var segs = new List<(double X1, double Y1, double X2, double Y2)>();
+            for (int k = 0; k < n - 1; k++)
+            {
+                double segStart = cumDist[k];
+                double segEnd = cumDist[k + 1];
+                if (segEnd - segStart < 1e-12) continue;
+                var startSeg = ml.Vertices[k].Segments.Count > e ? ml.Vertices[k].Segments[e] : null;
+                var pars = startSeg?.Parameters;
+
+                double elementStart = segStart; // 无 pattern → 从段起点画
+                var breaks = new List<(double a, double b)>();
+                if (pars != null && pars.Count >= 4)
+                {
+                    // 元素实际起点（绝对距离），夹到段内
+                    elementStart = segStart + pars[1];
+                    if (elementStart < segStart) elementStart = segStart;
+                    if (elementStart > segEnd) elementStart = segEnd;
+                    int pc = pars.Count;
+                    for (int pi = 2; pi + 1 < pc; pi += 2)
+                    {
+                        // 断口相对元素起点 → 绝对距离，夹到 [elementStart, segEnd]
+                        double ba = elementStart + pars[pi];
+                        double bb = elementStart + pars[pi + 1];
+                        if (ba < elementStart) ba = elementStart;
+                        if (ba > segEnd) ba = segEnd;
+                        if (bb < elementStart) bb = elementStart;
+                        if (bb > segEnd) bb = segEnd;
+                        if (bb - ba > 1e-9) breaks.Add((ba, bb));
+                    }
+                }
+
+                // 在 [elementStart, segEnd] 内按断口切出画线段（断口之外画）
+                double cur = elementStart;
+                foreach (var br in breaks)
+                {
+                    if (br.a > cur + 1e-9)
+                    {
+                        var p1 = PointAt(c, cur);
+                        var p2 = PointAt(c, br.a);
+                        segs.Add((p1.X, p1.Y, p2.X, p2.Y));
+                    }
+                    if (br.b > cur) cur = br.b;
+                }
+                if (segEnd - cur > 1e-9)
+                {
+                    var p1 = PointAt(c, cur);
+                    var p2 = PointAt(c, segEnd);
+                    segs.Add((p1.X, p1.Y, p2.X, p2.Y));
+                }
+            }
+
+            // 颜色
+            short aci = EntityAciIndex(ml);
+            if (e < styleElems.Count)
+            {
+                var col = styleElems[e].Color;
+                try { aci = col.IsTrueColor ? TrueColorToAci(col.R, col.G, col.B) : col.Index; } catch { }
+            }
+            result.Add(new MLineDrawnElement(aci, segs));
+        }
+
+        if (result.Count == 0)
+        {
+            // 无子线定义 → 画中心线全段
+            var segs = new List<(double X1, double Y1, double X2, double Y2)>();
+            for (int k = 0; k < n - 1; k++) segs.Add((wp[k].X, wp[k].Y, wp[k + 1].X, wp[k + 1].Y));
+            result.Add(new MLineDrawnElement(EntityAciIndex(ml), segs));
+        }
+        return result;
+    }
+
     // PolyfaceMesh 线框（三引擎共享）：旧式 3D 多面体网格。每个 Face（VertexFaceRecord.Index1-4，
     // 1-based，0=无效）把有效顶点索引连成一条线串；3 点成三角、4 点成四边形。
     // 顶点（VertexFaceMesh.Location）经 tr 世界化，返回世界系线段列表 (a, b)。
@@ -1719,15 +1887,18 @@ internal partial class ImageEngine
 
             case MLine ml:
                 {
-                    // 多线：按每 vertex.Segments 的 offset 展开各子线（世界系）→ 描边细线。
-                    // MLINE 正确语义=一组平行细线（AutoCAD 2D 渲染永不填充）。旧实现按 41 组码
-                    // (element 3D 厚度) 误判"有宽度"→ 走 EmitQuadFill 填充成实心楔形带（错误）。
-                    // DXF 41 是 3D extrusion 厚度，与 2D 线宽无关；故始终描边、不用 MLineHasWidth。
+                    // 多线：按 DXF 41 参数化提取各子线的实际画线段（含画/断模式与开口长短），
+                    // 逐段描边细线。MLINE 正确语义=一组平行细线（AutoCAD 2D 渲染永不填充）。
+                    // 旧实现只用 p[0](offset) 画整条子线，忽略 p[2..] 画/断区间 → 缺失开口/长短齿。
                     double w = StrokeWidth(ent, scaleMul);
-                    foreach (var el in MLineElements(ml, tr))
+                    foreach (var el in MLineDrawnElements(ml, tr))
                     {
                         string col = ColorOf(el.Aci, layerAci, byBlockAci);
-                        EmitPolyline(sb, el.Center, col, w, false, dash);
+                        foreach (var s in el.Segs)
+                        {
+                            var pts = new List<(double X, double Y)> { (s.X1, s.Y1), (s.X2, s.Y2) };
+                            EmitPolyline(sb, pts, col, w, false, dash);
+                        }
                     }
                 }
                 break;

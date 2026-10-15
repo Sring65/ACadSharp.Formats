@@ -725,10 +725,10 @@ internal partial class ImageEngine
                 if (px < cMinX) cMinX = px; if (px > cMaxX) cMaxX = px;
                 if (py < cMinY) cMinY = py; if (py > cMaxY) cMaxY = py;
             }
-        // PDF 画布系方向（y 向上：uy = +sin）
+        // PDF 画布系方向（y 向上：uy = +sin，yDown=false）
         double ang = gp.Angle;
         double ux = Math.Cos(ang), uy = Math.Sin(ang);
-        var geom = ComputeHatchGradGeom(spec, cMinX, cMinY, cMaxX, cMaxY, ux, uy);
+        var geom = ComputeHatchGradGeom(spec, cMinX, cMinY, cMaxX, cMaxY, ux, uy, false);
         string c1 = HexToRgbPdf(StopHex(spec.C1));
         string c2 = HexToRgbPdf(StopHex(spec.C2));
         if (geom.Radial)

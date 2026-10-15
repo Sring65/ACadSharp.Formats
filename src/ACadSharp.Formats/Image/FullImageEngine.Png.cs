@@ -1100,14 +1100,14 @@ internal partial class ImageEngine
         bool evenOdd = contours.Count > 1;
         if (gradient)
         {
-            // 接入共享 9 类型模型：minX/Y 已是像素单位（PngSx/PngSy），画布系 Y 翻转→uy 取反。
+            // 接入共享 9 类型 LUT 模型：minX/Y 已是像素单位（PngSx/PngSy），画布系 Y 翻转→uy 取反、yDown=true。
             var spec = MakeHatchGradSpec(gp);
             double ang = gp.Angle;
             double ux = Math.Cos(ang), uy = -Math.Sin(ang);
-            var geom = ComputeHatchGradGeom(spec, minX, minY, maxX, maxY, ux, uy);
+            var geom = ComputeHatchGradGeom(spec, minX, minY, maxX, maxY, ux, uy, true);
             var c1 = HexToRgb(StopHex(spec.C1));
             var c2 = HexToRgb(StopHex(spec.C2));
-            var prof = new Func<float, float>(u => (float)HatchGradProfile(spec.Kind, spec.Inverted, u));
+            var prof = new Func<float, float>(u => (float)HatchGradProfileLut(spec, u));
             if (geom.Radial)
                 _rc.FillGradientProfile(contours, evenOdd, new RasterCanvas.P(0, 0), new RasterCanvas.P(0, 0), c1, c2, true, (float)geom.Fx, (float)geom.Fy, (float)geom.R, prof);
             else

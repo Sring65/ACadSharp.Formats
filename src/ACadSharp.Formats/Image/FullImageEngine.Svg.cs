@@ -3508,21 +3508,79 @@ internal partial class ImageEngine
         };
     }
 
-    // 剖面函数 profile(u)：u∈[0,1]（0=C1 端，1=C2 端），返回插值系数。
-    // 各类型模拟圆柱/球面/抛物面光照的亮度剖面；Inverted=1−profile。
-    private static double HatchGradProfile(HatchGradKind kind, bool inverted, double u)
+    // ============================================================================
+    // 渐变剖面 LUT（数据驱动 ground-truth）——从 AutoCAD 渲染逐像素提取，33 点。
+    //   f∈[0,1]：0=C1(红)端，1=C2(蓝)端。轴向=沿梯度轴归一化位置 t；径向=焦点归一化距离 r。
+    //   9 类型×{shift0,shift1}；INV 类型 = 1 − base（渲染时取反，已验证均差<0.08）。
+    //   关键：轴向类是"钟形"非单调（CYLINDER≈sin(πt)、CURVED 极缓钟形、LINEAR 线性）；
+    //         径向类=峰值/谷值曲线（SPHERICAL 峰 1.0、HEMISPHERICAL 峰 0.70）。
+    //   shift 直接映射 LUT 索引（s0 对称/s1 偏斜），偏斜已编码进 LUT，几何不再偏移轴。
+    //   角度由几何旋转处理，LUT 只依赖 t/r（按 0° 提取）。
+    // ============================================================================
+    private static readonly double[] LUT_LINEAR_s0 =
+        { 0.059, 0.073, 0.099, 0.128, 0.154, 0.183, 0.212, 0.242, 0.272, 0.299, 0.328, 0.357, 0.386, 0.414, 0.441, 0.469, 0.498,
+          0.527, 0.556, 0.582, 0.612, 0.642, 0.672, 0.701, 0.727, 0.756, 0.784, 0.813, 0.842, 0.869, 0.899, 0.929, 0.945 };
+    private static readonly double[] LUT_CYLINDER_s0 =
+        { 0.176, 0.219, 0.297, 0.382, 0.462, 0.537, 0.603, 0.669, 0.733, 0.797, 0.852, 0.899, 0.934, 0.959, 0.978, 0.987, 0.988,
+          0.982, 0.969, 0.946, 0.919, 0.876, 0.823, 0.761, 0.697, 0.633, 0.571, 0.501, 0.422, 0.335, 0.250, 0.165, 0.120 };
+    private static readonly double[] LUT_CYLINDER_s1 =
+        { 0.312, 0.380, 0.505, 0.640, 0.742, 0.833, 0.894, 0.944, 0.971, 0.985, 0.986, 0.981, 0.964, 0.950, 0.933, 0.916, 0.891,
+          0.859, 0.824, 0.786, 0.752, 0.713, 0.674, 0.624, 0.571, 0.517, 0.466, 0.418, 0.361, 0.305, 0.244, 0.182, 0.149 };
+    private static readonly double[] LUT_CURVED_s0 =
+        { 0.608, 0.614, 0.625, 0.637, 0.646, 0.653, 0.658, 0.663, 0.669, 0.673, 0.678, 0.683, 0.688, 0.692, 0.697, 0.703, 0.705,
+          0.704, 0.700, 0.695, 0.690, 0.684, 0.680, 0.676, 0.673, 0.669, 0.665, 0.659, 0.652, 0.642, 0.632, 0.622, 0.616 };
+    private static readonly double[] LUT_CURVED_s1 =
+        { 0.678, 0.682, 0.688, 0.696, 0.701, 0.703, 0.700, 0.696, 0.692, 0.688, 0.684, 0.680, 0.676, 0.674, 0.671, 0.667, 0.658,
+          0.645, 0.629, 0.614, 0.598, 0.582, 0.567, 0.551, 0.534, 0.518, 0.501, 0.486, 0.465, 0.444, 0.419, 0.395, 0.382 };
+    private static readonly double[] LUT_SPHERICAL_s0 =
+        { 0.998, 0.994, 0.986, 0.976, 0.963, 0.950, 0.929, 0.906, 0.877, 0.841, 0.807, 0.765, 0.724, 0.669, 0.612, 0.558, 0.513,
+          0.469, 0.418, 0.352, 0.283, 0.225, 0.170, 0.114, 0.061, 0.023, 0.008, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000 };
+    private static readonly double[] LUT_SPHERICAL_s1 =
+        { 0.992, 0.986, 0.972, 0.946, 0.914, 0.871, 0.816, 0.748, 0.673, 0.605, 0.530, 0.450, 0.363, 0.278, 0.190, 0.105, 0.040,
+          0.008, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000 };
+    private static readonly double[] LUT_HEMISPHERICAL_s0 =
+        { 0.700, 0.690, 0.667, 0.642, 0.622, 0.600, 0.579, 0.554, 0.530, 0.509, 0.488, 0.468, 0.443, 0.422, 0.401, 0.379, 0.354,
+          0.327, 0.301, 0.276, 0.250, 0.222, 0.195, 0.169, 0.141, 0.110, 0.081, 0.059, 0.040, 0.023, 0.010, 0.005, 0.005 };
+    private static readonly double[] LUT_HEMISPHERICAL_s1 =
+        { 0.322, 0.327, 0.339, 0.351, 0.361, 0.372, 0.382, 0.394, 0.405, 0.414, 0.424, 0.429, 0.428, 0.420, 0.410, 0.398, 0.388,
+          0.378, 0.368, 0.358, 0.348, 0.337, 0.325, 0.306, 0.284, 0.257, 0.229, 0.198, 0.170, 0.142, 0.114, 0.082, 0.067 };
+
+    // 按 (类型, shift) 取对应 LUT（INV 由调用方对返回值取反）
+    private static double[] GradLut(HatchGradKind kind, int shift)
+    {
+        switch (kind)
+        {
+            case HatchGradKind.Linear: return LUT_LINEAR_s0;
+            case HatchGradKind.Cylinder: return shift >= 1 ? LUT_CYLINDER_s1 : LUT_CYLINDER_s0;
+            case HatchGradKind.Curved: return shift >= 1 ? LUT_CURVED_s1 : LUT_CURVED_s0;
+            case HatchGradKind.Spherical: return shift >= 1 ? LUT_SPHERICAL_s1 : LUT_SPHERICAL_s0;
+            case HatchGradKind.Hemispherical: return shift >= 1 ? LUT_HEMISPHERICAL_s1 : LUT_HEMISPHERICAL_s0;
+            default: return LUT_LINEAR_s0;
+        }
+    }
+
+    // 剖面函数 profile(u)：u∈[0,1]（0=C1 端，1=C2 端），返回插值系数 f。
+    // LINEAR=恒等 t（线性渐变本质，已验证 MAE<2）；其余按 (类型,shift) 查 LUT 线性插值。
+    // Inverted=1−f（INV 类型）。shift 决定 LUT 索引（s0 对称/s1 偏斜）。
+    private static double HatchGradProfileLut(HatchGradSpec spec, double u)
     {
         if (u < 0) u = 0; else if (u > 1) u = 1;
         double f;
-        switch (kind)
+        if (spec.Kind == HatchGradKind.Linear)
         {
-            case HatchGradKind.Cylinder: f = 0.5 * (1.0 - Math.Cos(Math.PI * u)); break;      // 轴向 S 形
-            case HatchGradKind.Curved: f = u * u; break;                                       // 轴向抛物
-            case HatchGradKind.Spherical: f = 1.0 - Math.Cos(Math.PI * u * 0.5); break;        // 径向球面
-            case HatchGradKind.Hemispherical: f = Math.Sqrt(Math.Max(0, 2 * u - u * u)); break;// 径向半球
-            default: f = u; break;                                                             // 线性
+            f = u;
         }
-        if (inverted) f = 1.0 - f;
+        else
+        {
+            int shift = spec.Shift >= 0.5 ? 1 : 0;
+            var lut = GradLut(spec.Kind, shift);
+            double x = u * (lut.Length - 1);
+            int i0 = (int)Math.Floor(x);
+            int i1 = Math.Min(lut.Length - 1, i0 + 1);
+            double fr = x - i0;
+            f = lut[i0] * (1.0 - fr) + lut[i1] * fr;
+        }
+        if (spec.Inverted) f = 1.0 - f;
         if (f < 0) f = 0; else if (f > 1) f = 1;
         return f;
     }
@@ -3538,7 +3596,10 @@ internal partial class ImageEngine
         { Radial = radial; Px0 = px0; Py0 = py0; Px1 = px1; Py1 = py1; Fx = fx; Fy = fy; R = r; }
     }
 
-    private static HatchGradGeom ComputeHatchGradGeom(HatchGradSpec spec, double minX, double minY, double maxX, double maxY, double ux, double uy)
+    // 径向 shift=1 焦点（归一化图像坐标，(0,0)=左上）——从 CAD ground-truth 提取（SPHERICAL 可靠峰值）。
+    private static readonly double RadialFocusS1X = 0.23, RadialFocusS1Y = 0.23;
+
+    private static HatchGradGeom ComputeHatchGradGeom(HatchGradSpec spec, double minX, double minY, double maxX, double maxY, double ux, double uy, bool yDown)
     {
         double cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
         double W = maxX - minX, H = maxY - minY;
@@ -3547,16 +3608,18 @@ internal partial class ImageEngine
         // 归一化画布系方向（PNG 的 x/y 缩放不同可能传入非单位向量；L 公式与投影均假设单位向量）
         double umag = Math.Sqrt(ux * ux + uy * uy);
         if (umag < 1e-12) { ux = 1; uy = 0; } else { ux /= umag; uy /= umag; }
-        // 沿方向 u 的投影半长（轴向轴长一半 / 径向基础半径）
+        // 沿方向 u 的投影半长（轴向轴长一半）
         double L = 0.5 * (W * Math.Abs(ux) + H * Math.Abs(uy));
         if (L <= 1e-9) L = 0.25 * diag;
-        bool centered = spec.Shift >= 0.5;
+        int shift = spec.Shift >= 0.5 ? 1 : 0;
         if (spec.Radial)
         {
-            // 径向：居中→焦点在中心；非居中→焦点沿 -u 方向移向角（半径相应放大以覆盖对角）。
-            double fx = centered ? cx : cx - L * ux;
-            double fy = centered ? cy : cy - L * uy;
-            // R = 焦点到包围盒最远角点距离（保证整个填充区域被渐变覆盖，远角处 t≈1）
+            // 径向焦点（图像归一化 (0,0)=左上）：s0 中心 / s1 左上。按 yDown 转画布坐标。
+            double nfx = shift == 1 ? RadialFocusS1X : 0.5;
+            double nfy = shift == 1 ? RadialFocusS1Y : 0.5;
+            double fx = minX + nfx * W;
+            double fy = yDown ? (minY + nfy * H) : (maxY - nfy * H); // PDF y 向上：图像顶=画布 maxY
+            // R = 焦点到包围盒最远角点距离（远角处 t≈1，LUT 尾部到 0）
             double R = 0;
             foreach (double ax in new[] { minX, maxX })
                 foreach (double ay in new[] { minY, maxY })
@@ -3569,12 +3632,9 @@ internal partial class ImageEngine
         }
         else
         {
-            // 轴向：居中→轴对称于中心；非居中→非线性类型高光向角偏移（LINEAR 恒对称、两端到两端）。
-            if (centered || spec.Kind == HatchGradKind.Linear)
-                return new HatchGradGeom(false, cx - L * ux, cy - L * uy, cx + L * ux, cy + L * uy, 0, 0, 0);
-            // 非居中非线性：轴整体向 -u 偏移 L（焦点/峰值移到角侧）
-            double ox = cx - L * ux, oy = cy - L * uy; // 偏移后的 t=0.5 中心
-            return new HatchGradGeom(false, ox - L * ux, oy - L * uy, ox + L * ux, oy + L * uy, 0, 0, 0);
+            // 轴向：轴恒为 bbox 沿 u 的全跨度（居中于 bbox 中心）。偏斜由 LUT 编码（s1 峰值偏左），
+            // 几何不再偏移轴（旧实现的"非居中偏移 L"是错的，会与 LUT 偏斜叠加）。
+            return new HatchGradGeom(false, cx - L * ux, cy - L * uy, cx + L * ux, cy + L * uy, 0, 0, 0);
         }
     }
 
@@ -3660,10 +3720,10 @@ internal partial class ImageEngine
                 if (px < cMinX) cMinX = px; if (px > cMaxX) cMaxX = px;
                 if (py < cMinY) cMinY = py; if (py > cMaxY) cMaxY = py;
             }
-        // 画布系单位方向（SVG Y 翻转：uy 取反）
+        // 画布系单位方向（SVG Y 翻转：uy 取反，yDown=true）
         double ang = gp.Angle;
         double ux = Math.Cos(ang), uy = -Math.Sin(ang);
-        var geom = ComputeHatchGradGeom(spec, cMinX, cMinY, cMaxX, cMaxY, ux, uy);
+        var geom = ComputeHatchGradGeom(spec, cMinX, cMinY, cMaxX, cMaxY, ux, uy, true);
 
         string c1 = StopHex(spec.C1), c2 = StopHex(spec.C2);
         if (geom.Radial)
@@ -3680,15 +3740,15 @@ internal partial class ImageEngine
         }
     }
 
-    // 按剖面 profile(u) 生成 SVG <stop> 序列：u=0..1 步进 0.05，颜色 = lerp(c1,c2,profile(u))。
-    // LINEAR（profile=u）等价于均匀两端插值；非线性（圆柱/球/抛物）由此采样逼近。
+    // 按 LUT 剖面生成 SVG <stop> 序列：u=0..1 步进 0.03（34 点，≥LUT 33 点保精度），
+    // 颜色 = lerp(c1,c2,LutProfile(u))。LINEAR 恒等；非线性（圆柱/球/抛物钟形）由采样逼近。
     private void AppendGradientProfileStops(HatchGradSpec spec, string c1, string c2)
     {
-        const int N = 20; // 21 个采样点（含两端）
+        const int N = 33; // 与 LUT 点数一致
         for (int i = 0; i <= N; i++)
         {
             double u = i / (double)N;
-            double f = HatchGradProfile(spec.Kind, spec.Inverted, u);
+            double f = HatchGradProfileLut(spec, u);
             string col = (i == 0) ? c1 : (i == N) ? c2 : LerpHex(c1, c2, f);
             _svgDefs.AppendLine($"      <stop offset=\"{u.ToString("0.###", Ci)}\" stop-color=\"{col}\"/>");
         }

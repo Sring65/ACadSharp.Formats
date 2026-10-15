@@ -3456,14 +3456,145 @@ internal partial class ImageEngine
         return ColorOf(aci, layerAci, byBlockAci);
     }
 
-    // 渐变类型按 470 原始名判断：球面/椭圆类（SPHERICAL/INVSPHERICAL/HEMISPHERICAL/ELLIPTIC 等）→ 径向（中心向外）；
-    // 线性类（LINEAR/CYLINDER/FLAT）→ 沿 460 角度线性近似。名称含 SPHERICAL 或 ELLIPTIC 子串即判为径向。
-    // 三引擎（SVG radialGradient / PNG FillGradient radial / PDF ShadingType 3）共享此判定。
-    private static bool IsEllipticGradient(HatchGradientPattern gp)
+    // ============================================================================
+    // 渐变类型共享模型（AutoCAD GFNAME 9 种）—— 三引擎（PNG 逐像素 / SVG 渐变定义 /
+    // PDF shading）共享此分类、剖面函数与几何（轴向端点 / 径向焦点）。
+    //   GFNAME: 1=LINEAR 2=CYLINDER 3=INVCYLINDER 4=SPHERICAL 5=HEMISPHERICAL
+    //           6=CURVED 7=INVSPHERICAL 8=INVHEMISPHERICAL 9=INVCURVED
+    // 关键属性（DXF 组码）：470=名称(类型) 460=角度(弧度) 461=Shift(居中 0/1)
+    //   452=单色/双色 453/463/421=色标(位置+颜色)。
+    // 剖面 profile(u)：u∈[0,1]，0=C1 端，1=C2 端。
+    //   LINEAR 恒等；CYLINDER 轴向 S 形 0.5(1-cosπu)；CURVED 抛物 u²；
+    //   SPHERICAL 径向 1-cos(πr/2)；HEMISPHERICAL 径向 √(2r-r²)。Inverted=1-profile。
+    // 居中/Shift：径向类非居中→焦点移向角(沿-角度方向)、居中→焦点在中心；
+    //   轴向非线性类非居中→高光偏移向角、居中→对称居中。LINEAR 不受 Shift 影响。
+    // ============================================================================
+    private enum HatchGradKind { Linear, Cylinder, Spherical, Hemispherical, Curved }
+
+    // 渐变类型解析结果（非 readonly struct：字段供对象初始化器赋值）
+    private struct HatchGradSpec
     {
-        string n = gp.Name ?? "";
-        return n.IndexOf("SPHERICAL", StringComparison.OrdinalIgnoreCase) >= 0
-            || n.IndexOf("ELLIPTIC", StringComparison.OrdinalIgnoreCase) >= 0;
+        public HatchGradKind Kind;
+        public bool Inverted;      // INVCYLINDER/INVSPHERICAL/INVHEMISPHERICAL/INVCURVED
+        public bool Radial;        // 径向（SPHERICAL/INVSPHERICAL/HEMISPHERICAL/INVHEMISPHERICAL）
+        public double Shift;       // 461（0=非居中, 1=居中）
+        public bool Single;        // 452 单色渐变
+        public ACadSharp.Color C1, C2; // 双端颜色（463=0 端 / 463=1 端）
+    }
+
+    private static HatchGradSpec MakeHatchGradSpec(HatchGradientPattern gp)
+    {
+        string n = (gp?.Name ?? "").Trim().ToUpperInvariant();
+        bool inverted = n.StartsWith("INV", StringComparison.Ordinal);
+        string baseName = inverted ? n.Substring(3) : n;
+        HatchGradKind kind; bool radial;
+        switch (baseName)
+        {
+            case "CYLINDER": kind = HatchGradKind.Cylinder; radial = false; break;
+            case "HEMISPHERICAL": kind = HatchGradKind.Hemispherical; radial = true; break;
+            case "CURVED": kind = HatchGradKind.Curved; radial = false; break;
+            case "SPHERICAL": kind = HatchGradKind.Spherical; radial = true; break;
+            default: kind = HatchGradKind.Linear; radial = false; break; // LINEAR / 空名 / 默认
+        }
+        var cols = gp?.Colors;
+        var c1 = cols != null && cols.Count > 0 ? cols[0].Color : ACadSharp.Color.Default;
+        var c2 = cols != null && cols.Count > 1 ? cols[cols.Count - 1].Color : ACadSharp.Color.Default;
+        return new HatchGradSpec
+        {
+            Kind = kind, Inverted = inverted, Radial = radial,
+            Shift = Math.Clamp(gp?.Shift ?? 0.0, 0.0, 1.0),
+            Single = gp?.IsSingleColorGradient ?? false,
+            C1 = c1, C2 = c2,
+        };
+    }
+
+    // 剖面函数 profile(u)：u∈[0,1]（0=C1 端，1=C2 端），返回插值系数。
+    // 各类型模拟圆柱/球面/抛物面光照的亮度剖面；Inverted=1−profile。
+    private static double HatchGradProfile(HatchGradKind kind, bool inverted, double u)
+    {
+        if (u < 0) u = 0; else if (u > 1) u = 1;
+        double f;
+        switch (kind)
+        {
+            case HatchGradKind.Cylinder: f = 0.5 * (1.0 - Math.Cos(Math.PI * u)); break;      // 轴向 S 形
+            case HatchGradKind.Curved: f = u * u; break;                                       // 轴向抛物
+            case HatchGradKind.Spherical: f = 1.0 - Math.Cos(Math.PI * u * 0.5); break;        // 径向球面
+            case HatchGradKind.Hemispherical: f = Math.Sqrt(Math.Max(0, 2 * u - u * u)); break;// 径向半球
+            default: f = u; break;                                                             // 线性
+        }
+        if (inverted) f = 1.0 - f;
+        if (f < 0) f = 0; else if (f > 1) f = 1;
+        return f;
+    }
+
+    // 渐变几何（画布系）：轴向→端点(Px0,Py0)-(Px1,Py1)；径向→焦点(Fx,Fy)+半径R。
+    // bbox 为画布坐标；ux,uy=画布系单位方向向量（Y 已按各引擎翻转/朝向）。
+    private readonly struct HatchGradGeom
+    {
+        public readonly bool Radial;
+        public readonly double Px0, Py0, Px1, Py1;
+        public readonly double Fx, Fy, R;
+        public HatchGradGeom(bool radial, double px0, double py0, double px1, double py1, double fx, double fy, double r)
+        { Radial = radial; Px0 = px0; Py0 = py0; Px1 = px1; Py1 = py1; Fx = fx; Fy = fy; R = r; }
+    }
+
+    private static HatchGradGeom ComputeHatchGradGeom(HatchGradSpec spec, double minX, double minY, double maxX, double maxY, double ux, double uy)
+    {
+        double cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
+        double W = maxX - minX, H = maxY - minY;
+        double diag = Math.Sqrt(W * W + H * H);
+        if (diag <= 1e-9) diag = 1;
+        // 归一化画布系方向（PNG 的 x/y 缩放不同可能传入非单位向量；L 公式与投影均假设单位向量）
+        double umag = Math.Sqrt(ux * ux + uy * uy);
+        if (umag < 1e-12) { ux = 1; uy = 0; } else { ux /= umag; uy /= umag; }
+        // 沿方向 u 的投影半长（轴向轴长一半 / 径向基础半径）
+        double L = 0.5 * (W * Math.Abs(ux) + H * Math.Abs(uy));
+        if (L <= 1e-9) L = 0.25 * diag;
+        bool centered = spec.Shift >= 0.5;
+        if (spec.Radial)
+        {
+            // 径向：居中→焦点在中心；非居中→焦点沿 -u 方向移向角（半径相应放大以覆盖对角）。
+            double fx = centered ? cx : cx - L * ux;
+            double fy = centered ? cy : cy - L * uy;
+            // R = 焦点到包围盒最远角点距离（保证整个填充区域被渐变覆盖，远角处 t≈1）
+            double R = 0;
+            foreach (double ax in new[] { minX, maxX })
+                foreach (double ay in new[] { minY, maxY })
+                {
+                    double dd = Math.Sqrt((ax - fx) * (ax - fx) + (ay - fy) * (ay - fy));
+                    if (dd > R) R = dd;
+                }
+            if (R <= 1e-9) R = L;
+            return new HatchGradGeom(true, 0, 0, 0, 0, fx, fy, R);
+        }
+        else
+        {
+            // 轴向：居中→轴对称于中心；非居中→非线性类型高光向角偏移（LINEAR 恒对称、两端到两端）。
+            if (centered || spec.Kind == HatchGradKind.Linear)
+                return new HatchGradGeom(false, cx - L * ux, cy - L * uy, cx + L * ux, cy + L * uy, 0, 0, 0);
+            // 非居中非线性：轴整体向 -u 偏移 L（焦点/峰值移到角侧）
+            double ox = cx - L * ux, oy = cy - L * uy; // 偏移后的 t=0.5 中心
+            return new HatchGradGeom(false, ox - L * ux, oy - L * uy, ox + L * ux, oy + L * uy, 0, 0, 0);
+        }
+    }
+
+    // 像素 (px,py) → 渐变参数 t∈[0,1]（0=C1 端，1=C2 端）。轴向=沿轴投影；径向=到焦点距离/半径。
+    private static double HatchGradParam(HatchGradGeom g, double px, double py)
+    {
+        double t;
+        if (g.Radial)
+        {
+            double dx = px - g.Fx, dy = py - g.Fy;
+            t = g.R > 1e-9 ? Math.Sqrt(dx * dx + dy * dy) / g.R : 0;
+        }
+        else
+        {
+            double dx = g.Px1 - g.Px0, dy = g.Py1 - g.Py0;
+            double len2 = dx * dx + dy * dy;
+            t = len2 > 1e-9 ? ((px - g.Px0) * dx + (py - g.Py0) * dy) / len2 : 0;
+        }
+        if (t < 0) t = 0; else if (t > 1) t = 1;
+        return t;
     }
 
     // 渐变色标 hex：真色直取，否则走 ACI 官方表（含 7 号白/黑随底色反色）
@@ -3514,41 +3645,65 @@ internal partial class ImageEngine
         }
     }
 
-    // SVG 渐变定义（写入 _svgDefs；userSpaceOnUse 坐标 = 画布像素坐标）
-    // 460 角度沿梯度方向；范围取 hatch 包围盒对角线一半
+    // SVG 渐变定义（写入 _svgDefs；userSpaceOnUse 坐标 = 画布像素坐标）。
+    // 接入共享 9 类型模型：轴向 linearGradient / 径向 radialGradient（焦点由居中决定）；
+    // 非线性剖面（圆柱/球/抛物）用多 stop 采样逼近（u=0..1 步进 0.05）。
     private void EmitHatchGradientDef(string id, List<List<XY>> loops, HatchGradientPattern gp)
     {
-        double minX = double.MaxValue, minY = double.MaxValue, maxX = double.MinValue, maxY = double.MinValue;
+        var spec = MakeHatchGradSpec(gp);
+        // 画布系 bbox（SVG Y 翻转：世界 minY→画布大 Y）
+        double cMinX = double.MaxValue, cMaxX = double.MinValue, cMinY = double.MaxValue, cMaxY = double.MinValue;
         foreach (var loop in loops)
             foreach (var p in loop)
             {
-                if (p.X < minX) minX = p.X; if (p.Y < minY) minY = p.Y;
-                if (p.X > maxX) maxX = p.X; if (p.Y > maxY) maxY = p.Y;
+                double px = Sx(p.X), py = Sy(p.Y);
+                if (px < cMinX) cMinX = px; if (px > cMaxX) cMaxX = px;
+                if (py < cMinY) cMinY = py; if (py > cMaxY) cMaxY = py;
             }
-        double cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
-        double L = 0.5 * Math.Sqrt((maxX - minX) * (maxX - minX) + (maxY - minY) * (maxY - minY));
-        if (!double.IsFinite(L) || L <= 0) L = 1.0;
-        // 渐变色标：Colors 列表（463 位置 + 421 颜色）；取首/末两个色标（双端渐变）
-        string c1 = "#FFFFFF", c2 = "#000000";
-        if (gp.Colors != null && gp.Colors.Count >= 2)
+        // 画布系单位方向（SVG Y 翻转：uy 取反）
+        double ang = gp.Angle;
+        double ux = Math.Cos(ang), uy = -Math.Sin(ang);
+        var geom = ComputeHatchGradGeom(spec, cMinX, cMinY, cMaxX, cMaxY, ux, uy);
+
+        string c1 = StopHex(spec.C1), c2 = StopHex(spec.C2);
+        if (geom.Radial)
         {
-            c1 = StopHex(gp.Colors[0].Color);
-            c2 = StopHex(gp.Colors[gp.Colors.Count - 1].Color);
-        }
-        bool elliptic = IsEllipticGradient(gp);
-        if (elliptic)
-        {
-            _svgDefs.AppendLine($"    <radialGradient id=\"{id}\" gradientUnits=\"userSpaceOnUse\" cx=\"{F(Sx(cx))}\" cy=\"{F(Sy(cy))}\" r=\"{F(L)}\">");
+            _svgDefs.AppendLine($"    <radialGradient id=\"{id}\" gradientUnits=\"userSpaceOnUse\" cx=\"{F(geom.Fx)}\" cy=\"{F(geom.Fy)}\" r=\"{F(geom.R)}\" fx=\"{F(geom.Fx)}\" fy=\"{F(geom.Fy)}\">");
+            AppendGradientProfileStops(spec, c1, c2);
+            _svgDefs.AppendLine("    </radialGradient>");
         }
         else
         {
-            double ang = gp.Angle; // fork 弧度
-            double dx = Math.Cos(ang), dy = Math.Sin(ang);
-            _svgDefs.AppendLine($"    <linearGradient id=\"{id}\" gradientUnits=\"userSpaceOnUse\" x1=\"{F(Sx(cx - dx * L))}\" y1=\"{F(Sy(cy - dy * L))}\" x2=\"{F(Sx(cx + dx * L))}\" y2=\"{F(Sy(cy + dy * L))}\">");
+            _svgDefs.AppendLine($"    <linearGradient id=\"{id}\" gradientUnits=\"userSpaceOnUse\" x1=\"{F(geom.Px0)}\" y1=\"{F(geom.Py0)}\" x2=\"{F(geom.Px1)}\" y2=\"{F(geom.Py1)}\">");
+            AppendGradientProfileStops(spec, c1, c2);
+            _svgDefs.AppendLine("    </linearGradient>");
         }
-        _svgDefs.AppendLine($"      <stop offset=\"0\" stop-color=\"{c1}\"/>");
-        _svgDefs.AppendLine($"      <stop offset=\"1\" stop-color=\"{c2}\"/>");
-        _svgDefs.AppendLine(elliptic ? "    </radialGradient>" : "    </linearGradient>");
+    }
+
+    // 按剖面 profile(u) 生成 SVG <stop> 序列：u=0..1 步进 0.05，颜色 = lerp(c1,c2,profile(u))。
+    // LINEAR（profile=u）等价于均匀两端插值；非线性（圆柱/球/抛物）由此采样逼近。
+    private void AppendGradientProfileStops(HatchGradSpec spec, string c1, string c2)
+    {
+        const int N = 20; // 21 个采样点（含两端）
+        for (int i = 0; i <= N; i++)
+        {
+            double u = i / (double)N;
+            double f = HatchGradProfile(spec.Kind, spec.Inverted, u);
+            string col = (i == 0) ? c1 : (i == N) ? c2 : LerpHex(c1, c2, f);
+            _svgDefs.AppendLine($"      <stop offset=\"{u.ToString("0.###", Ci)}\" stop-color=\"{col}\"/>");
+        }
+    }
+
+    // hex 颜色按 t∈[0,1] 线性插值（RGB 分量）
+    private static string LerpHex(string h1, string h2, double t)
+    {
+        if (t < 0) t = 0; else if (t > 1) t = 1;
+        byte r1 = Convert.ToByte(h1.Substring(1, 2), 16), g1 = Convert.ToByte(h1.Substring(3, 2), 16), b1 = Convert.ToByte(h1.Substring(5, 2), 16);
+        byte r2 = Convert.ToByte(h2.Substring(1, 2), 16), g2 = Convert.ToByte(h2.Substring(3, 2), 16), b2 = Convert.ToByte(h2.Substring(5, 2), 16);
+        byte R = (byte)(r1 + (r2 - r1) * t);
+        byte G = (byte)(g1 + (g2 - g1) * t);
+        byte B = (byte)(b1 + (b2 - b1) * t);
+        return "#" + R.ToString("X2") + G.ToString("X2") + B.ToString("X2");
     }
 
     // ===== 图案 HATCH（ANSI31/411B 等带显式线定义者）=====

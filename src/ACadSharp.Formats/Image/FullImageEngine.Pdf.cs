@@ -709,27 +709,33 @@ internal partial class ImageEngine
         }
     }
 
-    // 计算 PDF shading 参数（坐标为 PDF 用户空间，y 向上）
+    // 计算 PDF shading 参数（坐标为 PDF 用户空间，y 向上）。
+    // 接入共享 9 类型模型：径向(SPHERICAL/INVSPHERICAL/HEMISPHERICAL/INVHEMISPHERICAL)→Type3(焦点由居中决定)；
+    // 轴向(LINEAR/CYLINDER/INVCYLINDER/CURVED/INVCURVED)→Type2(沿 460 角度，居中偏移)。
+    // PDF 矢量 shading 仅支持双端线性插值(FunctionType 2)，剖面曲线(圆柱/球/抛物)无法表达→用端点近似。
     private (int ShadingType, string Coords, string C0, string C1) MakePdfShading(List<List<XY>> loops, HatchGradientPattern gp)
     {
-        double minX = double.MaxValue, minY = double.MaxValue, maxX = double.MinValue, maxY = double.MinValue;
+        var spec = MakeHatchGradSpec(gp);
+        // PDF 画布系 bbox（Py y 向上不翻转）
+        double cMinX = double.MaxValue, cMaxX = double.MinValue, cMinY = double.MaxValue, cMaxY = double.MinValue;
         foreach (var loop in loops)
             foreach (var p in loop)
             {
-                if (p.X < minX) minX = p.X; if (p.Y < minY) minY = p.Y;
-                if (p.X > maxX) maxX = p.X; if (p.Y > maxY) maxY = p.Y;
+                double px = Sx(p.X), py = Py(p.Y);
+                if (px < cMinX) cMinX = px; if (px > cMaxX) cMaxX = px;
+                if (py < cMinY) cMinY = py; if (py > cMaxY) cMaxY = py;
             }
-        double cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
-        double L = 0.5 * Math.Sqrt((maxX - minX) * (maxX - minX) + (maxY - minY) * (maxY - minY));
-        if (!double.IsFinite(L) || L <= 0) L = 1.0;
-        // 渐变色标：Colors 列表取首/末两个（双端渐变）
-        string c1 = HexToRgbPdf(StopHex(gp.Colors[0].Color));
-        string c2 = HexToRgbPdf(StopHex(gp.Colors[gp.Colors.Count - 1].Color));
-        if (IsEllipticGradient(gp))
-            return (3, $"{F(Sx(cx))} {F(Py(cy))} {F(Sx(cx))} {F(Py(cy))} 0 0 {F(L)} 0", c1, c2);
-        double ang = gp.Angle; // fork 弧度
-        double dx = Math.Cos(ang), dy = Math.Sin(ang);
-        return (2, $"{F(Sx(cx - dx * L))} {F(Py(cy - dy * L))} {F(Sx(cx + dx * L))} {F(Py(cy + dy * L))}", c1, c2);
+        // PDF 画布系方向（y 向上：uy = +sin）
+        double ang = gp.Angle;
+        double ux = Math.Cos(ang), uy = Math.Sin(ang);
+        var geom = ComputeHatchGradGeom(spec, cMinX, cMinY, cMaxX, cMaxY, ux, uy);
+        string c1 = HexToRgbPdf(StopHex(spec.C1));
+        string c2 = HexToRgbPdf(StopHex(spec.C2));
+        if (geom.Radial)
+            // Type3 径向：焦点 (Fx,Fy) 0 0，内半径 0，外半径 R
+            return (3, $"{F(geom.Fx)} {F(geom.Fy)} {F(geom.Fx)} {F(geom.Fy)} 0 0 {F(geom.R)} 0", c1, c2);
+        // Type2 轴向：端点 (Px0,Py0)→(Px1,Py1)
+        return (2, $"{F(geom.Px0)} {F(geom.Py0)} {F(geom.Px1)} {F(geom.Py1)}", c1, c2);
     }
 
     // 子路径集合 → PDF 路径串（m/l/h）

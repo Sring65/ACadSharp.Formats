@@ -131,6 +131,35 @@ internal sealed class RasterCanvas
         });
     }
 
+    /// <summary>带剖面函数的渐变填充：t 沿轴(gradA→gradB)投影或沿(cx,cy)半径计算，
+    /// 经 profile(t)∈[0,1] 得插值系数后取 c1→c2。profile=null 等价线性。
+    /// 用于 AutoCAD 9 类型渐变（圆柱/球/抛物等非均匀剖面）。</summary>
+    public void FillGradientProfile(List<List<P>> contours, bool evenOdd, P gradA, P gradB, Rgb c1, Rgb c2, bool radial, float cx, float cy, float radius, Func<float, float> profile)
+    {
+        float dx = gradB.X - gradA.X, dy = gradB.Y - gradA.Y;
+        float len2 = dx * dx + dy * dy;
+        ScanFill(contours, evenOdd, (px, py) =>
+        {
+            float t;
+            if (radial)
+            {
+                float ddx = px - cx, ddy = py - cy;
+                t = radius > 1e-6f ? (float)Math.Sqrt(ddx * ddx + ddy * ddy) / radius : 0f;
+            }
+            else
+            {
+                t = len2 > 1e-9f ? ((px - gradA.X) * dx + (py - gradA.Y) * dy) / len2 : 0f;
+            }
+            if (t < 0f) t = 0f; else if (t > 1f) t = 1f;
+            float f = profile == null ? t : profile(t);
+            if (f < 0f) f = 0f; else if (f > 1f) f = 1f;
+            return new Rgb(
+                (byte)(c1.R + (c2.R - c1.R) * f),
+                (byte)(c1.G + (c2.G - c1.G) * f),
+                (byte)(c1.B + (c2.B - c1.B) * f));
+        });
+    }
+
     private void ScanFill(List<List<P>> contours, bool evenOdd, Func<int, int, Rgb> colorAt)
     {
         if (contours == null || contours.Count == 0) return;

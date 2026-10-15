@@ -1100,28 +1100,21 @@ internal partial class ImageEngine
         bool evenOdd = contours.Count > 1;
         if (gradient)
         {
-            double cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
-            double L = 0.5 * Math.Sqrt((maxX - minX) * (maxX - minX) + (maxY - minY) * (maxY - minY));
-            if (!double.IsFinite(L) || L <= 0) L = 1.0;
-            var c1 = RasterCanvas.Rgb.White; var c2 = RasterCanvas.Rgb.Black;
-            if (gp.Colors != null && gp.Colors.Count >= 2)
-            {
-                c1 = HexToRgb(StopHex(gp.Colors[0].Color));
-                c2 = HexToRgb(StopHex(gp.Colors[gp.Colors.Count - 1].Color));
-            }
-            if (IsEllipticGradient(gp))
-                // L 已是像素单位（contours 经 PngSx/PngSy 转像素后算出对角线半长），与线性分支一致直接用 L，
-                // 不可再乘 PngK（放大倍率）否则 radius 偏大 10 倍、t=dist/radius 过小导致渐变几乎不变色。
-                _rc.FillGradient(contours, evenOdd, new RasterCanvas.P(0, 0), new RasterCanvas.P(0, 0), c1, c2, true, (float)cx, (float)cy, (float)L);
+            // 接入共享 9 类型模型：minX/Y 已是像素单位（PngSx/PngSy），画布系 Y 翻转→uy 取反。
+            var spec = MakeHatchGradSpec(gp);
+            double ang = gp.Angle;
+            double ux = Math.Cos(ang), uy = -Math.Sin(ang);
+            var geom = ComputeHatchGradGeom(spec, minX, minY, maxX, maxY, ux, uy);
+            var c1 = HexToRgb(StopHex(spec.C1));
+            var c2 = HexToRgb(StopHex(spec.C2));
+            var prof = new Func<float, float>(u => (float)HatchGradProfile(spec.Kind, spec.Inverted, u));
+            if (geom.Radial)
+                _rc.FillGradientProfile(contours, evenOdd, new RasterCanvas.P(0, 0), new RasterCanvas.P(0, 0), c1, c2, true, (float)geom.Fx, (float)geom.Fy, (float)geom.R, prof);
             else
-            {
-                double ang = gp.Angle;
-                double dx = Math.Cos(ang), dy = Math.Sin(ang);
-                _rc.FillGradient(contours, evenOdd,
-                    new RasterCanvas.P((float)(cx - dx * L), (float)(cy - dy * L)),
-                    new RasterCanvas.P((float)(cx + dx * L), (float)(cy + dy * L)),
-                    c1, c2, false, 0, 0, 0);
-            }
+                _rc.FillGradientProfile(contours, evenOdd,
+                    new RasterCanvas.P((float)geom.Px0, (float)geom.Py0),
+                    new RasterCanvas.P((float)geom.Px1, (float)geom.Py1),
+                    c1, c2, false, 0, 0, 0, prof);
         }
         else
         {

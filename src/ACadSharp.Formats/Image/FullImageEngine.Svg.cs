@@ -997,28 +997,36 @@ internal partial class ImageEngine
         return (b.Item1 - a.Item1, b.Item2 - a.Item2);
     }
 
-    // MLine 渲染几何（三引擎共享）：把 MLine 按 MLineStyle.Elements 的各 Offset 偏移到世界系折线。
-    // 每个 Element 生成一条平行折线（沿角平分法向偏移），返回 (偏移后世界点列, 该 Element 的 ACI)。
-    // 顶点先经 tr 世界化，再在世界系算段方向/法向（tr 为相似变换，法向方向一致）；
-    // 偏移量乘块缩放（tr.Scale）。样式无定义时退化为画中线。
-    private static List<(List<(double X, double Y)> Poly, short Aci)> MLineOffsetPolys(MLine ml, Transform2D tr)
+    // MLine 单个子线元素（一个 element 在世界系的一条子线）
+    private readonly struct MLineElement
     {
-        var result = new List<(List<(double X, double Y)>, short)>();
-        if (ml?.Vertices == null || ml.Vertices.Count < 2) return result;
-        // 顶点世界化
-        var wp = new List<(double X, double Y)>(ml.Vertices.Count);
-        foreach (var v in ml.Vertices)
+        public readonly List<(double X, double Y)> Center; // 中心线（offset 已沿 miter/法向偏移，世界系）
+        public readonly double[] Width;                    // 逐顶点线宽（世界单位，可 0 或渐变）
+        public readonly short Aci;
+        public MLineElement(List<(double X, double Y)> center, double[] width, short aci)
+        { Center = center; Width = width; Aci = aci; }
+    }
+
+    // MLine 渲染几何（三引擎共享）：按每个 vertex.Segments[e].Parameters 把各子线展开到世界系。
+    // Parameters 语义（DXF MLINE）：2 参数 [offset, width]（固定宽），4 参数 [off0,w0,off1,w1]
+    // （沿段渐变）；offset 为子线到中心线的法向偏移、width 为子线线宽，均为**绝对世界单位**
+    // （已含 MLine ScaleFactor，ACadSharp ApplyTransform 已对块内 MLine 的 Parameters 按块缩放缩放）。
+    // 拐角 miter 用 AutoCAD 预计算的 vertex.Miter 向量（角平分方向，尖接对齐 AutoCAD）；
+    // 端点沿该端唯一线段法向偏移。样式无定义时退化为画中心线。
+    private static List<MLineElement> MLineElements(MLine ml, Transform2D tr)
+    {
+        var result = new List<MLineElement>();
+        if (ml?.Vertices == null) return result;
+        int n = ml.Vertices.Count;
+        if (n < 2) return result;
+        // 顶点世界化（Position 经 tr；块内 MLine 的 Position/Segments 已被 ACadSharp ApplyTransform 世界化）
+        var wp = new (double X, double Y)[n];
+        for (int i = 0; i < n; i++)
         {
-            var p = tr == null ? (v.Position.X, v.Position.Y) : tr.Apply(v.Position.X, v.Position.Y);
-            wp.Add(p);
+            var v = ml.Vertices[i];
+            wp[i] = tr == null ? (v.Position.X, v.Position.Y) : tr.Apply(v.Position.X, v.Position.Y);
         }
-        // 每顶点偏移位置（miter 尖接，对齐 AutoCAD MLine 拐角）：
-        //   - 端点（i=0 / i=n-1）：沿该端唯一线段法向偏移
-        //   - 中间点：取「进入段子线」(过 V_{i-1}+n_{i-1}*off，方向 d_{i-1}) 与「离开段子线」
-        //     (过 V_i+n_i*off，方向 d_i) 的交点作为尖接点，保证子线拐角延伸相交、
-        //     间距与直线段一致；交点过尖（|p-V_i|>|off|/sin(θ/2)）则回退 bevel。
-        int n = wp.Count;
-        // 各段单位方向与法向（段 k：V_k→V_{k+1}）
+        // 各段单位方向与法向（段 k：V_k→V_{k+1}），法向取左法向（与 offset 正方向一致）
         var d = new (double X, double Y)[n - 1];
         var nm = new (double X, double Y)[n - 1];
         for (int k = 0; k < n - 1; k++)
@@ -1028,70 +1036,131 @@ internal partial class ImageEngine
             if (len < 1e-12) { d[k] = (0, 0); nm[k] = (0, 0); }
             else { d[k] = (dx / len, dy / len); nm[k] = (-dy / len, dx / len); }
         }
-        double offScale = tr?.Scale ?? 1.0;
-        var style = ml.Style ?? ACadSharp.Objects.MLineStyle.Default;
-        var elems = style.Elements.ToList();
-        if (elems.Count == 0)
+        // miter 方向世界化：块插入带旋转时同步旋转（tr 旋转部分 Ca/Sa，不含缩放/平移）
+        double ca = tr?.Ca ?? 1.0, sa = tr?.Sa ?? 0.0;
+        (double X, double Y) WorldMiter(XYZ m)
         {
-            result.Add((wp, EntityAciIndex(ml))); // 无样式定义 → 中线
-            return result;
+            double mx = m.X, my = m.Y;
+            if (tr != null) { double rx = mx * ca - my * sa, ry = mx * sa + my * ca; mx = rx; my = ry; }
+            double l = Math.Sqrt(mx * mx + my * my);
+            return l < 1e-12 ? (0, 0) : (mx / l, my / l);
         }
-        foreach (var el in elems)
+        // element 数 = 各 vertex Segments 最大数（无定义 → 画中心线）
+        int eMax = 0;
+        for (int i = 0; i < n; i++) eMax = Math.Max(eMax, ml.Vertices[i].Segments.Count);
+        var styleElems = ml.Style?.Elements?.ToList() ?? new List<ACadSharp.Objects.MLineStyle.Element>();
+        for (int e = 0; e < eMax; e++)
         {
-            double off = el.Offset * offScale;
-            var poly = new List<(double X, double Y)>(n);
+            var c = new List<(double X, double Y)>(n);
+            var w = new double[n];
             for (int i = 0; i < n; i++)
             {
-                double px, py;
-                if (i == 0)
-                { px = wp[0].X + nm[0].X * off; py = wp[0].Y + nm[0].Y * off; }
-                else if (i == n - 1)
-                { int k = n - 2; px = wp[i].X + nm[k].X * off; py = wp[i].Y + nm[k].Y * off; }
-                else
-                {
-                    int k1 = i - 1, k2 = i;
-                    // 进入段子线：P1=V_{i-1}+n_{k1}*off, 方向 d_{k1}
-                    double p1x = wp[i - 1].X + nm[k1].X * off, p1y = wp[i - 1].Y + nm[k1].Y * off;
-                    // 离开段子线：P2=V_i+n_{k2}*off, 方向 d_{k2}
-                    double p2x = wp[i].X + nm[k2].X * off, p2y = wp[i].Y + nm[k2].Y * off;
-                    double denom = d[k1].X * d[k2].Y - d[k1].Y * d[k2].X;
-                    if (Math.Abs(denom) < 1e-12)
-                    {
-                        // 平行/反向 → 无 miter 交点，回退 bevel
-                        (px, py) = MLineBevelPoint(wp[i], d[k1], d[k2], off);
-                    }
-                    else
-                    {
-                        double t = ((p2x - p1x) * d[k2].Y - (p2y - p1y) * d[k2].X) / denom;
-                        double mx = p1x + d[k1].X * t, my = p1y + d[k1].Y * t;
-                        double ddx = mx - wp[i].X, ddy = my - wp[i].Y;
-                        double dist = Math.Sqrt(ddx * ddx + ddy * ddy);
-                        // miter 长度限制：|off|/|sin(θ/2)|，过尖回退 bevel
-                        double cross = d[k1].X * d[k2].Y - d[k1].Y * d[k2].X;
-                        double sinHalf = Math.Abs(cross) / 2.0;
-                        if (sinHalf > 1e-9 && dist <= Math.Abs(off) / sinHalf + 1e-6) { px = mx; py = my; }
-                        else { (px, py) = MLineBevelPoint(wp[i], d[k1], d[k2], off); }
-                    }
-                }
-                poly.Add((px, py));
+                var seg = ml.Vertices[i].Segments.Count > e ? ml.Vertices[i].Segments[e] : null;
+                double off = (seg != null && seg.Parameters.Count > 0) ? seg.Parameters[0] : 0;
+                w[i] = (seg != null && seg.Parameters.Count > 1) ? seg.Parameters[1] : 0;
+                // 偏移方向：中间点用 AutoCAD 预计算的 vertex.Miter（角平分，世界化）；端点用该端段法向
+                (double X, double Y) dir;
+                if (i == 0) dir = nm[0];
+                else if (i == n - 1) dir = nm[n - 2];
+                else { dir = WorldMiter(ml.Vertices[i].Miter); if (dir.X == 0 && dir.Y == 0) dir = nm[i - 1]; }
+                c.Add((wp[i].X + dir.X * off, wp[i].Y + dir.Y * off));
             }
-            short aci;
-            try { aci = el.Color.IsTrueColor ? TrueColorToAci(el.Color.R, el.Color.G, el.Color.B) : el.Color.Index; }
-            catch { aci = 256; }
-            result.Add((poly, aci));
+            // 颜色：MLineStyle.Elements[e].Color（BYLAYER 256 由调用方 ColorOf 解析），缺省实体色
+            short aci = EntityAciIndex(ml);
+            if (e < styleElems.Count)
+            {
+                var col = styleElems[e].Color;
+                try { aci = col.IsTrueColor ? TrueColorToAci(col.R, col.G, col.B) : col.Index; } catch { }
+            }
+            result.Add(new MLineElement(c, w, aci));
+        }
+        if (result.Count == 0)
+        {
+            // 无子线定义 → 画中心线（无偏移、宽度 0）
+            result.Add(new MLineElement(wp.ToList(), new double[n], EntityAciIndex(ml)));
         }
         return result;
     }
 
-    // MLine 拐角 bevel 回退点：当 miter 交点平行/过尖时，用两段方向角平分线的法向偏移。
-    // 方向单位化后相加得角平分向量，取其法向（单位）* off 即 bevel 拐角位置。
-    private static (double X, double Y) MLineBevelPoint((double X, double Y) v, (double X, double Y) d1, (double X, double Y) d2, double off)
+    // MLine 子线变宽轮廓：把子线中心线按逐顶点宽度展开成闭合填充多边形（变宽=梯形楔形，等宽=平行带）。
+    // 上边（+法向）与下边（-法向）各自沿段法向偏移 ±(w_k+w_{k+1})/4（段 k 端点宽度均值的一半 → 梯形）；
+    // 拐角处上/下边各自 miter 尖接（与中心线一致），两端帽盖由首末上下边点连接闭合。
+    private static List<(double X, double Y)> MLineElementOutline(MLineElement el)
     {
-        double dx = d1.X + d2.X, dy = d1.Y + d2.Y;
-        double len = Math.Sqrt(dx * dx + dy * dy);
-        if (len < 1e-12) return v; // 反向（180°）→ 无法向，落在顶点
-        // 角平分法向 = 平分向量的左法向，单位化
-        return (v.X + (-dy / len) * off, v.Y + (dx / len) * off);
+        var outl = new List<(double X, double Y)>();
+        var c = el.Center; int n = c.Count;
+        if (n < 2 || el.Width == null || el.Width.Length < 2) return outl;
+        var w = el.Width;
+        // 各段单位方向与法向
+        var d = new (double X, double Y)[n - 1];
+        var nm = new (double X, double Y)[n - 1];
+        for (int k = 0; k < n - 1; k++)
+        {
+            double dx = c[k + 1].X - c[k].X, dy = c[k + 1].Y - c[k].Y;
+            double len = Math.Sqrt(dx * dx + dy * dy);
+            if (len < 1e-12) { d[k] = (0, 0); nm[k] = (0, 0); }
+            else { d[k] = (dx / len, dy / len); nm[k] = (-dy / len, dx / len); }
+        }
+        // 段 k 上/下偏移 = 端点宽度均值的一半（梯形中线偏移）
+        var offU = new double[n - 1]; var offD = new double[n - 1];
+        for (int k = 0; k < n - 1; k++)
+        {
+            double wm = (Math.Abs(w[k]) + Math.Abs(w[k + 1])) * 0.5;
+            offU[k] = wm * 0.5; offD[k] = wm * 0.5;
+        }
+        var up = new (double X, double Y)[n];
+        var dn = new (double X, double Y)[n];
+        for (int i = 0; i < n; i++)
+        {
+            (double X, double Y) pu, pd;
+            if (i == 0)
+            {
+                // 起点帽：沿段 0 法向偏移
+                pu = (c[0].X + nm[0].X * offU[0], c[0].Y + nm[0].Y * offU[0]);
+                pd = (c[0].X - nm[0].X * offD[0], c[0].Y - nm[0].Y * offD[0]);
+            }
+            else if (i == n - 1)
+            {
+                // 终点帽：沿末段法向偏移
+                int k = n - 2;
+                pu = (c[i].X + nm[k].X * offU[k], c[i].Y + nm[k].Y * offU[k]);
+                pd = (c[i].X - nm[k].X * offD[k], c[i].Y - nm[k].Y * offD[k]);
+            }
+            else
+            {
+                int k1 = i - 1, k2 = i;
+                // 上边 miter：线1 过 V_{i-1}+n_{k1}*offU[k1] 方向 d[k1]；线2 过 V_i+n_{k2}*offU[k2] 方向 d[k2]
+                pu = MLineMiter(
+                    c[i - 1].X + nm[k1].X * offU[k1], c[i - 1].Y + nm[k1].Y * offU[k1], d[k1],
+                    c[i].X + nm[k2].X * offU[k2], c[i].Y + nm[k2].Y * offU[k2], d[k2]);
+                // 下边 miter：线1 过 V_{i-1}-n_{k1}*offD[k1] 方向 d[k1]；线2 过 V_i-n_{k2}*offD[k2] 方向 d[k2]
+                pd = MLineMiter(
+                    c[i - 1].X - nm[k1].X * offD[k1], c[i - 1].Y - nm[k1].Y * offD[k1], d[k1],
+                    c[i].X - nm[k2].X * offD[k2], c[i].Y - nm[k2].Y * offD[k2], d[k2]);
+            }
+            up[i] = pu; dn[i] = pd;
+        }
+        // 轮廓 = 上边(0..n-1) + 下边(n-1..0) 闭合
+        for (int i = 0; i < n; i++) outl.Add(up[i]);
+        for (int i = n - 1; i >= 0; i--) outl.Add(dn[i]);
+        return outl;
+    }
+
+    // MLine 变宽轮廓的拐角 miter：两线（P1 沿 dir1、P2 沿 dir2）交点；平行/反向时回退 P2。
+    private static (double X, double Y) MLineMiter(double p1x, double p1y, (double X, double Y) dir1, double p2x, double p2y, (double X, double Y) dir2)
+    {
+        double denom = dir1.X * dir2.Y - dir1.Y * dir2.X;
+        if (Math.Abs(denom) < 1e-12) return (p2x, p2y);
+        double t = ((p2x - p1x) * dir2.Y - (p2y - p1y) * dir2.X) / denom;
+        return (p1x + dir1.X * t, p1y + dir1.Y * t);
+    }
+
+    // MLine 子线是否有可见宽度（决定描边还是填充楔形）：任一点宽度 > 阈值即按填充渲染。
+    private static bool MLineHasWidth(MLineElement el)
+    {
+        if (el.Width == null) return false;
+        foreach (double w in el.Width) if (Math.Abs(w) > 1e-6) return true;
+        return false;
     }
 
     // PolyfaceMesh 线框（三引擎共享）：旧式 3D 多面体网格。每个 Face（VertexFaceRecord.Index1-4，
@@ -1269,6 +1338,11 @@ internal partial class ImageEngine
             {
                 case Point pt: Expand(pt.Location.X, pt.Location.Y); break;
                 case Line ln: Expand(ln.StartPoint.X, ln.StartPoint.Y); Expand(ln.EndPoint.X, ln.EndPoint.Y); break;
+                case MLine ml:
+                    // 多线：用展开后的各子线中心线扩展 bbox（含 offset 偏移与宽度，避免漏算）
+                    foreach (var el in MLineElements(ml, null))
+                        foreach (var p in el.Center) Expand(p.X, p.Y);
+                    break;
                 case LwPolyline p2: foreach (var p in LwPolylineSamplePoints(p2, null)) Expand(p.X, p.Y); break; // 含 bulge 弧段范围
                 case Polyline3D p3: foreach (var v in p3.Vertices) if (IsDisplayVertex(v)) Expand(v.Location.X, v.Location.Y); break;
                 case Polyline2D p2d: foreach (var v in p2d.Vertices) if (IsDisplayVertex(v)) Expand(v.Location.X, v.Location.Y); break;
@@ -1726,14 +1800,16 @@ internal partial class ImageEngine
 
             case MLine ml:
                 {
-                    // 多线：按 MLineStyle 各 Offset 偏移到世界系平行折线，逐条描边
+                    // 多线：按每 vertex.Segments 的 offset/width 展开各子线（世界系）；
+                    // 无宽度→描边中心线，变宽→按逐顶点宽度展开成梯形楔形填充
                     double w = StrokeWidth(ent, scaleMul);
-                    foreach (var (poly, aci) in MLineOffsetPolys(ml, tr))
+                    foreach (var el in MLineElements(ml, tr))
                     {
-                        string col = ColorOf(aci, layerAci, byBlockAci);
-                        var pts = new List<(double X, double Y)>(poly.Count);
-                        foreach (var p in poly) pts.Add(p);
-                        EmitPolyline(sb, pts, col, w, false, dash);
+                        string col = ColorOf(el.Aci, layerAci, byBlockAci);
+                        if (MLineHasWidth(el))
+                            EmitQuadFill(sb, MLineElementOutline(el), col);
+                        else
+                            EmitPolyline(sb, el.Center, col, w, false, dash);
                     }
                 }
                 break;

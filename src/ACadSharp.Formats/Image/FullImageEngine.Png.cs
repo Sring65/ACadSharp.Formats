@@ -462,13 +462,15 @@ internal partial class ImageEngine
 
             case MLine ml:
                 {
+                    // 多线：按每 vertex.Segments 的 offset/width 展开各子线；无宽度→描边，变宽→梯形楔形填充
                     double w = StrokeWidth(ent, scaleMul);
-                    foreach (var (poly, aci) in MLineOffsetPolys(ml, tr))
+                    foreach (var el in MLineElements(ml, tr))
                     {
-                        string col = ColorOf(aci, layerAci, byBlockAci);
-                        var pts = new List<(double X, double Y)>(poly.Count);
-                        foreach (var p in poly) pts.Add(p);
-                        StrokePts(pts, false, col, w, dash);
+                        string col = ColorOf(el.Aci, layerAci, byBlockAci);
+                        if (MLineHasWidth(el))
+                            EmitQuadFillPng(MLineElementOutline(el), col);
+                        else
+                            StrokePts(el.Center, false, col, w, dash);
                     }
                 }
                 break;

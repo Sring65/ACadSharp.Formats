@@ -501,14 +501,20 @@ internal partial class ImageEngine
 
             case MLine ml:
                 {
+                    // 多线：按每 vertex.Segments 的 offset/width 展开各子线；无宽度→描边，变宽→梯形楔形填充
                     double w = StrokeWidth(ent, scaleMul);
-                    foreach (var (poly, aci) in MLineOffsetPolys(ml, tr))
+                    foreach (var el in MLineElements(ml, tr))
                     {
-                        string ecol = ColorOf(aci, layerAci, byBlockAci);
-                        var d = new StringBuilder();
-                        for (int i = 0; i < poly.Count; i++)
-                            d.Append(F(Sx(poly[i].X)) + " " + F(Py(poly[i].Y)) + " " + (i == 0 ? "m" : "l") + " ");
-                        PdfStroke(cs, ecol, w, dash, d + "S");
+                        string ecol = ColorOf(el.Aci, layerAci, byBlockAci);
+                        if (MLineHasWidth(el))
+                            PdfQuadFill(cs, ecol, MLineElementOutline(el));
+                        else
+                        {
+                            var d = new StringBuilder();
+                            for (int i = 0; i < el.Center.Count; i++)
+                                d.Append(F(Sx(el.Center[i].X)) + " " + F(Py(el.Center[i].Y)) + " " + (i == 0 ? "m" : "l") + " ");
+                            PdfStroke(cs, ecol, w, dash, d + "S");
+                        }
                     }
                 }
                 break;

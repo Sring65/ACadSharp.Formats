@@ -1101,42 +1101,39 @@ internal partial class ImageEngine
             if (len < 1e-12) { d[k] = (0, 0); nm[k] = (0, 0); }
             else { d[k] = (dx / len, dy / len); nm[k] = (-dy / len, dx / len); }
         }
-        // 段 k 上/下偏移 = 端点宽度均值的一半（梯形中线偏移）
-        var offU = new double[n - 1]; var offD = new double[n - 1];
-        for (int k = 0; k < n - 1; k++)
-        {
-            double wm = (Math.Abs(w[k]) + Math.Abs(w[k + 1])) * 0.5;
-            offU[k] = wm * 0.5; offD[k] = wm * 0.5;
-        }
+        // 每顶点上/下偏移 = 该点宽度的一半（|w[i]|/2）：段内上下边自然斜切 → 变宽楔形/等宽平行带
         var up = new (double X, double Y)[n];
         var dn = new (double X, double Y)[n];
+        double Off(int i) => Math.Abs(w[i]) * 0.5;
         for (int i = 0; i < n; i++)
         {
             (double X, double Y) pu, pd;
+            double oi = Off(i);
             if (i == 0)
             {
-                // 起点帽：沿段 0 法向偏移
-                pu = (c[0].X + nm[0].X * offU[0], c[0].Y + nm[0].Y * offU[0]);
-                pd = (c[0].X - nm[0].X * offD[0], c[0].Y - nm[0].Y * offD[0]);
+                // 起点帽：沿段 0 法向偏移（宽度 w[0]）
+                pu = (c[0].X + nm[0].X * oi, c[0].Y + nm[0].Y * oi);
+                pd = (c[0].X - nm[0].X * oi, c[0].Y - nm[0].Y * oi);
             }
             else if (i == n - 1)
             {
-                // 终点帽：沿末段法向偏移
+                // 终点帽：沿末段法向偏移（宽度 w[n-1]）
                 int k = n - 2;
-                pu = (c[i].X + nm[k].X * offU[k], c[i].Y + nm[k].Y * offU[k]);
-                pd = (c[i].X - nm[k].X * offD[k], c[i].Y - nm[k].Y * offD[k]);
+                pu = (c[i].X + nm[k].X * oi, c[i].Y + nm[k].Y * oi);
+                pd = (c[i].X - nm[k].X * oi, c[i].Y - nm[k].Y * oi);
             }
             else
             {
                 int k1 = i - 1, k2 = i;
-                // 上边 miter：线1 过 V_{i-1}+n_{k1}*offU[k1] 方向 d[k1]；线2 过 V_i+n_{k2}*offU[k2] 方向 d[k2]
+                double o1 = Off(i - 1); // 进入点宽度
+                // 上边 miter：线1 过 V_{i-1}+n_{k1}*o1 方向 d[k1]；线2 过 V_i+n_{k2}*oi 方向 d[k2]
                 pu = MLineMiter(
-                    c[i - 1].X + nm[k1].X * offU[k1], c[i - 1].Y + nm[k1].Y * offU[k1], d[k1],
-                    c[i].X + nm[k2].X * offU[k2], c[i].Y + nm[k2].Y * offU[k2], d[k2]);
-                // 下边 miter：线1 过 V_{i-1}-n_{k1}*offD[k1] 方向 d[k1]；线2 过 V_i-n_{k2}*offD[k2] 方向 d[k2]
+                    c[i - 1].X + nm[k1].X * o1, c[i - 1].Y + nm[k1].Y * o1, d[k1],
+                    c[i].X + nm[k2].X * oi, c[i].Y + nm[k2].Y * oi, d[k2]);
+                // 下边 miter：线1 过 V_{i-1}-n_{k1}*o1 方向 d[k1]；线2 过 V_i-n_{k2}*oi 方向 d[k2]
                 pd = MLineMiter(
-                    c[i - 1].X - nm[k1].X * offD[k1], c[i - 1].Y - nm[k1].Y * offD[k1], d[k1],
-                    c[i].X - nm[k2].X * offD[k2], c[i].Y - nm[k2].Y * offD[k2], d[k2]);
+                    c[i - 1].X - nm[k1].X * o1, c[i - 1].Y - nm[k1].Y * o1, d[k1],
+                    c[i].X - nm[k2].X * oi, c[i].Y - nm[k2].Y * oi, d[k2]);
             }
             up[i] = pu; dn[i] = pd;
         }

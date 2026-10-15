@@ -1110,7 +1110,9 @@ internal partial class ImageEngine
                 c2 = HexToRgb(StopHex(gp.Colors[gp.Colors.Count - 1].Color));
             }
             if (IsEllipticGradient(gp))
-                _rc.FillGradient(contours, evenOdd, new RasterCanvas.P(0, 0), new RasterCanvas.P(0, 0), c1, c2, true, (float)cx, (float)cy, (float)(L * PngK));
+                // L 已是像素单位（contours 经 PngSx/PngSy 转像素后算出对角线半长），与线性分支一致直接用 L，
+                // 不可再乘 PngK（放大倍率）否则 radius 偏大 10 倍、t=dist/radius 过小导致渐变几乎不变色。
+                _rc.FillGradient(contours, evenOdd, new RasterCanvas.P(0, 0), new RasterCanvas.P(0, 0), c1, c2, true, (float)cx, (float)cy, (float)L);
             else
             {
                 double ang = gp.Angle;

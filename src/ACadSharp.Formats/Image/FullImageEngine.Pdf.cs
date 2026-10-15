@@ -732,9 +732,12 @@ internal partial class ImageEngine
         string c1 = HexToRgbPdf(StopHex(spec.C1));
         string c2 = HexToRgbPdf(StopHex(spec.C2));
         if (geom.Radial)
-            // Type3 径向：焦点 (Fx,Fy) 0 0，内半径 0，外半径 R
-            return (3, $"{F(geom.Fx)} {F(geom.Fy)} {F(geom.Fx)} {F(geom.Fy)} 0 0 {F(geom.R)} 0", c1, c2);
-        // Type2 轴向：端点 (Px0,Py0)→(Px1,Py1)
+            // Type3 径向：/Coords 必须 6 个数 [x0 y0 r0 x1 y1 r1]（起始圆→结束圆）。
+            // 同心圆：起始=焦点处点(r0=0, t=0=C0)，结束=半径R同心圆(t=1=C1)，t 沿半径线性，
+            // 与 PNG/SVG 的 t=dist(focus)/R 一致。旧实现写 8 个数(Fx Fy Fx Fy 0 0 R 0)违反规范
+            // → 查看器解析 shading 失败、渐变不显示。
+            return (3, $"{F(geom.Fx)} {F(geom.Fy)} 0 {F(geom.Fx)} {F(geom.Fy)} {F(geom.R)}", c1, c2);
+        // Type2 轴向：/Coords 4 个数 [x0 y0 x1 y1]，端点 (Px0,Py0)→(Px1,Py1)
         return (2, $"{F(geom.Px0)} {F(geom.Py0)} {F(geom.Px1)} {F(geom.Py1)}", c1, c2);
     }
 

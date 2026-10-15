@@ -699,7 +699,9 @@ internal partial class ImageEngine
                 return;
             }
             _pdfShadings[slot] = MakePdfShading(loops, gp);
-            CsAscii(cs, "/Sh" + slot + " sh\n");
+            // PDF sh 操作符作用于“当前填充路径”：必须先写出 HATCH 边界路径 d（m/l/h）再 sh 填充；
+            // 漏写路径会导致 shading 落到上一实体路径（如背景矩形 re f）上 → 渐变填充缺失。
+            CsAscii(cs, d + "/Sh" + slot + " sh\n");
         }
         else
         {

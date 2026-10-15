@@ -3456,9 +3456,15 @@ internal partial class ImageEngine
         return ColorOf(aci, layerAci, byBlockAci);
     }
 
-    // 渐变类型按 470 原始名判断：ELLIPTIC → 径向；其余（LINEAR/CYLINDER/…）→ 线性近似。
+    // 渐变类型按 470 原始名判断：球面/椭圆类（SPHERICAL/INVSPHERICAL/HEMISPHERICAL/ELLIPTIC 等）→ 径向（中心向外）；
+    // 线性类（LINEAR/CYLINDER/FLAT）→ 沿 460 角度线性近似。名称含 SPHERICAL 或 ELLIPTIC 子串即判为径向。
+    // 三引擎（SVG radialGradient / PNG FillGradient radial / PDF ShadingType 3）共享此判定。
     private static bool IsEllipticGradient(HatchGradientPattern gp)
-        => string.Equals(gp.Name, "ELLIPTIC", StringComparison.OrdinalIgnoreCase);
+    {
+        string n = gp.Name ?? "";
+        return n.IndexOf("SPHERICAL", StringComparison.OrdinalIgnoreCase) >= 0
+            || n.IndexOf("ELLIPTIC", StringComparison.OrdinalIgnoreCase) >= 0;
+    }
 
     // 渐变色标 hex：真色直取，否则走 ACI 官方表（含 7 号白/黑随底色反色）
     private string StopHex(ACadSharp.Color c)

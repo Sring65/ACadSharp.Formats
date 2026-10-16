@@ -1039,7 +1039,10 @@ internal partial class ImageEngine
             // GetAdvanceWidth(ushort glyphIndex)，把码点当字形索引 → 中文（U+4E00+）越界返回 0，
             // penAdv 不推进 → 后续字符叠上前字符（"文字重叠"根因）。英文码点小恰好未暴露。
             double adv = fr.GetAdvanceWidth((int)ch) / upm;
-            penAdv += adv * wf;
+            // penAdv 只累加原始 advance（em），不再乘 wf：
+            // Lx=(fp.X/upm+penAdv)×fs×wf 已统一乘一次 wf——若 penAdv 再乘 wf 会变成 wf²，
+            // 使 \W 宽字距文本第 2 字起被右推（advance 放大 wf 倍），中文出现异常空隙。
+            penAdv += adv;
         }
 
         // 下/上划线：沿文字方向（旋转后的局部 x 轴），长度 = run 宽（数据单位 × PngK）

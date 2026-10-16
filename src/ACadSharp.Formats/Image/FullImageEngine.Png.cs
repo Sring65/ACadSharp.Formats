@@ -540,8 +540,8 @@ internal partial class ImageEngine
         }
     }
 
-    // 点样式（$PDMODE/$PDSIZE）→ PNG 位图，与 SVG/PDF 端逐样式一致（2026-10-16 定稿标准）：
-    //   ① 笔画与直线一致（lw，1 像素不加粗）；② 框半径 = 点大小值（数据单位）
+    // 点样式（$PDMODE/$PDSIZE）→ PNG 位图，与 SVG/PDF 端逐样式一致（2026-10-16 定稿 + 10-17 缩小一半）：
+    //   ① 笔画与直线一致（lw×k，保底 1px 不加粗）；② 框半径 = 点大小值 × 0.5（数据单位）
     //   ③ 方框半宽/圆框半径 = 同一半径；④ 加号/X 半伸出 = 2r（伸出框外一 r）；竖线总长 = r（第 5 列）
     //   位0-2：0=点(实心小圆) 1=不显示 2=加号 3=X 4=竖线；位5(32)=外加圆框；位6(64)=外加方框
     private void EmitPointPng(double cx, double cy, RasterCanvas.Rgb col, double lw)
@@ -601,7 +601,7 @@ internal partial class ImageEngine
                 _rc.StrokePolyline(new List<RasterCanvas.P> { P(ax0, ay0), P(ax1, ay1) }, false, w, col);
                 _rc.StrokePolyline(new List<RasterCanvas.P> { P(ax0, ay1), P(ax1, ay0) }, false, w, col);
                 break;
-            case 4: // 竖线（总长 = r；2026-10-16 用户定稿：第 5 列竖线长度为 r）
+            case 4: // 竖线（总长 = r；2026-10-16 用户定稿：第 5 列竖线长度为 r（点大小值）；10-17 缩小一半后 = 点大小值/2）
             {
                 double vh = r * 0.5;
                 _rc.StrokePolyline(new List<RasterCanvas.P> { P(fx, (float)PngSy(cy - vh)), P(fx, (float)PngSy(cy + vh)) }, false, w, col);
@@ -953,7 +953,9 @@ internal partial class ImageEngine
                     string col = run.Color.HasValue ? AciColor(run.Color.Value) : baseCol;
                     double fs = Math.Max(run.Height * scaleMul, 0.2);
                     string fam = ResolveFontFamily(!string.IsNullOrEmpty(run.Font) ? run.Font : styleFont);
-                    double dx = (x - anchorX) * scaleMul, dy = (baselines[li] - anchorY) * scaleMul;
+                    double dx = (x - anchorX) * scaleMul;
+                    // \S 堆叠：基线按 BaselineShift（em）上下移（与 SVG 端一致）
+                    double dy = (baselines[li] + run.BaselineShift * run.Height - anchorY) * scaleMul;
                     double wx = px + dx * ca - dy * sa;
                     double wy = py + dx * sa + dy * ca;
                     DrawTextPng(wx, wy, run.Text, fs, col, -rot, fam, run.WidthFactor,

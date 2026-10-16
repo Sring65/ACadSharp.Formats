@@ -1541,30 +1541,57 @@ internal partial class ImageEngine
 
     // 文字包围盒估算：TEXT/MText 若只展开基线插入点，会把 ascender/descender 裁出画布
     // （典型：顶部文字只剩基线附近下半、上环丢失，如 sample-hatch 的 "81,96"）。
-    // 这里按字高/行数/宽度因子估算**轴对齐**文字盒（ascender≈0.85H、descender≈0.25H，左右各扩
-    // 总宽以覆盖中/右对齐）。取轴对齐 AABB（不乘旋转）：任何旋转文字都包含在其 AABB 内，
-    // 既避免旋转角度单位/块内双重旋转的坑，又保证永不裁切（旋转时仅多留少量空白）。
-    private static (double Hw, double Asc, double Desc) TextMetrics(Entity e)
+    // 按字高/行数/宽度因子估算文字盒，再绕锚点旋转取轴对齐 AABB（不乘旋转的盒装不下旋转文字，
+    // 如 61° 的 TEXT 需要 94×sin61°≈83 的竖向半高，未旋转盒只有 0.85H≈13）。
+    //
+    // MText 必须按**真实排版**（解析富文本 → 按组码41换行后的行宽/行数/行高）估算：
+    // 旧版直接用原始富文本字符数（含 \f/\H/\W/\P 等格式码）算宽——最长"行"200+ 字符 →
+    // 文字盒 ±900 单位 → 画布被撑大 9 倍、文字缩成蚂蚁（sample2004_textorMtext 占位 bug，
+    // 用户反馈"读取文字大小占位有bug"）。且拉丁 0.6em/字对 CJK（1.0em）低估，
+    // 现统一走 EstimateTextWidth（CJK 感知）+ 真实布局（\H 行高/\W 宽度/换行全部生效）。
+    private (double Hw, double Asc, double Desc) TextMetrics(Entity e)
     {
-        double H = 1.0, wf = 1.0, len = 1.0, rows = 1.0;
         if (e is TextEntity t)
         {
-            H = t.Height > 0 ? t.Height : 1.0;
-            wf = t.WidthFactor > 0 ? t.WidthFactor : 1.0;
-            len = Math.Max(1, (t.Value ?? "").Length);
+            double H = t.Height > 0 ? t.Height : 1.0;
+            double wf = t.WidthFactor > 0 ? t.WidthFactor : 1.0;
+            double w = EstimateTextWidth(t.Value ?? "", H) * wf;
+            // 局部盒：左右各扩整条文字宽（覆盖左/中/右对齐），上 0.85H 下 0.25H
+            return RotatedBoxAabb(Math.Max(w, H), 0.85 * H, -0.25 * H, t.Rotation);
         }
-        else if (e is MText mt)
+        if (e is MText mt)
         {
-            H = mt.Height > 0 ? mt.Height : 1.0;
-            // MText 无实体级宽度因子（run 级 \W 各段独立），范围估算取 1.0 即可（行宽按 0.6em 估算已含裕量）。
-            var ls = (mt.Value ?? "").Split(new[] { "\\P", "\n" }, StringSplitOptions.None);
-            rows = Math.Max(1, ls.Length);
-            foreach (var s in ls) len = Math.Max(len, s.Length);
+            var layout = WrapMText(ParseMText(mt.Value ?? "", mt.Height), mt.RectangleWidth);
+            int n = layout.Lines.Count;
+            if (n == 0) return (1.0, 1.0, 1.0);
+            double maxH = 0.1;
+            foreach (var ln in layout.Lines) maxH = Math.Max(maxH, ln.MaxHeight);
+            double gap = 1.5 * maxH;                                       // 与 MTextLocalLayout 一致的基线行距
+            double top = 0.8 * layout.Lines[0].MaxHeight;                  // 首行 ascender
+            double bottom = -((n - 1) * gap + 0.2 * layout.Lines[n - 1].MaxHeight); // 末行 descender
+            return RotatedBoxAabb(Math.Max(layout.MaxLineWidth, maxH), top, bottom, mt.Rotation);
         }
-        double totalW = H * 0.6 * len * wf;        // 估算文字总宽（平均字宽 0.6em）
-        double Hw = Math.Max(totalW, H);            // 左右各扩展量（覆盖中/右对齐，至少一字宽）
-        double Htot = H * rows * 1.2;               // 总高（含行距）
-        return (Hw, 0.85 * Htot, 0.25 * Htot);
+        return (1.0, 1.0, 1.0);
+    }
+
+    // 局部文字盒（左右 ±halfW，竖向 [yBot,yTop]）绕锚点旋转 rotRad 后的轴对齐 AABB 半高
+    private static (double Hw, double Asc, double Desc) RotatedBoxAabb(double halfW, double yTop, double yBot, double rotRad)
+    {
+        double c = Math.Cos(rotRad), s = Math.Sin(rotRad);
+        double maxX = 0, minX = 0, maxY = 0, minY = 0;
+        bool first = true;
+        foreach (double x in new[] { -halfW, halfW })
+            foreach (double y in new[] { yBot, yTop })
+            {
+                double X = x * c - y * s, Y = x * s + y * c;
+                if (first) { maxX = minX = X; maxY = minY = Y; first = false; }
+                else
+                {
+                    if (X > maxX) maxX = X; if (X < minX) minX = X;
+                    if (Y > maxY) maxY = Y; if (Y < minY) minY = Y;
+                }
+            }
+        return (Math.Max(maxX, -minX), maxY, -minY);
     }
 
     // 以 (cx,cy) 为基线锚点的轴对齐文字盒 4 角（局部坐标，供 EntityLocalPoints yield）。
@@ -1625,8 +1652,8 @@ internal partial class ImageEngine
         }
     }
 
-    // 取实体在局部坐标系下的关键点（用于范围/插入展开）
-    private static IEnumerable<XY> EntityLocalPoints(Entity e)
+    // 取实体在局部坐标系下的关键点（用于范围/插入展开；MText 走真实排版占位，须为实例方法）
+    private IEnumerable<XY> EntityLocalPoints(Entity e)
     {
         if (e is Point pt) yield return new XY(pt.Location.X, pt.Location.Y);
         else if (e is Line ln) { yield return new XY(ln.StartPoint.X, ln.StartPoint.Y); yield return new XY(ln.EndPoint.X, ln.EndPoint.Y); }
@@ -2544,6 +2571,7 @@ internal partial class ImageEngine
         public bool Italic;     // 斜体（\f 规格 |i1|）
         public double Oblique;  // 倾斜角（\Q<deg>;，度，0=无）
         public string Font;     // 字体族名（\f 内联）；null=随实体样式
+        public double BaselineShift; // \S 堆叠基线偏移（em，+=上标/分子，-=下标/分母；0=正常）
     }
 
     // MTEXT 一行
@@ -2761,8 +2789,41 @@ internal partial class ImageEngine
                             break;
                         case 'S':
                             {
+                                // \S<上>^<下>（超/下标）或 \S<分子>/<分母>（分数堆叠）
+                                // 旧版把 "^"/"/" 原样当正文 → 出现 "2^" "^3" 乱码字符；
+                                // 现按属性拆成带基线偏移的独立 run（上标 +0.35em / 下标 -0.30em）。
                                 int end = SkipCode(i);
-                                curText.Append(raw.Substring(i + 2, end - i - 2).Replace("^B", ""));
+                                string sc = raw.Substring(i + 2, end - i - 2).Replace("^B", "");
+                                int caret = sc.IndexOf('^');
+                                int slash = caret < 0 ? sc.IndexOf('/') : -1;
+                                if (caret >= 0 || slash >= 0)
+                                {
+                                    string up, lo;
+                                    if (caret >= 0)
+                                    {
+                                        up = sc.Substring(0, caret);
+                                        lo = caret + 1 < sc.Length ? sc.Substring(caret + 1) : "";
+                                    }
+                                    else
+                                    {
+                                        up = sc.Substring(0, slash);
+                                        lo = slash + 1 < sc.Length ? sc.Substring(slash + 1) : "";
+                                    }
+                                    Flush(); // \S 只影响其后自身
+                                    void AddStackRun(string txt, double shift)
+                                    {
+                                        if (string.IsNullOrEmpty(txt)) return;
+                                        line.Runs.Add(new MTextRun
+                                        {
+                                            Text = txt, Height = curH, WidthFactor = curWF, Color = curC,
+                                            Underline = curU, Overline = curOV, Bold = curB, Italic = curI,
+                                            Oblique = curOB, Font = curFont, BaselineShift = shift
+                                        });
+                                    }
+                                    AddStackRun(up, 0.35);   // 上标/分子：基线上移 0.35em
+                                    AddStackRun(lo, -0.30);  // 下标/分母：基线下移 0.30em
+                                }
+                                else curText.Append(sc);
                                 i = end;
                             }
                             break;
@@ -2878,6 +2939,9 @@ internal partial class ImageEngine
                             var last = ln.Runs[ln.Runs.Count - 1];
                             if (last.Height == run.Height && last.WidthFactor == run.WidthFactor
                                 && last.Color == run.Color && last.Underline == run.Underline
+                                && last.Overline == run.Overline && last.Bold == run.Bold
+                                && last.Italic == run.Italic && last.Oblique == run.Oblique
+                                && last.BaselineShift == run.BaselineShift
                                 && (last.Font ?? "") == (run.Font ?? ""))
                             {
                                 last.Text += t;
@@ -2885,7 +2949,7 @@ internal partial class ImageEngine
                                 continue;
                             }
                         }
-                        ln.Runs.Add(new MTextRun { Text = t, Height = run.Height, WidthFactor = run.WidthFactor, Color = run.Color, Underline = run.Underline, Font = run.Font });
+                        ln.Runs.Add(new MTextRun { Text = t, Height = run.Height, WidthFactor = run.WidthFactor, Color = run.Color, Underline = run.Underline, Overline = run.Overline, Bold = run.Bold, Italic = run.Italic, Oblique = run.Oblique, Font = run.Font, BaselineShift = run.BaselineShift });
                     }
                     ln.Recalc();
                     result.Lines.Add(ln);
@@ -2974,7 +3038,8 @@ internal partial class ImageEngine
                     string col = run.Color.HasValue ? AciColor(run.Color.Value) : baseCol;
                     double fs = Math.Max(run.Height * scaleMul, 0.2);
                     string cssFont = SvgFontFamily(ResolveFontFamily(!string.IsNullOrEmpty(run.Font) ? run.Font : styleFont));
-                    ToWorld(x, baselines[li], out double wx, out double wy);
+                    // \S 堆叠：基线按 BaselineShift（em）上下移（CAD y 向上：上标=+）
+                    ToWorld(x, baselines[li] + run.BaselineShift * run.Height, out double wx, out double wy);
                     double sx = Sx(wx), sy = Sy(wy);
 
                     // 富文本属性：字体族/字号/颜色/加粗/斜体/下划线+上划线
@@ -3172,13 +3237,14 @@ internal partial class ImageEngine
 
     private void EmitPoint(StringBuilder sb, double cx, double cy, string color, double lw)
     {
-        // 点样式（$PDMODE/$PDSIZE）——2026-10-16 用户定稿标准（无需对照 CAD 实际显示）：
+        // 点样式（$PDMODE/$PDSIZE）——2026-10-16 用户定稿标准 + 2026-10-17 整体缩小一半：
         //   ① 笔画与直线一致（lw，1 像素不加粗，废除随字形缩放的加粗公式）
-        //   ② 半径 = 点大小值（数据单位）：PDSIZE=0 → 视高 5%；>0 → 绝对值；<0 → 视高百分比
+        //   ② 半径 = 点大小值 × 0.5（数据单位）：PDSIZE=0 → 视高 5%；>0 → 绝对值；<0 → 视高百分比
         //      （“不管设置是 5% 还是 5 单位，1×5×10=50 像素”——折算为数据单位半径，
         //        经渲染变换映射为像素：size(数据单位) × 每单位像素数）
         //   ③ 方框半宽 = 半径，圆框半径 = 半径（同一半径）
         //   ④ 加号/X 半伸出 = 2r（伸出框外一 r）；竖线总长 = r（第 5 列）；点为小实心圆
+        //   2026-10-17 用户“绘制的有点大了，缩小一半”→ PointGlyphRadius 整体 ×0.5（三引擎统一）
         //   PDMODE 位0-2：0=点 1=不显示 2=加号 3=X 4=竖线；位5(32)=外加圆框；位6(64)=外加方框
         int mode = _pdMode;
         int shape = mode & 7;
@@ -3231,7 +3297,7 @@ internal partial class ImageEngine
                 sb.AppendLine($"  <path d=\"{d}\" fill=\"none\" stroke=\"{color}\" stroke-width=\"{F(w)}\" stroke-linecap=\"butt\"/>");
                 break;
             }
-            case 4: // 竖线（总长 = r；2026-10-16 用户定稿：第 5 列竖线长度为 r）
+            case 4: // 竖线（总长 = r；2026-10-16 用户定稿：第 5 列竖线长度为 r（点大小值）；10-17 缩小一半后 = 点大小值/2）
             {
                 double vh = r * 0.5;
                 double vy0 = Sy(cy - vh), vy1 = Sy(cy + vh);
@@ -3243,10 +3309,14 @@ internal partial class ImageEngine
         }
     }
 
-    // 点样式半径（数据单位）= 点大小值：PDSIZE=0 → 视高 5%；>0 → 绝对单位；<0 → |PDSIZE|% 视高。
+    // 点样式半径（数据单位）= 点大小值 × PointGlyphScale：
+    // PDSIZE=0 → 视高 5%；>0 → 绝对单位；<0 → |PDSIZE|% 视高。
     // 用户定稿：“不管设置是 5% 还是 5 单位”——一律折算为数据单位半径（方框半宽/圆框半径），
     // 渲染时经变换映射为像素（如 5 单位 × 每单位 10 像素 = 50 像素半径）。
+    // 2026-10-17 用户反馈“绘制的有点大了，缩小一半”→ 整体乘以 PointGlyphScale=0.5：
+    // 方框半宽/圆框半径 = 点大小值/2；加号/X 半伸出 = 点大小值；竖线总长 = 点大小值/2；点径 = 0.15×点大小值/2。
     // 依赖 _h（画布高度），须在 WriteSvg/WritePdf/WritePng 定稿 _h 之后调用。
+    private const double PointGlyphScale = 0.5;   // 2026-10-17 用户：点样式整体缩小一半
     private double PointGlyphRadius()
     {
         double viewH = _h;
@@ -3256,7 +3326,7 @@ internal partial class ImageEngine
         else if (_pdSize > 0) r = _pdSize;
         else r = viewH * Math.Abs(_pdSize) / 100.0;
         if (!double.IsFinite(r) || r <= 0) r = viewH * 0.05;
-        return r;
+        return r * PointGlyphScale;
     }
 
     // 点样式字形会超出点实体位置范围：PDSIZE=0 时 r=5% 视高，加号/X 更伸到 2r，

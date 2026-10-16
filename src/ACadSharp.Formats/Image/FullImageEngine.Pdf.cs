@@ -914,7 +914,7 @@ internal partial class ImageEngine
     }
 
     // 点样式（$PDMODE/$PDSIZE）→ PDF 内容流，与 SVG 端 EmitPoint 逐样式一致（2026-10-16 定稿标准）：
-    //   ① 笔画与直线一致（lw，1 像素不加粗）；② 框半径 = 点大小值（数据单位）
+    //   ① 笔画与直线一致（lw，1 像素不加粗）；② 框半径 = 点大小值 × 0.5（数据单位，2026-10-17 缩小一半）
     //   ③ 方框半宽/圆框半径 = 同一半径；④ 加号/X 半伸出 = 2r（伸出框外一 r）；竖线总长 = r（第 5 列）
     //   位0-2：0=点(实心小圆) 1=不显示 2=加号 3=X 4=竖线；位5(32)=外加圆框；位6(64)=外加方框
     // 填充色必须显式 rg（PdfStroke 只设 RG 描边色，填充沿用上一条残留状态会致颜色不确定）；
@@ -978,7 +978,7 @@ internal partial class ImageEngine
                 PdfStroke(cs, color, w, null, d + "S");
                 break;
             }
-            case 4: // 竖线（总长 = r；2026-10-16 用户定稿：第 5 列竖线长度为 r）
+            case 4: // 竖线（总长 = r；2026-10-16 用户定稿：第 5 列竖线长度为 r（点大小值）；10-17 缩小一半后 = 点大小值/2）
             {
                 double vh = r * 0.5;
                 var d = new StringBuilder();

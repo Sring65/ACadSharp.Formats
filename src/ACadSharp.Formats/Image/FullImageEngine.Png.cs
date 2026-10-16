@@ -951,7 +951,50 @@ internal partial class ImageEngine
             foreach (var run in layout.Lines[li].Runs)
             {
                 double rw = MTextRunWidth(run) * scaleMul;
-                if (!string.IsNullOrEmpty(run.Text))
+                if (run.IsFraction)
+                {
+                    // \S<num>/<den> 分数：分子/分母上下分层 + 中间分数线（与 SVG 端一致）
+                    string col = run.Color.HasValue ? AciColor(run.Color.Value) : baseCol;
+                    double fs = Math.Max(run.Height * scaleMul, 0.2);
+                    string fam = ResolveFontFamily(!string.IsNullOrEmpty(run.Font) ? run.Font : styleFont);
+                    int sl = run.Text.IndexOf('/');
+                    string num = run.Text.Substring(0, sl);
+                    string den = sl + 1 < run.Text.Length ? run.Text.Substring(sl + 1) : "";
+                    double wf = run.WidthFactor > 0 ? run.WidthFactor : 1.0;
+                    double numW = EstimateTextWidth(num, run.Height) * wf * scaleMul;
+                    double denW = EstimateTextWidth(den, run.Height) * wf * scaleMul;
+                    double fracW = Math.Max(numW, denW);
+                    double dyOff = 0.30 * run.Height; // 分子/分母基线偏移（数据单位，CAD y 向上）
+                    double numX = x + (fracW - numW) / 2.0;
+                    double denX = x + (fracW - denW) / 2.0;
+                    void LocToWorld(double lx, double ly, out double wx, out double wy)
+                    {
+                        double dx = (lx - anchorX) * scaleMul, dy = (ly - anchorY) * scaleMul;
+                        wx = px + dx * ca - dy * sa; wy = py + dx * sa + dy * ca;
+                    }
+                    if (!string.IsNullOrEmpty(num))
+                    {
+                        LocToWorld(numX, baselines[li] + dyOff, out double wnx, out double wny);
+                        DrawTextPng(wnx, wny, num, fs, col, -rot, fam, run.WidthFactor, run.Bold, run.Italic, run.Oblique, false, false, numW);
+                    }
+                    if (!string.IsNullOrEmpty(den))
+                    {
+                        LocToWorld(denX, baselines[li] - dyOff, out double wdx, out double wdy);
+                        DrawTextPng(wdx, wdy, den, fs, col, -rot, fam, run.WidthFactor, run.Bold, run.Italic, run.Oblique, false, false, denW);
+                    }
+                    if (_rc != null && fracW > 1e-6)
+                    {
+                        LocToWorld(x, baselines[li], out double h1x, out double h1y);
+                        LocToWorld(x + fracW, baselines[li], out double h2x, out double h2y);
+                        var pp = new List<RasterCanvas.P>
+                        {
+                            new RasterCanvas.P((float)PngSx(h1x), (float)PngSy(h1y)),
+                            new RasterCanvas.P((float)PngSx(h2x), (float)PngSy(h2y))
+                        };
+                        _rc.StrokePolyline(pp, false, (float)Math.Max(1.0, fs * PngK * 0.04), HexToRgb(col));
+                    }
+                }
+                else if (!string.IsNullOrEmpty(run.Text))
                 {
                     string col = run.Color.HasValue ? AciColor(run.Color.Value) : baseCol;
                     double fs = Math.Max(run.Height * scaleMul, 0.2);

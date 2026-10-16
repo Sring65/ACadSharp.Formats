@@ -2572,6 +2572,7 @@ internal partial class ImageEngine
         public double Oblique;  // 倾斜角（\Q<deg>;，度，0=无）
         public string Font;     // 字体族名（\f 内联）；null=随实体样式
         public double BaselineShift; // \S 堆叠基线偏移（em，+=上标/分子，-=下标/分母；0=正常）
+        public bool IsFraction; // \S<num>/<den> 分数堆叠：单 run 存 "num/den"，渲染时上下分层+分数线
     }
 
     // MTEXT 一行
@@ -2592,7 +2593,18 @@ internal partial class ImageEngine
     }
 
     private static double MTextRunWidth(MTextRun r)
-        => EstimateTextWidth(r.Text, r.Height) * (r.WidthFactor > 0 ? r.WidthFactor : 1.0);
+    {
+        double wf = r.WidthFactor > 0 ? r.WidthFactor : 1.0;
+        if (r.IsFraction)
+        {
+            // 分数宽 = max(分子, 分母)（分数线与较宽者同宽），不是 "num/den" 整体宽
+            int sl = r.Text.IndexOf('/');
+            string num = sl >= 0 ? r.Text.Substring(0, sl) : r.Text;
+            string den = sl + 1 < r.Text.Length ? r.Text.Substring(sl + 1) : "";
+            return Math.Max(EstimateTextWidth(num, r.Height), EstimateTextWidth(den, r.Height)) * wf;
+        }
+        return EstimateTextWidth(r.Text, r.Height) * wf;
+    }
 
     private static bool IsCjkChar(char ch)
         => (ch >= 0x2E80 && ch <= 0x9FFF) || (ch >= 0xFF00 && ch <= 0xFFEF)
@@ -2789,26 +2801,30 @@ internal partial class ImageEngine
                             break;
                         case 'S':
                             {
-                                // \S<上>^<下>（超/下标）或 \S<分子>/<分母>（分数堆叠）
-                                // 旧版把 "^"/"/" 原样当正文 → 出现 "2^" "^3" 乱码字符；
-                                // 现按属性拆成带基线偏移的独立 run（上标 +0.35em / 下标 -0.30em）。
+                                // \S<上>^<下>（超/下标，两 run 基线偏移）或 \S<分子>/<分母>（分数堆叠，单 run 上下分层+分数线）
+                                // 旧版把 "^"/"/" 原样当正文 → 出现 "2^" "^3" 乱码字符；现按分隔符拆分。
+                                // 分数用单 run（IsFraction，Text="num/den"）：渲染时分子/分母上下分层 + 中间画横线，
+                                // 宽度取 max(分子,分母)。上下标用两 run（BaselineShift ±em，字号已由前置 \H 控制）。
                                 int end = SkipCode(i);
                                 string sc = raw.Substring(i + 2, end - i - 2).Replace("^B", "");
                                 int caret = sc.IndexOf('^');
                                 int slash = caret < 0 ? sc.IndexOf('/') : -1;
-                                if (caret >= 0 || slash >= 0)
+                                if (slash >= 0)
                                 {
-                                    string up, lo;
-                                    if (caret >= 0)
+                                    string num = sc.Substring(0, slash);
+                                    string den = slash + 1 < sc.Length ? sc.Substring(slash + 1) : "";
+                                    Flush(); // \S 只影响其后自身
+                                    line.Runs.Add(new MTextRun
                                     {
-                                        up = sc.Substring(0, caret);
-                                        lo = caret + 1 < sc.Length ? sc.Substring(caret + 1) : "";
-                                    }
-                                    else
-                                    {
-                                        up = sc.Substring(0, slash);
-                                        lo = slash + 1 < sc.Length ? sc.Substring(slash + 1) : "";
-                                    }
+                                        Text = num + "/" + den, Height = curH, WidthFactor = curWF, Color = curC,
+                                        Underline = curU, Overline = curOV, Bold = curB, Italic = curI,
+                                        Oblique = curOB, Font = curFont, BaselineShift = 0, IsFraction = true
+                                    });
+                                }
+                                else if (caret >= 0)
+                                {
+                                    string up = sc.Substring(0, caret);
+                                    string lo = caret + 1 < sc.Length ? sc.Substring(caret + 1) : "";
                                     Flush(); // \S 只影响其后自身
                                     void AddStackRun(string txt, double shift)
                                     {
@@ -2820,8 +2836,8 @@ internal partial class ImageEngine
                                             Oblique = curOB, Font = curFont, BaselineShift = shift
                                         });
                                     }
-                                    AddStackRun(up, 0.35);   // 上标/分子：基线上移 0.35em
-                                    AddStackRun(lo, -0.30);  // 下标/分母：基线下移 0.30em
+                                    AddStackRun(up, 0.35);   // 上标：基线上移 0.35em
+                                    AddStackRun(lo, -0.30);  // 下标：基线下移 0.30em
                                 }
                                 else curText.Append(sc);
                                 i = end;
@@ -2942,6 +2958,7 @@ internal partial class ImageEngine
                                 && last.Overline == run.Overline && last.Bold == run.Bold
                                 && last.Italic == run.Italic && last.Oblique == run.Oblique
                                 && last.BaselineShift == run.BaselineShift
+                                && last.IsFraction == run.IsFraction
                                 && (last.Font ?? "") == (run.Font ?? ""))
                             {
                                 last.Text += t;
@@ -2949,7 +2966,7 @@ internal partial class ImageEngine
                                 continue;
                             }
                         }
-                        ln.Runs.Add(new MTextRun { Text = t, Height = run.Height, WidthFactor = run.WidthFactor, Color = run.Color, Underline = run.Underline, Overline = run.Overline, Bold = run.Bold, Italic = run.Italic, Oblique = run.Oblique, Font = run.Font, BaselineShift = run.BaselineShift });
+                        ln.Runs.Add(new MTextRun { Text = t, Height = run.Height, WidthFactor = run.WidthFactor, Color = run.Color, Underline = run.Underline, Overline = run.Overline, Bold = run.Bold, Italic = run.Italic, Oblique = run.Oblique, Font = run.Font, BaselineShift = run.BaselineShift, IsFraction = run.IsFraction });
                     }
                     ln.Recalc();
                     result.Lines.Add(ln);
@@ -3033,7 +3050,40 @@ internal partial class ImageEngine
             foreach (var run in layout.Lines[li].Runs)
             {
                 double rw = MTextRunWidth(run) * scaleMul;
-                if (!string.IsNullOrEmpty(run.Text))
+                if (run.IsFraction)
+                {
+                    // \S<num>/<den> 分数：分子/分母上下分层 + 中间分数线（横线宽=分数宽）
+                    string col = run.Color.HasValue ? AciColor(run.Color.Value) : baseCol;
+                    double fs = Math.Max(run.Height * scaleMul, 0.2);
+                    string cssFont = SvgFontFamily(ResolveFontFamily(!string.IsNullOrEmpty(run.Font) ? run.Font : styleFont));
+                    int sl = run.Text.IndexOf('/');
+                    string num = run.Text.Substring(0, sl);
+                    string den = sl + 1 < run.Text.Length ? run.Text.Substring(sl + 1) : "";
+                    double wf = run.WidthFactor > 0 ? run.WidthFactor : 1.0;
+                    double numW = EstimateTextWidth(num, run.Height) * wf * scaleMul;
+                    double denW = EstimateTextWidth(den, run.Height) * wf * scaleMul;
+                    double fracW = Math.Max(numW, denW); // = rw
+                    double dyOff = 0.30 * run.Height;     // 分子/分母基线相对主基线偏移（数据单位，CAD y 向上）
+                    double numX = x + (fracW - numW) / 2.0; // 分子水平居中
+                    double denX = x + (fracW - denW) / 2.0; // 分母水平居中
+                    void Emtxt(double lx, double ly, string s)
+                    {
+                        ToWorld(lx, ly, out double wx, out double wy);
+                        double sx = Sx(wx), sy = Sy(wy);
+                        var tf = new List<string> { $"translate({F(sx)}, {F(sy)})" };
+                        if (Math.Abs(rot) > 1e-6) tf.Add($"rotate({F(-rot)})");
+                        if (Math.Abs(run.Oblique) > 1e-6) tf.Add($"skewX({F(-run.Oblique)})");
+                        if (Math.Abs(run.WidthFactor - 1.0) > 1e-6) tf.Add($"scale({F(run.WidthFactor)}, 1)");
+                        sb.AppendLine($"  <text x=\"0\" y=\"0\" font-family=\"{cssFont}\" font-size=\"{F(fs)}\" fill=\"{col}\" transform=\"{string.Join(" ", tf)}\">{EscapeXml(s)}</text>");
+                    }
+                    if (!string.IsNullOrEmpty(num)) Emtxt(numX, baselines[li] + dyOff, num);
+                    if (!string.IsNullOrEmpty(den)) Emtxt(denX, baselines[li] - dyOff, den);
+                    // 分数线：主基线处，宽=分数宽
+                    ToWorld(x, baselines[li], out double f1x, out double f1y);
+                    ToWorld(x + fracW, baselines[li], out double f2x, out double f2y);
+                    sb.AppendLine($"  <line x1=\"{F(Sx(f1x))}\" y1=\"{F(Sy(f1y))}\" x2=\"{F(Sx(f2x))}\" y2=\"{F(Sy(f2y))}\" stroke=\"{col}\" stroke-width=\"{F(Math.Max(fs * 0.04, 0.1))}\"/>");
+                }
+                else if (!string.IsNullOrEmpty(run.Text))
                 {
                     string col = run.Color.HasValue ? AciColor(run.Color.Value) : baseCol;
                     double fs = Math.Max(run.Height * scaleMul, 0.2);

@@ -635,7 +635,41 @@ internal partial class ImageEngine
             foreach (var run in layout.Lines[li].Runs)
             {
                 double rw = MTextRunWidth(run) * scaleMul;
-                if (!string.IsNullOrEmpty(run.Text))
+                if (run.IsFraction)
+                {
+                    // \S<num>/<den> 分数：分子/分母上下分层（不同基线的 BT/ET）+ 中间分数线（与 SVG/PNG 端一致）
+                    string col = run.Color.HasValue ? AciColor(run.Color.Value) : baseCol;
+                    double fs = Math.Max(run.Height * scaleMul, 0.2);
+                    int slot = _pdfFonts.GetSlot(ResolveFontFamily(!string.IsNullOrEmpty(run.Font) ? run.Font : styleFont));
+                    CjkFont font = _pdfFonts.FontAt(slot);
+                    int sl = run.Text.IndexOf('/');
+                    string num = run.Text.Substring(0, sl);
+                    string den = sl + 1 < run.Text.Length ? run.Text.Substring(sl + 1) : "";
+                    double wf = run.WidthFactor > 0 ? run.WidthFactor : 1.0;
+                    double numW = EstimateTextWidth(num, run.Height) * wf * scaleMul;
+                    double denW = EstimateTextWidth(den, run.Height) * wf * scaleMul;
+                    double fracW = Math.Max(numW, denW);
+                    double dyOff = 0.30 * run.Height;
+                    double numX = x + (fracW - numW) / 2.0;
+                    double denX = x + (fracW - denW) / 2.0;
+                    void EmitStackText(double lx, double ly, string s)
+                    {
+                        if (string.IsNullOrEmpty(s)) return;
+                        ToWorld(lx, ly, out double wx, out double wy);
+                        byte[] data = font != null ? font.Encode(s) : PdfFallbackTextBytes(s);
+                        if (data.Length == 0) return;
+                        CsAscii(cs, "BT\n/F" + slot + " " + F(fs) + " Tf\n" + HexToRgbPdf(col) + " rg\n" +
+                                   F(ca * wf) + " " + F(sa * wf) + " " + F(-sa) + " " + F(ca) + " " + F(Sx(wx)) + " " + F(Py(wy)) + " Tm\n");
+                        CsString(cs, data);
+                        CsAscii(cs, " Tj\nET\n");
+                    }
+                    EmitStackText(numX, baselines[li] + dyOff, num);
+                    EmitStackText(denX, baselines[li] - dyOff, den);
+                    ToWorld(x, baselines[li], out double f1x, out double f1y);
+                    ToWorld(x + fracW, baselines[li], out double f2x, out double f2y);
+                    PdfStroke(cs, col, Math.Max(0.05, fs * 0.04), null, F(Sx(f1x)) + " " + F(Py(f1y)) + " m " + F(Sx(f2x)) + " " + F(Py(f2y)) + " l S");
+                }
+                else if (!string.IsNullOrEmpty(run.Text))
                 {
                     string col = run.Color.HasValue ? AciColor(run.Color.Value) : baseCol;
                     double fs = Math.Max(run.Height * scaleMul, 0.2);

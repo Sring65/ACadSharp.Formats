@@ -73,7 +73,10 @@ internal partial class ImageEngine
         if (fr == null) return EstimateTextWidth(txt, t.Height) * wf; // 无字体 → 估算兜底
         double total = 0;
         for (int i = 0; i < txt.Length; i++)
-            total += fr.GetAdvanceWidth(txt[i]) / fr.UnitsPerEm;
+            // 必须 (int) 强转：传 char 时 C# 重载决议优先绑定 GetAdvanceWidth(ushort glyphIndex)
+            // （char→ushort 是无符号精确转换，优于 char→int），把 Unicode 码点当字形索引 → 越界返回 0。
+            // 中文汉字码点大（U+4E00+）必越界 → advance 读成 0 → 渲染时后续字符叠上前字符（"文字重叠"）。
+            total += fr.GetAdvanceWidth((int)txt[i]) / fr.UnitsPerEm;
         return total * t.Height * wf;
     }
 
@@ -1032,7 +1035,10 @@ internal partial class ImageEngine
                 if (glyphContours.Count > 0)
                     _rc.Fill(glyphContours, glyphContours.Count > 1, col);
             }
-            double adv = fr.GetAdvanceWidth(ch) / upm;
+            // (int) 强转强制走 GetAdvanceWidth(int codepoint) 重载：传 char 时 C# 优先绑定
+            // GetAdvanceWidth(ushort glyphIndex)，把码点当字形索引 → 中文（U+4E00+）越界返回 0，
+            // penAdv 不推进 → 后续字符叠上前字符（"文字重叠"根因）。英文码点小恰好未暴露。
+            double adv = fr.GetAdvanceWidth((int)ch) / upm;
             penAdv += adv * wf;
         }
 

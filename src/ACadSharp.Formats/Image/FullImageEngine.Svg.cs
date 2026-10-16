@@ -25,7 +25,7 @@ internal partial class ImageEngine
     private bool _useRealTextWidth;       // PNG 光栅端置 true：文字对齐锚点用真实字体度量算宽（修正居中/右对正漂移）
     private double _ltScale = 1.0;
     private double _scale = 1.0;
-    private short _pdMode;                 // $PDMODE 点样式：位0-2=0点/1无/2+/3X/4竖线；位5(32)=方框；位6(64)=圆框
+    private short _pdMode;                 // $PDMODE 点样式：位0-2=0点/1无/2+/3X/4竖线；位5(32)=圆框；位6(64)=方框
     private double _pdSize;                // $PDSIZE 点尺寸：0=视高5%；>0=绝对单位；<0=视高百分比(|v|%)
     private double _minX = double.MaxValue, _minY = double.MaxValue, _maxX = double.MinValue, _maxY = double.MinValue;
     private double _margin = 2.0, _w = 1.0, _h = 1.0;
@@ -3173,7 +3173,8 @@ internal partial class ImageEngine
     {
         // 点样式（$PDMODE/$PDSIZE，AutoCAD 语义，此前被完全忽略——所有点一律画成
         // 半径=1.5×线宽的实心圆，r≈0.15 数据单位在整幅图里几乎不可见，"点样式未正常渲染"）：
-        //   PDMODE 位0-2：0=点 1=不显示 2=加号 3=X 4=竖线；位5(32)=外加方框；位6(64)=外加圆框
+        //   PDMODE 位0-2：0=点 1=不显示 2=加号 3=X 4=竖线；位5(32)=外加圆框；位6(64)=外加方框
+        //   （对话框 20 图标布局：行1=无框(0-4)，行2=圆框(32-36)，行3=方框(64-68)，行4=圆+方框(96-100)）
         //   PDSIZE：0=视高5%（相对屏幕）；>0=绝对单位；<0=视高百分比(|值|%)
         int mode = _pdMode;
         int shape = mode & 7;
@@ -3188,8 +3189,11 @@ internal partial class ImageEngine
         string halo = _transparentBg ? "none" : (_whiteBg ? "#FFFFFF" : "#000000");
         double sx0 = Sx(cx - half), sx1 = Sx(cx + half), sy0 = Sy(cy - half), sy1 = Sy(cy + half);
         double scx = Sx(cx), scy = Sy(cy);
-        // 外加方框（PDMODE 位5=32）
+        // 外加圆框（PDMODE 位5=32；对话框第 2 行）
         if ((mode & 32) != 0)
+            sb.AppendLine($"  <circle cx=\"{F(scx)}\" cy=\"{F(scy)}\" r=\"{F(half)}\" fill=\"none\" stroke=\"{color}\" stroke-width=\"{F(w)}\"/>");
+        // 外加方框（PDMODE 位6=64；对话框第 3 行）
+        if ((mode & 64) != 0)
         {
             var d = new StringBuilder();
             d.Append("M").Append(F(sx0)).Append(',').Append(F(sy0))
@@ -3197,9 +3201,6 @@ internal partial class ImageEngine
              .Append("H").Append(F(sx0)).Append("Z");
             sb.AppendLine($"  <path d=\"{d}\" fill=\"none\" stroke=\"{color}\" stroke-width=\"{F(w)}\" stroke-linejoin=\"miter\"/>");
         }
-        // 外加圆框（PDMODE 位6=64）
-        if ((mode & 64) != 0)
-            sb.AppendLine($"  <circle cx=\"{F(scx)}\" cy=\"{F(scy)}\" r=\"{F(half)}\" fill=\"none\" stroke=\"{color}\" stroke-width=\"{F(w)}\"/>");
         // 中心图形
         switch (shape)
         {

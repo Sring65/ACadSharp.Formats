@@ -540,7 +540,7 @@ internal partial class ImageEngine
     }
 
     // 点样式（$PDMODE/$PDSIZE，AutoCAD 语义）→ PNG 位图，与 SVG/PDF 端逐样式一致：
-    //   位0-2：0=点(实心小圆) 1=不显示 2=加号 3=X 4=竖线；位5(32)=外加方框；位6(64)=外加圆框
+    //   位0-2：0=点(实心小圆) 1=不显示 2=加号 3=X 4=竖线；位5(32)=外加圆框；位6(64)=外加方框
     private void EmitPointPng(double cx, double cy, RasterCanvas.Rgb col, double lw)
     {
         int mode = _pdMode;
@@ -557,11 +557,8 @@ internal partial class ImageEngine
         float x0 = (float)PngSx(cx - half), x1 = (float)PngSx(cx + half);
         float y0 = (float)PngSy(cy - half), y1 = (float)PngSy(cy + half);
         RasterCanvas.P P(float px, float py) => new RasterCanvas.P(px, py);
-        // 外加方框（位5=32）
+        // 外加圆框（位5=32；对话框第 2 行）：48 段折线逼近圆
         if ((mode & 32) != 0)
-            _rc.StrokePolyline(new List<RasterCanvas.P> { P(x0, y0), P(x0, y1), P(x1, y1), P(x1, y0) }, true, w, col);
-        // 外加圆框（位6=64）：48 段折线逼近圆
-        if ((mode & 64) != 0)
         {
             float rad = Math.Abs(x1 - fx);
             int m = Math.Max(16, (int)Math.Ceiling(2 * Math.PI * Math.Max(rad, 1f) / 2.0));
@@ -573,6 +570,9 @@ internal partial class ImageEngine
             }
             _rc.StrokePolyline(pts, true, w, col);
         }
+        // 外加方框（位6=64；对话框第 3 行）
+        if ((mode & 64) != 0)
+            _rc.StrokePolyline(new List<RasterCanvas.P> { P(x0, y0), P(x0, y1), P(x1, y1), P(x1, y0) }, true, w, col);
         // 中心图形
         switch (shape)
         {

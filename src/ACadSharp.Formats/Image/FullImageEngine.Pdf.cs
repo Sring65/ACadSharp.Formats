@@ -913,7 +913,7 @@ internal partial class ImageEngine
     }
 
     // 点样式（$PDMODE/$PDSIZE，AutoCAD 语义）→ PDF 内容流，与 SVG 端 EmitPoint 逐样式一致：
-    //   位0-2：0=点(实心小圆) 1=不显示 2=加号 3=X 4=竖线；位5(32)=外加方框；位6(64)=外加圆框
+    //   位0-2：0=点(实心小圆) 1=不显示 2=加号 3=X 4=竖线；位5(32)=外加圆框；位6(64)=外加方框
     // 填充色必须显式 rg（PdfStroke 只设 RG 描边色，填充沿用上一条残留状态会致颜色不确定）；
     // 描边一律用合法路径操作符（"0 360 arc" 非 PDF 标准，合规查看器直接忽略导致点/框消失）。
     private void EmitPointPdf(MemoryStream cs, double cx, double cy, string color, double lw)
@@ -930,21 +930,21 @@ internal partial class ImageEngine
         double scx = Sx(cx), scy = Py(cy);
         double x0 = Sx(cx - half), x1 = Sx(cx + half), y0 = Py(cy - half), y1 = Py(cy + half);
         string rgb = HexToRgbPdf(color);
-        // 外加方框（位5=32）：矩形闭合路径描边
+        // 外加圆框（位5=32；对话框第 2 行）：贝塞尔整圆描边
         if ((mode & 32) != 0)
+        {
+            var d = new StringBuilder();
+            AppendCircleBezier(d, scx, scy, Math.Abs(x1 - scx));
+            PdfStroke(cs, color, w, null, d + "S");
+        }
+        // 外加方框（位6=64；对话框第 3 行）：矩形闭合路径描边
+        if ((mode & 64) != 0)
         {
             var d = new StringBuilder();
             d.Append(F(x0)).Append(' ').Append(F(y0)).Append(" m ")
              .Append(F(x0)).Append(' ').Append(F(y1)).Append(" l ")
              .Append(F(x1)).Append(' ').Append(F(y1)).Append(" l ")
              .Append(F(x1)).Append(' ').Append(F(y0)).Append(" l h ");
-            PdfStroke(cs, color, w, null, d + "S");
-        }
-        // 外加圆框（位6=64）：贝塞尔整圆描边
-        if ((mode & 64) != 0)
-        {
-            var d = new StringBuilder();
-            AppendCircleBezier(d, scx, scy, Math.Abs(x1 - scx));
             PdfStroke(cs, color, w, null, d + "S");
         }
         // 中心图形

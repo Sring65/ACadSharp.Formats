@@ -92,6 +92,7 @@ internal partial class ImageEngine
         if (!double.IsFinite(_margin) || _margin <= 0) _margin = 2.0;
         _w = dataW + 2 * _margin;
         _h = dataH + 2 * _margin;
+        ExpandViewForPointGlyphs(); // 点样式字形（r 可达视高 5%）四边扩界，避免边缘点被裁
 
         BuildLinetypeDash();
 
@@ -539,7 +540,9 @@ internal partial class ImageEngine
         }
     }
 
-    // 点样式（$PDMODE/$PDSIZE，AutoCAD 语义）→ PNG 位图，与 SVG/PDF 端逐样式一致：
+    // 点样式（$PDMODE/$PDSIZE）→ PNG 位图，与 SVG/PDF 端逐样式一致（2026-10-16 定稿标准）：
+    //   ① 笔画与直线一致（lw，1 像素不加粗）；② 框半径 = 点大小值（数据单位）
+    //   ③ 方框半宽/圆框半径 = 同一半径；④ 加号/X 半伸出 = 2r（伸出框外一 r）；竖线总长 = r（第 5 列）
     //   位0-2：0=点(实心小圆) 1=不显示 2=加号 3=X 4=竖线；位5(32)=外加圆框；位6(64)=外加方框
     private void EmitPointPng(double cx, double cy, RasterCanvas.Rgb col, double lw)
     {
@@ -548,16 +551,18 @@ internal partial class ImageEngine
         bool hasFrame = (mode & 96) != 0;
         if (shape == 1 && !hasFrame) return;       // PDMODE=1：无中心图形也无外框 → 完全无显示
                                                       // 位0=1 但带外框（33/65/97）= 只画外框、无中心图形
-        double s = PointGlyphSize();                 // 字形外接尺寸（数据单位）
-        if (!double.IsFinite(s) || s <= 0) return;
-        double k = PngK;                             // 每数据单位像素数
-        float w = (float)Math.Min(Math.Max(s * k / 8.0, Math.Max(lw, 0.05) * k), s * k / 3.0);
-        double half = s / 2.0;
+        double r = PointGlyphRadius();                // 框半径（数据单位）= 点大小值
+        if (!double.IsFinite(r) || r <= 0) return;
+        double k = PngK;                              // 每数据单位像素数
+        float w = (float)Math.Max(lw * k, 0.5);      // 笔画与直线一致（像素），不加粗
+        double arm = r * 2.0;                         // 加号/X 半伸出 = 2r（伸出框外一 r）
         float fx = (float)PngSx(cx), fy = (float)PngSy(cy);
-        float x0 = (float)PngSx(cx - half), x1 = (float)PngSx(cx + half);
-        float y0 = (float)PngSy(cy - half), y1 = (float)PngSy(cy + half);
+        float x0 = (float)PngSx(cx - r), x1 = (float)PngSx(cx + r);
+        float y0 = (float)PngSy(cy - r), y1 = (float)PngSy(cy + r);
+        float ax0 = (float)PngSx(cx - arm), ax1 = (float)PngSx(cx + arm);
+        float ay0 = (float)PngSy(cy - arm), ay1 = (float)PngSy(cy + arm);
         RasterCanvas.P P(float px, float py) => new RasterCanvas.P(px, py);
-        // 外加圆框（位5=32；对话框第 2 行）：48 段折线逼近圆
+        // 外加圆框（位5=32；对话框第 2 行）：48 段折线逼近圆，半径 = 点大小值
         if ((mode & 32) != 0)
         {
             float rad = Math.Abs(x1 - fx);
@@ -570,32 +575,35 @@ internal partial class ImageEngine
             }
             _rc.StrokePolyline(pts, true, w, col);
         }
-        // 外加方框（位6=64；对话框第 3 行）
+        // 外加方框（位6=64；对话框第 3 行）：半宽 = 点大小值
         if ((mode & 64) != 0)
             _rc.StrokePolyline(new List<RasterCanvas.P> { P(x0, y0), P(x0, y1), P(x1, y1), P(x1, y0) }, true, w, col);
         // 中心图形
         switch (shape)
         {
-            case 0: // 点：实心小圆（屏幕相对）
+            case 0: // 点：小实心圆（随框半径适度缩放）
             {
-                float rad = (float)Math.Max(s * k * 0.035, 0.5);
+                float rad = (float)Math.Max(w, r * k * 0.15);
                 // 背景色光晕环（透明背景无底色，跳过，避免在透明上出现一圈边）
                 if (!_transparentBg)
                     _rc.FillDisc(fx, fy, rad + Math.Max(0.5f, rad * 0.3f), _whiteBg ? RasterCanvas.Rgb.White : RasterCanvas.Rgb.Black);
                 _rc.FillDisc(fx, fy, rad, col);
                 break;
             }
-            case 2: // 加号
-                _rc.StrokePolyline(new List<RasterCanvas.P> { P(x0, fy), P(x1, fy) }, false, w, col);
-                _rc.StrokePolyline(new List<RasterCanvas.P> { P(fx, y0), P(fx, y1) }, false, w, col);
+            case 2: // 加号（±2r，伸出框外一 r）
+                _rc.StrokePolyline(new List<RasterCanvas.P> { P(ax0, fy), P(ax1, fy) }, false, w, col);
+                _rc.StrokePolyline(new List<RasterCanvas.P> { P(fx, ay0), P(fx, ay1) }, false, w, col);
                 break;
-            case 3: // X
-                _rc.StrokePolyline(new List<RasterCanvas.P> { P(x0, y0), P(x1, y1) }, false, w, col);
-                _rc.StrokePolyline(new List<RasterCanvas.P> { P(x0, y1), P(x1, y0) }, false, w, col);
+            case 3: // X（±2r，伸出框外一 r）
+                _rc.StrokePolyline(new List<RasterCanvas.P> { P(ax0, ay0), P(ax1, ay1) }, false, w, col);
+                _rc.StrokePolyline(new List<RasterCanvas.P> { P(ax0, ay1), P(ax1, ay0) }, false, w, col);
                 break;
-            case 4: // 竖线
-                _rc.StrokePolyline(new List<RasterCanvas.P> { P(fx, y0), P(fx, y1) }, false, w, col);
+            case 4: // 竖线（总长 = r；2026-10-16 用户定稿：第 5 列竖线长度为 r）
+            {
+                double vh = r * 0.5;
+                _rc.StrokePolyline(new List<RasterCanvas.P> { P(fx, (float)PngSy(cy - vh)), P(fx, (float)PngSy(cy + vh)) }, false, w, col);
                 break;
+            }
         }
     }
 

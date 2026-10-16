@@ -1669,6 +1669,7 @@ internal partial class ImageEngine
         if (!double.IsFinite(_margin) || _margin <= 0) _margin = 2.0;
         _w = dataW + 2 * _margin;
         _h = dataH + 2 * _margin;
+        ExpandViewForPointGlyphs(); // 点样式字形（r 可达视高 5%）四边扩界，避免边缘点被裁
 
         BuildLinetypeDash();
 
@@ -3171,88 +3172,117 @@ internal partial class ImageEngine
 
     private void EmitPoint(StringBuilder sb, double cx, double cy, string color, double lw)
     {
-        // 点样式（$PDMODE/$PDSIZE，AutoCAD 语义，此前被完全忽略——所有点一律画成
-        // 半径=1.5×线宽的实心圆，r≈0.15 数据单位在整幅图里几乎不可见，"点样式未正常渲染"）：
+        // 点样式（$PDMODE/$PDSIZE）——2026-10-16 用户定稿标准（无需对照 CAD 实际显示）：
+        //   ① 笔画与直线一致（lw，1 像素不加粗，废除随字形缩放的加粗公式）
+        //   ② 半径 = 点大小值（数据单位）：PDSIZE=0 → 视高 5%；>0 → 绝对值；<0 → 视高百分比
+        //      （“不管设置是 5% 还是 5 单位，1×5×10=50 像素”——折算为数据单位半径，
+        //        经渲染变换映射为像素：size(数据单位) × 每单位像素数）
+        //   ③ 方框半宽 = 半径，圆框半径 = 半径（同一半径）
+        //   ④ 加号/X 半伸出 = 2r（伸出框外一 r）；竖线总长 = r（第 5 列）；点为小实心圆
         //   PDMODE 位0-2：0=点 1=不显示 2=加号 3=X 4=竖线；位5(32)=外加圆框；位6(64)=外加方框
-        //   （对话框 20 图标布局：行1=无框(0-4)，行2=圆框(32-36)，行3=方框(64-68)，行4=圆+方框(96-100)）
-        //   PDSIZE：0=视高5%（相对屏幕）；>0=绝对单位；<0=视高百分比(|值|%)
         int mode = _pdMode;
         int shape = mode & 7;
         bool hasFrame = (mode & 96) != 0;
         if (shape == 1 && !hasFrame) return;       // PDMODE=1：无中心图形也无外框 → 完全无显示
                                                       // 位0=1 但带外框（33/65/97）= 只画外框、无中心图形
-        double s = PointGlyphSize();                 // 字形外接尺寸（数据单位）
-        if (!double.IsFinite(s) || s <= 0) return;
-        double w = PointGlyphWeight(s, lw);          // 笔画权重
-        double half = s / 2.0;
+        double r = PointGlyphRadius();                // 框半径（数据单位）= 点大小值
+        if (!double.IsFinite(r) || r <= 0) return;
+        double w = lw;                                // 笔画与直线一致，不加粗
+        double arm = r * 2.0;                         // 加号/X 半伸出 = 2r（超出框一 r）
         // 透明背景无底色：省略背景色描边光晕（避免透明处出现一圈黑/白边）
         string halo = _transparentBg ? "none" : (_whiteBg ? "#FFFFFF" : "#000000");
-        double sx0 = Sx(cx - half), sx1 = Sx(cx + half), sy0 = Sy(cy - half), sy1 = Sy(cy + half);
         double scx = Sx(cx), scy = Sy(cy);
-        // 外加圆框（PDMODE 位5=32；对话框第 2 行）
+        double fx0 = Sx(cx - r), fx1 = Sx(cx + r), fy0 = Sy(cy - r), fy1 = Sy(cy + r);
+        double ax0 = Sx(cx - arm), ax1 = Sx(cx + arm), ay0 = Sy(cy - arm), ay1 = Sy(cy + arm);
+        // 外加圆框（PDMODE 位5=32；对话框第 2 行）：半径 = 点大小值
         if ((mode & 32) != 0)
-            sb.AppendLine($"  <circle cx=\"{F(scx)}\" cy=\"{F(scy)}\" r=\"{F(half)}\" fill=\"none\" stroke=\"{color}\" stroke-width=\"{F(w)}\"/>");
-        // 外加方框（PDMODE 位6=64；对话框第 3 行）
+            sb.AppendLine($"  <circle cx=\"{F(scx)}\" cy=\"{F(scy)}\" r=\"{F(Math.Abs(fx1 - scx))}\" fill=\"none\" stroke=\"{color}\" stroke-width=\"{F(w)}\"/>");
+        // 外加方框（PDMODE 位6=64；对话框第 3 行）：半宽 = 点大小值
         if ((mode & 64) != 0)
         {
             var d = new StringBuilder();
-            d.Append("M").Append(F(sx0)).Append(',').Append(F(sy0))
-             .Append("H").Append(F(sx1)).Append("V").Append(F(sy1))
-             .Append("H").Append(F(sx0)).Append("Z");
+            d.Append("M").Append(F(fx0)).Append(',').Append(F(fy0))
+             .Append("H").Append(F(fx1)).Append("V").Append(F(fy1))
+             .Append("H").Append(F(fx0)).Append("Z");
             sb.AppendLine($"  <path d=\"{d}\" fill=\"none\" stroke=\"{color}\" stroke-width=\"{F(w)}\" stroke-linejoin=\"miter\"/>");
         }
         // 中心图形
         switch (shape)
         {
-            case 0: // 点：实心小圆（屏幕相对，≈5%视高字形的 3.5%）
+            case 0: // 点：小实心圆（随框半径适度缩放）
             {
-                double r = Math.Max(s * 0.035, 0.05);
-                sb.AppendLine($"  <circle cx=\"{F(scx)}\" cy=\"{F(scy)}\" r=\"{F(r)}\" fill=\"{color}\" stroke=\"{halo}\" stroke-width=\"{F(Math.Min(r * 0.3, w))}\"/>");
+                double pr = Math.Max(Math.Abs(w), r * 0.15);
+                sb.AppendLine($"  <circle cx=\"{F(scx)}\" cy=\"{F(scy)}\" r=\"{F(pr)}\" fill=\"{color}\" stroke=\"{halo}\" stroke-width=\"{F(Math.Min(pr * 0.3, Math.Abs(w)))}\"/>");
                 break;
             }
-            case 2: // 加号
+            case 2: // 加号（±2r，伸出框外一 r）
             {
                 var d = new StringBuilder();
-                d.Append("M").Append(F(sx0)).Append(',').Append(F(scy)).Append("H").Append(F(sx1))
-                 .Append("M").Append(F(scx)).Append(',').Append(F(sy0)).Append("V").Append(F(sy1));
+                d.Append("M").Append(F(ax0)).Append(',').Append(F(scy)).Append("H").Append(F(ax1))
+                 .Append("M").Append(F(scx)).Append(',').Append(F(ay0)).Append("V").Append(F(ay1));
                 sb.AppendLine($"  <path d=\"{d}\" fill=\"none\" stroke=\"{color}\" stroke-width=\"{F(w)}\" stroke-linecap=\"butt\"/>");
                 break;
             }
-            case 3: // X
+            case 3: // X（±2r，伸出框外一 r）
             {
                 var d = new StringBuilder();
-                d.Append("M").Append(F(sx0)).Append(',').Append(F(sy0)).Append("L").Append(F(sx1)).Append(',').Append(F(sy1))
-                 .Append("M").Append(F(sx0)).Append(',').Append(F(sy1)).Append("L").Append(F(sx1)).Append(',').Append(F(sy0));
+                d.Append("M").Append(F(ax0)).Append(',').Append(F(ay0)).Append("L").Append(F(ax1)).Append(',').Append(F(ay1))
+                 .Append("M").Append(F(ax0)).Append(',').Append(F(ay1)).Append("L").Append(F(ax1)).Append(',').Append(F(ay0));
                 sb.AppendLine($"  <path d=\"{d}\" fill=\"none\" stroke=\"{color}\" stroke-width=\"{F(w)}\" stroke-linecap=\"butt\"/>");
                 break;
             }
-            case 4: // 竖线
+            case 4: // 竖线（总长 = r；2026-10-16 用户定稿：第 5 列竖线长度为 r）
             {
+                double vh = r * 0.5;
+                double vy0 = Sy(cy - vh), vy1 = Sy(cy + vh);
                 var d = new StringBuilder();
-                d.Append("M").Append(F(scx)).Append(',').Append(F(sy0)).Append("V").Append(F(sy1));
+                d.Append("M").Append(F(scx)).Append(',').Append(F(vy0)).Append("V").Append(F(vy1));
                 sb.AppendLine($"  <path d=\"{d}\" fill=\"none\" stroke=\"{color}\" stroke-width=\"{F(w)}\" stroke-linecap=\"butt\"/>");
                 break;
             }
         }
     }
 
-    // 点字形尺寸（数据单位）：PDSIZE=0 → 5% 视高；>0 → 绝对单位；<0 → |PDSIZE|% 视高。
+    // 点样式半径（数据单位）= 点大小值：PDSIZE=0 → 视高 5%；>0 → 绝对单位；<0 → |PDSIZE|% 视高。
+    // 用户定稿：“不管设置是 5% 还是 5 单位”——一律折算为数据单位半径（方框半宽/圆框半径），
+    // 渲染时经变换映射为像素（如 5 单位 × 每单位 10 像素 = 50 像素半径）。
     // 依赖 _h（画布高度），须在 WriteSvg/WritePdf/WritePng 定稿 _h 之后调用。
-    private double PointGlyphSize()
+    private double PointGlyphRadius()
     {
         double viewH = _h;
         if (!double.IsFinite(viewH) || viewH <= 0) viewH = 1.0;
-        double s;
-        if (Math.Abs(_pdSize) < 1e-12) s = viewH * 0.05;
-        else if (_pdSize > 0) s = _pdSize;
-        else s = viewH * Math.Abs(_pdSize) / 100.0;
-        if (!double.IsFinite(s) || s <= 0) s = viewH * 0.05;
-        return s;
+        double r;
+        if (Math.Abs(_pdSize) < 1e-12) r = viewH * 0.05;
+        else if (_pdSize > 0) r = _pdSize;
+        else r = viewH * Math.Abs(_pdSize) / 100.0;
+        if (!double.IsFinite(r) || r <= 0) r = viewH * 0.05;
+        return r;
     }
 
-    // 点字形笔画权重（数据单位）：随字形缩放，但不细于实体线宽、不粗于字形的 1/3。
-    private static double PointGlyphWeight(double s, double lw)
-        => Math.Min(Math.Max(s / 8.0, Math.Max(lw, 0.05)), s / 3.0);
+    // 点样式字形会超出点实体位置范围：PDSIZE=0 时 r=5% 视高，加号/X 更伸到 2r，
+    // 边缘点的框/标记会被画布裁掉（曾致总览图首格圆形只剩半弧）。
+    // 这里把视界四边各向外扩 r，保证字形完整可见。
+    // PDSIZE=0 时 r 依赖 _h（循环依赖），迭代 3 次收敛（公比 5%）。
+    private void ExpandViewForPointGlyphs()
+    {
+        if (!HasVisiblePointGlyph()) return;
+        for (int i = 0; i < 3; i++)
+        {
+            double r = PointGlyphRadius();
+            _minX -= r; _maxX += r; _minY -= r; _maxY += r;
+            _w = (_maxX - _minX) + 2 * _margin;
+            _h = (_maxY - _minY) + 2 * _margin;
+        }
+    }
+
+    private bool HasVisiblePointGlyph()
+    {
+        int mode = _pdMode;
+        if ((mode & 7) == 1 && (mode & 96) == 0) return false;   // PDMODE=1：无可见字形
+        foreach (var ent in AllEntities())
+            if (ent is Point) return true;
+        return false;
+    }
 
     // R18：普通 TEXT 宽度因子（DXF 41 / WidthFactor）——水平缩放锚定基线起点 (sx,sy)：
     // translate(sx,sy) scale(WF,1) translate(-sx,-sy) 先按文字局部系压缩字宽，再整体旋转（与 MText SVG 的 scale(WF,1) 同语义）。

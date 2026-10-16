@@ -364,15 +364,8 @@ internal partial class ImageEngine
                 {
                     var (cx, cy) = tr == null ? (pt.Location.X, pt.Location.Y) : tr.Apply(pt.Location.X, pt.Location.Y);
                     double lw = StrokeWidth(ent, scaleMul);
-                    double radius = Math.Max(0.05, lw * 1.5);
-                    if (!double.IsFinite(radius) || radius <= 0) radius = 0.05;
-                    float fx = (float)PngSx(cx), fy = (float)PngSy(cy);
-                    float rad = (float)(radius * PngK);
                     var col = HexToRgb(ColorOf(EntityAciIndex(ent), layerAci, byBlockAci));
-                    // 背景色光晕环（透明背景无底色，跳过，避免在透明上出现一圈边）
-                    if (!_transparentBg)
-                        _rc.FillDisc(fx, fy, rad + (float)(radius * 0.15 * PngK), _whiteBg ? RasterCanvas.Rgb.White : RasterCanvas.Rgb.Black);
-                    _rc.FillDisc(fx, fy, rad, col);
+                    EmitPointPng(cx, cy, col, lw);
                 }
                 break;
 
@@ -542,6 +535,66 @@ internal partial class ImageEngine
 
             default:
                 RecordSkip(ent.GetType().Name);
+                break;
+        }
+    }
+
+    // 点样式（$PDMODE/$PDSIZE，AutoCAD 语义）→ PNG 位图，与 SVG/PDF 端逐样式一致：
+    //   位0-2：0=点(实心小圆) 1=不显示 2=加号 3=X 4=竖线；位5(32)=外加方框；位6(64)=外加圆框
+    private void EmitPointPng(double cx, double cy, RasterCanvas.Rgb col, double lw)
+    {
+        int mode = _pdMode;
+        int shape = mode & 7;
+        bool hasFrame = (mode & 96) != 0;
+        if (shape == 1 && !hasFrame) return;       // PDMODE=1：无中心图形也无外框 → 完全无显示
+                                                      // 位0=1 但带外框（33/65/97）= 只画外框、无中心图形
+        double s = PointGlyphSize();                 // 字形外接尺寸（数据单位）
+        if (!double.IsFinite(s) || s <= 0) return;
+        double k = PngK;                             // 每数据单位像素数
+        float w = (float)Math.Min(Math.Max(s * k / 8.0, Math.Max(lw, 0.05) * k), s * k / 3.0);
+        double half = s / 2.0;
+        float fx = (float)PngSx(cx), fy = (float)PngSy(cy);
+        float x0 = (float)PngSx(cx - half), x1 = (float)PngSx(cx + half);
+        float y0 = (float)PngSy(cy - half), y1 = (float)PngSy(cy + half);
+        RasterCanvas.P P(float px, float py) => new RasterCanvas.P(px, py);
+        // 外加方框（位5=32）
+        if ((mode & 32) != 0)
+            _rc.StrokePolyline(new List<RasterCanvas.P> { P(x0, y0), P(x0, y1), P(x1, y1), P(x1, y0) }, true, w, col);
+        // 外加圆框（位6=64）：48 段折线逼近圆
+        if ((mode & 64) != 0)
+        {
+            float rad = Math.Abs(x1 - fx);
+            int m = Math.Max(16, (int)Math.Ceiling(2 * Math.PI * Math.Max(rad, 1f) / 2.0));
+            var pts = new List<RasterCanvas.P>(m + 1);
+            for (int i = 0; i <= m; i++)
+            {
+                double th = 2 * Math.PI * i / m;
+                pts.Add(P(fx + (float)(rad * Math.Cos(th)), fy + (float)(rad * Math.Sin(th))));
+            }
+            _rc.StrokePolyline(pts, true, w, col);
+        }
+        // 中心图形
+        switch (shape)
+        {
+            case 0: // 点：实心小圆（屏幕相对）
+            {
+                float rad = (float)Math.Max(s * k * 0.035, 0.5);
+                // 背景色光晕环（透明背景无底色，跳过，避免在透明上出现一圈边）
+                if (!_transparentBg)
+                    _rc.FillDisc(fx, fy, rad + Math.Max(0.5f, rad * 0.3f), _whiteBg ? RasterCanvas.Rgb.White : RasterCanvas.Rgb.Black);
+                _rc.FillDisc(fx, fy, rad, col);
+                break;
+            }
+            case 2: // 加号
+                _rc.StrokePolyline(new List<RasterCanvas.P> { P(x0, fy), P(x1, fy) }, false, w, col);
+                _rc.StrokePolyline(new List<RasterCanvas.P> { P(fx, y0), P(fx, y1) }, false, w, col);
+                break;
+            case 3: // X
+                _rc.StrokePolyline(new List<RasterCanvas.P> { P(x0, y0), P(x1, y1) }, false, w, col);
+                _rc.StrokePolyline(new List<RasterCanvas.P> { P(x0, y1), P(x1, y0) }, false, w, col);
+                break;
+            case 4: // 竖线
+                _rc.StrokePolyline(new List<RasterCanvas.P> { P(fx, y0), P(fx, y1) }, false, w, col);
                 break;
         }
     }

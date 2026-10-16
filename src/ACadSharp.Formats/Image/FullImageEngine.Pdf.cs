@@ -412,15 +412,7 @@ internal partial class ImageEngine
             case Point pt:
                 {
                     var (cx, cy) = tr == null ? (pt.Location.X, pt.Location.Y) : tr.Apply(pt.Location.X, pt.Location.Y);
-                    // 点标记与 SVG 端一致：大小与线宽保持一致（直径 = 3× 当前线宽）；
-                    // 填充整圆同样用贝塞尔（旧 "0 360 arc" 被合规查看器忽略，点会消失）。
-                    // 填充必须显式设置填充色 rg：PdfStroke 只设置描边色 RG，
-                    // 填充色会沿用上一条操作残留的状态——前面恰好是黑色背景时点被填成
-                    // 黑色（黑底不可见），残留红色文字状态时又显示为红色，行为不确定。
-                    double pr = Math.Max(0.05, StrokeWidth(pt, scaleMul) * 1.5);
-                    var dDot = new StringBuilder();
-                    AppendCircleBezier(dDot, Sx(cx), Py(cy), pr);
-                    CsAscii(cs, HexToRgbPdf(col) + " rg\n" + HexToRgbPdf(col) + " RG\n0.6 w\n" + dDot + "f\n");
+                    EmitPointPdf(cs, cx, cy, col, StrokeWidth(pt, scaleMul));
                 }
                 break;
 
@@ -918,6 +910,78 @@ internal partial class ImageEngine
         d.Append(F(cx - k) + " " + F(cy + r) + " " + F(cx - r) + " " + F(cy + k) + " " + F(cx - r) + " " + F(cy) + " c ");
         d.Append(F(cx - r) + " " + F(cy - k) + " " + F(cx - k) + " " + F(cy - r) + " " + F(cx) + " " + F(cy - r) + " c ");
         d.Append(F(cx + k) + " " + F(cy - r) + " " + F(cx + r) + " " + F(cy - k) + " " + F(cx + r) + " " + F(cy) + " c h ");
+    }
+
+    // 点样式（$PDMODE/$PDSIZE，AutoCAD 语义）→ PDF 内容流，与 SVG 端 EmitPoint 逐样式一致：
+    //   位0-2：0=点(实心小圆) 1=不显示 2=加号 3=X 4=竖线；位5(32)=外加方框；位6(64)=外加圆框
+    // 填充色必须显式 rg（PdfStroke 只设 RG 描边色，填充沿用上一条残留状态会致颜色不确定）；
+    // 描边一律用合法路径操作符（"0 360 arc" 非 PDF 标准，合规查看器直接忽略导致点/框消失）。
+    private void EmitPointPdf(MemoryStream cs, double cx, double cy, string color, double lw)
+    {
+        int mode = _pdMode;
+        int shape = mode & 7;
+        bool hasFrame = (mode & 96) != 0;
+        if (shape == 1 && !hasFrame) return;       // PDMODE=1：无中心图形也无外框 → 完全无显示
+                                                      // 位0=1 但带外框（33/65/97）= 只画外框、无中心图形
+        double s = PointGlyphSize();                 // 字形外接尺寸（数据单位）
+        if (!double.IsFinite(s) || s <= 0) return;
+        double w = PointGlyphWeight(s, lw);          // 笔画权重
+        double half = s / 2.0;
+        double scx = Sx(cx), scy = Py(cy);
+        double x0 = Sx(cx - half), x1 = Sx(cx + half), y0 = Py(cy - half), y1 = Py(cy + half);
+        string rgb = HexToRgbPdf(color);
+        // 外加方框（位5=32）：矩形闭合路径描边
+        if ((mode & 32) != 0)
+        {
+            var d = new StringBuilder();
+            d.Append(F(x0)).Append(' ').Append(F(y0)).Append(" m ")
+             .Append(F(x0)).Append(' ').Append(F(y1)).Append(" l ")
+             .Append(F(x1)).Append(' ').Append(F(y1)).Append(" l ")
+             .Append(F(x1)).Append(' ').Append(F(y0)).Append(" l h ");
+            PdfStroke(cs, color, w, null, d + "S");
+        }
+        // 外加圆框（位6=64）：贝塞尔整圆描边
+        if ((mode & 64) != 0)
+        {
+            var d = new StringBuilder();
+            AppendCircleBezier(d, scx, scy, Math.Abs(x1 - scx));
+            PdfStroke(cs, color, w, null, d + "S");
+        }
+        // 中心图形
+        switch (shape)
+        {
+            case 0: // 点：实心小圆（屏幕相对）
+            {
+                double r = Math.Max(s * 0.035, 0.05);
+                var d = new StringBuilder();
+                AppendCircleBezier(d, scx, scy, r);
+                CsAscii(cs, rgb + " rg\n" + rgb + " RG\n" + F(Math.Min(r * 0.3, w)) + " w\n" + d + "f\n");
+                break;
+            }
+            case 2: // 加号：横竖两笔
+            {
+                var d = new StringBuilder();
+                d.Append(F(x0)).Append(' ').Append(F(scy)).Append(" m ").Append(F(x1)).Append(' ').Append(F(scy)).Append(" l ")
+                 .Append(F(scx)).Append(' ').Append(F(y0)).Append(" m ").Append(F(scx)).Append(' ').Append(F(y1)).Append(" l ");
+                PdfStroke(cs, color, w, null, d + "S");
+                break;
+            }
+            case 3: // X：两条对角线
+            {
+                var d = new StringBuilder();
+                d.Append(F(x0)).Append(' ').Append(F(y0)).Append(" m ").Append(F(x1)).Append(' ').Append(F(y1)).Append(" l ")
+                 .Append(F(x0)).Append(' ').Append(F(y1)).Append(" m ").Append(F(x1)).Append(' ').Append(F(y0)).Append(" l ");
+                PdfStroke(cs, color, w, null, d + "S");
+                break;
+            }
+            case 4: // 竖线
+            {
+                var d = new StringBuilder();
+                d.Append(F(scx)).Append(' ').Append(F(y0)).Append(" m ").Append(F(scx)).Append(' ').Append(F(y1)).Append(" l ");
+                PdfStroke(cs, color, w, null, d + "S");
+                break;
+            }
+        }
     }
 
     // 椭圆：8 段（每段 45°）三次贝塞尔逼近（y 向上坐标系，旋转角与 CAD 同向，直接取正）。

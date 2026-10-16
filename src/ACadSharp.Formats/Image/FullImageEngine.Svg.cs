@@ -25,6 +25,8 @@ internal partial class ImageEngine
     private bool _useRealTextWidth;       // PNG 光栅端置 true：文字对齐锚点用真实字体度量算宽（修正居中/右对正漂移）
     private double _ltScale = 1.0;
     private double _scale = 1.0;
+    private short _pdMode;                 // $PDMODE 点样式：位0-2=0点/1无/2+/3X/4竖线；位5(32)=方框；位6(64)=圆框
+    private double _pdSize;                // $PDSIZE 点尺寸：0=视高5%；>0=绝对单位；<0=视高百分比(|v|%)
     private double _minX = double.MaxValue, _minY = double.MaxValue, _maxX = double.MinValue, _maxY = double.MinValue;
     private double _margin = 2.0, _w = 1.0, _h = 1.0;
 
@@ -49,6 +51,12 @@ internal partial class ImageEngine
             if (double.IsFinite(v) && v > 0) _ltScale = v;
         }
         catch { }
+        try
+        {
+            _pdMode = doc.Header.PointDisplayMode;
+            _pdSize = doc.Header.PointDisplaySize;
+        }
+        catch { _pdMode = 0; _pdSize = 0.0; }
     }
 
     #region ===== 颜色：AutoCAD 标准 ACI 调色板 =====
@@ -3163,12 +3171,87 @@ internal partial class ImageEngine
 
     private void EmitPoint(StringBuilder sb, double cx, double cy, string color, double lw)
     {
-        double radius = Math.Max(0.05, lw * 1.5);
-        if (!double.IsFinite(radius) || radius <= 0) radius = 0.05;
+        // 点样式（$PDMODE/$PDSIZE，AutoCAD 语义，此前被完全忽略——所有点一律画成
+        // 半径=1.5×线宽的实心圆，r≈0.15 数据单位在整幅图里几乎不可见，"点样式未正常渲染"）：
+        //   PDMODE 位0-2：0=点 1=不显示 2=加号 3=X 4=竖线；位5(32)=外加方框；位6(64)=外加圆框
+        //   PDSIZE：0=视高5%（相对屏幕）；>0=绝对单位；<0=视高百分比(|值|%)
+        int mode = _pdMode;
+        int shape = mode & 7;
+        bool hasFrame = (mode & 96) != 0;
+        if (shape == 1 && !hasFrame) return;       // PDMODE=1：无中心图形也无外框 → 完全无显示
+                                                      // 位0=1 但带外框（33/65/97）= 只画外框、无中心图形
+        double s = PointGlyphSize();                 // 字形外接尺寸（数据单位）
+        if (!double.IsFinite(s) || s <= 0) return;
+        double w = PointGlyphWeight(s, lw);          // 笔画权重
+        double half = s / 2.0;
         // 透明背景无底色：省略背景色描边光晕（避免透明处出现一圈黑/白边）
         string halo = _transparentBg ? "none" : (_whiteBg ? "#FFFFFF" : "#000000");
-        sb.AppendLine($"  <circle cx=\"{F(Sx(cx))}\" cy=\"{F(Sy(cy))}\" r=\"{F(radius)}\" fill=\"{color}\" stroke=\"{halo}\" stroke-width=\"{F(radius * 0.3)}\"/>");
+        double sx0 = Sx(cx - half), sx1 = Sx(cx + half), sy0 = Sy(cy - half), sy1 = Sy(cy + half);
+        double scx = Sx(cx), scy = Sy(cy);
+        // 外加方框（PDMODE 位5=32）
+        if ((mode & 32) != 0)
+        {
+            var d = new StringBuilder();
+            d.Append("M").Append(F(sx0)).Append(',').Append(F(sy0))
+             .Append("H").Append(F(sx1)).Append("V").Append(F(sy1))
+             .Append("H").Append(F(sx0)).Append("Z");
+            sb.AppendLine($"  <path d=\"{d}\" fill=\"none\" stroke=\"{color}\" stroke-width=\"{F(w)}\" stroke-linejoin=\"miter\"/>");
+        }
+        // 外加圆框（PDMODE 位6=64）
+        if ((mode & 64) != 0)
+            sb.AppendLine($"  <circle cx=\"{F(scx)}\" cy=\"{F(scy)}\" r=\"{F(half)}\" fill=\"none\" stroke=\"{color}\" stroke-width=\"{F(w)}\"/>");
+        // 中心图形
+        switch (shape)
+        {
+            case 0: // 点：实心小圆（屏幕相对，≈5%视高字形的 3.5%）
+            {
+                double r = Math.Max(s * 0.035, 0.05);
+                sb.AppendLine($"  <circle cx=\"{F(scx)}\" cy=\"{F(scy)}\" r=\"{F(r)}\" fill=\"{color}\" stroke=\"{halo}\" stroke-width=\"{F(Math.Min(r * 0.3, w))}\"/>");
+                break;
+            }
+            case 2: // 加号
+            {
+                var d = new StringBuilder();
+                d.Append("M").Append(F(sx0)).Append(',').Append(F(scy)).Append("H").Append(F(sx1))
+                 .Append("M").Append(F(scx)).Append(',').Append(F(sy0)).Append("V").Append(F(sy1));
+                sb.AppendLine($"  <path d=\"{d}\" fill=\"none\" stroke=\"{color}\" stroke-width=\"{F(w)}\" stroke-linecap=\"butt\"/>");
+                break;
+            }
+            case 3: // X
+            {
+                var d = new StringBuilder();
+                d.Append("M").Append(F(sx0)).Append(',').Append(F(sy0)).Append("L").Append(F(sx1)).Append(',').Append(F(sy1))
+                 .Append("M").Append(F(sx0)).Append(',').Append(F(sy1)).Append("L").Append(F(sx1)).Append(',').Append(F(sy0));
+                sb.AppendLine($"  <path d=\"{d}\" fill=\"none\" stroke=\"{color}\" stroke-width=\"{F(w)}\" stroke-linecap=\"butt\"/>");
+                break;
+            }
+            case 4: // 竖线
+            {
+                var d = new StringBuilder();
+                d.Append("M").Append(F(scx)).Append(',').Append(F(sy0)).Append("V").Append(F(sy1));
+                sb.AppendLine($"  <path d=\"{d}\" fill=\"none\" stroke=\"{color}\" stroke-width=\"{F(w)}\" stroke-linecap=\"butt\"/>");
+                break;
+            }
+        }
     }
+
+    // 点字形尺寸（数据单位）：PDSIZE=0 → 5% 视高；>0 → 绝对单位；<0 → |PDSIZE|% 视高。
+    // 依赖 _h（画布高度），须在 WriteSvg/WritePdf/WritePng 定稿 _h 之后调用。
+    private double PointGlyphSize()
+    {
+        double viewH = _h;
+        if (!double.IsFinite(viewH) || viewH <= 0) viewH = 1.0;
+        double s;
+        if (Math.Abs(_pdSize) < 1e-12) s = viewH * 0.05;
+        else if (_pdSize > 0) s = _pdSize;
+        else s = viewH * Math.Abs(_pdSize) / 100.0;
+        if (!double.IsFinite(s) || s <= 0) s = viewH * 0.05;
+        return s;
+    }
+
+    // 点字形笔画权重（数据单位）：随字形缩放，但不细于实体线宽、不粗于字形的 1/3。
+    private static double PointGlyphWeight(double s, double lw)
+        => Math.Min(Math.Max(s / 8.0, Math.Max(lw, 0.05)), s / 3.0);
 
     // R18：普通 TEXT 宽度因子（DXF 41 / WidthFactor）——水平缩放锚定基线起点 (sx,sy)：
     // translate(sx,sy) scale(WF,1) translate(-sx,-sy) 先按文字局部系压缩字宽，再整体旋转（与 MText SVG 的 scale(WF,1) 同语义）。

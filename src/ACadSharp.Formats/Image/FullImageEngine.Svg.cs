@@ -1152,6 +1152,11 @@ internal partial class ImageEngine
                     center[k].Y + (center[k + 1].Y - center[k].Y) * frac);
         }
 
+        // 端帽抑制标志（DXF 71 组码）：NoStartCaps 抑制 MLine 起点 V0 的端帽，
+        // NoEndCaps 抑制 MLine 终点 V_{n-1} 的端帽。被抑制时该端 p[1] 视为 0（元素正好从/到顶点画起）。
+        bool noStartCaps = ml.Flags.HasFlag(MLineFlags.NoStartCaps);
+        bool noEndCaps = ml.Flags.HasFlag(MLineFlags.NoEndCaps);
+
         // element 数
         int eMax = 0;
         for (int i = 0; i < n; i++) eMax = Math.Max(eMax, ml.Vertices[i].Segments.Count);
@@ -1176,7 +1181,8 @@ internal partial class ImageEngine
             //   p[0] = offset（沿 miter 的偏移，已用于定位中心线 c）
             //   p[1] = 端帽长度：从顶点沿元素路径到元素【实际画线端点】的距离。
             //          **段起点 V_k 的 p[1] = 头部(startCap)**；**段终点 V_{k+1} 的 p[1] = 尾端(endCap)**。
-            //          NoStartCaps/NoEndCaps 抑制的正是这段端帽。
+            //          NoStartCaps(71 bit4) 只抑制 MLine 起点 V0 的端帽，NoEndCaps(71 bit8) 只抑制
+            //          MLine 终点 V_{n-1} 的端帽；被抑制时该端元素正好画到顶点（端帽=0）。
             //   p[2..] = 断口(break/cut)区间，**相对段起点 V0 绝对定位**（不随头/尾端帽变化）：
             //          p[2]=断口1起点, p[3]=断口1终点, p[4]=断口2起点, ...
             // 画线范围 = [segStart + startCap, segEnd - endCap]，在此范围内减去断口区间即得画线段。
@@ -1192,9 +1198,17 @@ internal partial class ImageEngine
                 var endSeg = ml.Vertices[k + 1].Segments.Count > e ? ml.Vertices[k + 1].Segments[e] : null;
                 var pars = startSeg?.Parameters;
 
-                // 头部缩进 = 段起点 V_k 的 p[1]；尾端缩进 = 段终点 V_{k+1} 的 p[1]
-                double startCap = (startSeg != null && startSeg.Parameters.Count >= 2) ? startSeg.Parameters[1] : 0;
-                double endCap = (endSeg != null && endSeg.Parameters.Count >= 2) ? endSeg.Parameters[1] : 0;
+                // 头部缩进 = 段起点 V_k 的 p[1]；尾端缩进 = 段终点 V_{k+1} 的 p[1]。
+                // NoStartCaps 只抑制 MLine 起点 V0 的端帽；NoEndCaps 只抑制 MLine 终点 V_{n-1} 的端帽。
+                // 中间顶点（折点）的端帽不受影响，始终按 p[1] 计算。
+                bool isMlineStart = (k == 0);
+                bool isMlineEnd = (k + 1 == n - 1);
+                double startCap = 0;
+                if (startSeg != null && startSeg.Parameters.Count >= 2 && !(isMlineStart && noStartCaps))
+                    startCap = startSeg.Parameters[1];
+                double endCap = 0;
+                if (endSeg != null && endSeg.Parameters.Count >= 2 && !(isMlineEnd && noEndCaps))
+                    endCap = endSeg.Parameters[1];
                 double drawStart = segStart + startCap; // 画线起点（头部）
                 double drawEnd = segEnd - endCap;       // 画线终点（尾端）
                 if (drawStart < segStart) drawStart = segStart;

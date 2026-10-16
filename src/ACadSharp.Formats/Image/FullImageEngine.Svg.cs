@@ -1171,10 +1171,14 @@ internal partial class ImageEngine
                     center[k].Y + (center[k + 1].Y - center[k].Y) * frac);
         }
 
-        // 端帽抑制标志（DXF 71 组码）：NoStartCaps 抑制 MLine 起点 V0 的端帽，
-        // NoEndCaps 抑制 MLine 终点 V_{n-1} 的端帽。被抑制时该端 p[1] 视为 0（元素正好从/到顶点画起）。
-        bool noStartCaps = ml.Flags.HasFlag(MLineFlags.NoStartCaps);
-        bool noEndCaps = ml.Flags.HasFlag(MLineFlags.NoEndCaps);
+        // 端帽语义（AutoCAD 实测校准：test/sample-mline.pdf 矢量 ground truth，
+        // 经 PDF 仿射反解到数据坐标系逐点比对，残差 < 0.06，见 Tools/mline_pdf_verify.py）：
+        //   DXF 71 组码 NoStartCaps(bit4)/NoEndCaps(bit8) 抑制的是 MLine 端的【横向端帽描边】
+        //   （闭合封口线段），与 41 组码 p[1] 的端点缩短（缩进）【无关】——p[1] 始终生效。
+        //   实测：chevron（71=5 含 NoStartCaps）子线仍从加帽点画起（短缺 12.13/13.29）；
+        //         连接线（71=13 含 NoStartCaps|NoEndCaps）起点同样加帽（短缺 20.0）。
+        //   历史教训：67c2aba 曾按 71 标志抑制 p[1]，导致交汇点 chevron 越界 12~13 单位、
+        //   "缩进"丢失（本提交回退该做法）。
 
         // element 数
         int eMax = 0;
@@ -1210,8 +1214,9 @@ internal partial class ImageEngine
             //             → 段中间 [32.5,47.5] 处断开 15 单位的口。
             //   p[0] = offset（沿 miter 的偏移，已用于定位中心线 c）
             //   p[1] = 端帽长度（内缩 cap）：段起点 V_k 的 p[1]=头部 startCap；段终点 V_{k+1} 的 p[1]=尾端 endCap。
-            //          NoStartCaps(71 bit4) 抑制 MLine 起点 V0 的端帽，NoEndCaps(71 bit8) 抑制 MLine 终点 V_{n-1} 的。
+            //          始终生效；71 组码 NoStartCaps/NoEndCaps 只抑制横向端帽描边，不影响此缩短量（见上方校准注释）。
             // 画线范围 = [segStart + startCap − startExt, segEnd − endCap + endExt]，再减去断口 gap 即得画线段。
+            // 首尾世界点沿【段方向】从偏移点精确计算（pDrawStart/pDrawEnd），断口边界按距离域取点。
             var segs = new List<(double X1, double Y1, double X2, double Y2)>();
             for (int k = 0; k < n - 1; k++)
             {
@@ -1223,17 +1228,18 @@ internal partial class ImageEngine
                 var pars = startSeg?.Parameters;
 
                 // 头部/尾端：
-                //   p[1] = 内缩（端帽 cap）：NoStartCaps 抑制 MLine 起点 V0 的，NoEndCaps 抑制 MLine 终点 V_{n-1} 的。
+                //   p[1] = 内缩（端帽 cap），始终生效（71 组码标志只抑制横向端帽描边，不影响缩短量）。
                 //   p[2] = count==3 时【单独】出现 → 末端顶点外延（延长）；count>=4 时为断口起点（见下）。
                 //          外延仅作用于 MLine 端点顶点（起点 V0 / 终点 V_{n-1}），使子线越过顶点延长，
-                //          用于相连多线在交汇点相接。**不受 NoStartCaps/NoEndCaps 抑制**。
+                //          用于相连多线在交汇点相接。
                 bool isMlineStart = (k == 0);
                 bool isMlineEnd = (k + 1 == n - 1);
+                // p[1] = 端帽内缩（缩进），始终生效（71 组码标志只抑制横向端帽描边，不影响缩短量）
                 double startCap = 0;
-                if (startSeg != null && startSeg.Parameters.Count >= 2 && !(isMlineStart && noStartCaps))
+                if (startSeg != null && startSeg.Parameters.Count >= 2)
                     startCap = startSeg.Parameters[1];
                 double endCap = 0;
-                if (endSeg != null && endSeg.Parameters.Count >= 2 && !(isMlineEnd && noEndCaps))
+                if (endSeg != null && endSeg.Parameters.Count >= 2)
                     endCap = endSeg.Parameters[1];
                 // 外延：仅当 p[2] 【单独】出现（count==3，无配对 p[3]）时，
                 // 它是"从子线起点到第一个断口的距离"且断口开放（无终点）→ 表现为末端顶点外延：
@@ -1245,9 +1251,16 @@ internal partial class ImageEngine
                 double endExt = 0;
                 if (isMlineEnd && endSeg != null && endSeg.Parameters.Count == 3)
                     endExt = endSeg.Parameters[2];
-                double drawStart = segStart + startCap - startExt; // 画线起点（头部，可越过 V_k 向后延）
-                double drawEnd = segEnd - endCap + endExt;        // 画线终点（尾端，可越过 V_{k+1} 向前延）
+                double drawStart = segStart + startCap - startExt; // 画线起点（距离域，头部）
+                double drawEnd = segEnd - endCap + endExt;        // 画线终点（距离域，尾端）
                 if (drawEnd < drawStart) drawEnd = drawStart;
+                // 端帽/外延的精确世界点：沿【段方向】从偏移点 c[k]/c[k+1] 取。
+                // 不能按偏移折线弧长参数化（PointAt）——偏移量沿线变化时（如 chevron e1：-20→-24.51），
+                // 弧长参数化与段方向法偏差可达 3.7 单位；AutoCAD 实测端帽点 = 偏移点 + cap·段方向。
+                double ux = segLen[k] > 1e-12 ? (wp[k + 1].X - wp[k].X) / segLen[k] : 0.0;
+                double uy = segLen[k] > 1e-12 ? (wp[k + 1].Y - wp[k].Y) / segLen[k] : 0.0;
+                (double X, double Y) pDrawStart = (c[k].X + ux * (startCap - startExt), c[k].Y + uy * (startCap - startExt));
+                (double X, double Y) pDrawEnd = (c[k + 1].X - ux * (endCap - endExt), c[k + 1].Y - uy * (endCap - endExt));
 
                 // 中间断口：p[2..] 成对 (start, end)，相对段起点 V0（segStart）绝对定位，夹到画线范围。
                 //   count>=4 时 [p[2],p[3]] 为断口 gap；count>=6 时 [p[2],p[3]],[p[4],p[5]] 多断口。
@@ -1274,7 +1287,9 @@ internal partial class ImageEngine
                 {
                     if (br.a > cur + 1e-9)
                     {
+                        // 首画线段起点用精确端帽点 pDrawStart；断口边界仍按距离域取点
                         var p1 = PointAt(c, cur);
+                        if (Math.Abs(cur - drawStart) < 1e-9) p1 = pDrawStart;
                         var p2 = PointAt(c, br.a);
                         segs.Add((p1.X, p1.Y, p2.X, p2.Y));
                     }
@@ -1283,7 +1298,8 @@ internal partial class ImageEngine
                 if (drawEnd - cur > 1e-9)
                 {
                     var p1 = PointAt(c, cur);
-                    var p2 = PointAt(c, drawEnd);
+                    if (Math.Abs(cur - drawStart) < 1e-9) p1 = pDrawStart;
+                    var p2 = pDrawEnd; // 尾端用精确端帽/外延点
                     segs.Add((p1.X, p1.Y, p2.X, p2.Y));
                 }
             }

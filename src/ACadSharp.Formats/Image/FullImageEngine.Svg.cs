@@ -1138,11 +1138,30 @@ internal partial class ImageEngine
         double totalLen = cumDist[n - 1];
         if (totalLen < 1e-12) return result;
 
-        // 沿偏移中心线取点：给定累计距离 t（0..totalLen），返回世界坐标
+        // 沿偏移中心线取点：给定累计距离 t，返回世界坐标。
+        // t 可越界：t<0 沿首段方向外延、t>totalLen 沿末段方向外延（用于端帽外延 p[2]）。
         (double X, double Y) PointAt((double X, double Y)[] center, double t)
         {
-            if (t <= 0) return center[0];
-            if (t >= totalLen) return center[n - 1];
+            if (t <= 0)
+            {
+                // 起点外延：沿首段方向（center[0]->center[1]）反向外推 -t
+                if (n < 2) return center[0];
+                double sl = segLen[0];
+                if (sl < 1e-12) return center[0];
+                double f = -t / sl;
+                return (center[0].X + (center[1].X - center[0].X) * f,
+                        center[0].Y + (center[1].Y - center[0].Y) * f);
+            }
+            if (t >= totalLen)
+            {
+                // 终点外延：沿末段方向（center[n-2]->center[n-1]）外推 (t-totalLen)
+                if (n < 2) return center[n - 1];
+                double sl = segLen[n - 2];
+                if (sl < 1e-12) return center[n - 1];
+                double f = 1.0 + (t - totalLen) / sl;
+                return (center[n - 2].X + (center[n - 1].X - center[n - 2].X) * f,
+                        center[n - 2].Y + (center[n - 1].Y - center[n - 2].Y) * f);
+            }
             // 找所在段
             int k = n - 2;
             for (int i = 1; i < n; i++) { if (t <= cumDist[i]) { k = i - 1; break; } }
@@ -1177,17 +1196,18 @@ internal partial class ImageEngine
                 c[i] = (wp[i].X + dir.X * off, wp[i].Y + dir.Y * off);
             }
 
-            // 提取画线段：按 DXF 41 正式定义（AutoCAD DXF Reference）——
+            // 提取画线段：按 DXF 41 正式定义（AutoCAD DXF Reference）+ AutoCAD 实测——
             //   p[0] = offset（沿 miter 的偏移，已用于定位中心线 c）
-            //   p[1] = 端帽长度：从顶点沿元素路径到元素【实际画线端点】的距离。
+            //   p[1] = 端帽长度（内缩）：从顶点沿元素路径到元素【实际画线端点】的距离。
             //          **段起点 V_k 的 p[1] = 头部(startCap)**；**段终点 V_{k+1} 的 p[1] = 尾端(endCap)**。
             //          NoStartCaps(71 bit4) 只抑制 MLine 起点 V0 的端帽，NoEndCaps(71 bit8) 只抑制
             //          MLine 终点 V_{n-1} 的端帽；被抑制时该端元素正好画到顶点（端帽=0）。
-            //   p[2..] = 断口(break/cut)区间，**相对段起点 V0 绝对定位**（不随头/尾端帽变化）：
-            //          p[2]=断口1起点, p[3]=断口1终点, p[4]=断口2起点, ...
-            // 画线范围 = [segStart + startCap, segEnd - endCap]，在此范围内减去断口区间即得画线段。
-            // 关键：断口用 segStart（段起点）而非 segStart+startCap 作基准 → 头/尾端帽变化
-            //       只移动画线端点，不改变中间开口位置（对齐 AutoCAD 实际行为）。
+            //   p[2]  = 端帽【外延】：子线越过顶点、沿 MLine 方向延长的距离（与 p[1] 内缩相反）。
+            //          **AutoCAD 实测**：MLine#2 末端 V1 的 p[2]=9.5334/22.8132，子线从顶点偏移点
+            //          沿 MLine 方向延长该距离（965.49,401.37→974.58,404.24 / 970.02,387.07→991.77,393.95），
+            //          使相连多线在交汇点处相接。起点顶点的 p[2] 同理（反方向外延）。
+            //   p[3..] = 中间断口(break/cut)成对区间（相对段起点 V0 绝对定位），count>=4 时生效。
+            // 画线范围 = [segStart + startCap, segEnd - endCap]，减去中间断口即得画线段；首/尾再按 p[2] 外延。
             var segs = new List<(double X1, double Y1, double X2, double Y2)>();
             for (int k = 0; k < n - 1; k++)
             {
@@ -1198,9 +1218,10 @@ internal partial class ImageEngine
                 var endSeg = ml.Vertices[k + 1].Segments.Count > e ? ml.Vertices[k + 1].Segments[e] : null;
                 var pars = startSeg?.Parameters;
 
-                // 头部缩进 = 段起点 V_k 的 p[1]；尾端缩进 = 段终点 V_{k+1} 的 p[1]。
-                // NoStartCaps 只抑制 MLine 起点 V0 的端帽；NoEndCaps 只抑制 MLine 终点 V_{n-1} 的端帽。
-                // 中间顶点（折点）的端帽不受影响，始终按 p[1] 计算。
+                // 头部/尾端：
+                //   p[1] = 内缩（端帽 cap）：NoStartCaps 抑制 MLine 起点 V0 的，NoEndCaps 抑制 MLine 终点 V_{n-1} 的。
+                //   p[2] = 外延（延长）：仅作用于 MLine 端点顶点（起点 V0 / 终点 V_{n-1}），使子线越过顶点延长，
+                //          用于相连多线在交汇点相接。**不受 NoStartCaps/NoEndCaps 抑制**。
                 bool isMlineStart = (k == 0);
                 bool isMlineEnd = (k + 1 == n - 1);
                 double startCap = 0;
@@ -1209,18 +1230,23 @@ internal partial class ImageEngine
                 double endCap = 0;
                 if (endSeg != null && endSeg.Parameters.Count >= 2 && !(isMlineEnd && noEndCaps))
                     endCap = endSeg.Parameters[1];
-                double drawStart = segStart + startCap; // 画线起点（头部）
-                double drawEnd = segEnd - endCap;       // 画线终点（尾端）
-                if (drawStart < segStart) drawStart = segStart;
-                if (drawEnd > segEnd) drawEnd = segEnd;
+                // 外延：起点段用 V0 的 p[2]（向后延），终点段用 V_{n-1} 的 p[2]（向前延）
+                double startExt = 0;
+                if (isMlineStart && startSeg != null && startSeg.Parameters.Count >= 3)
+                    startExt = startSeg.Parameters[2];
+                double endExt = 0;
+                if (isMlineEnd && endSeg != null && endSeg.Parameters.Count >= 3)
+                    endExt = endSeg.Parameters[2];
+                double drawStart = segStart + startCap - startExt; // 画线起点（头部，可越过 V_k 向后延）
+                double drawEnd = segEnd - endCap + endExt;        // 画线终点（尾端，可越过 V_{k+1} 向前延）
                 if (drawEnd < drawStart) drawEnd = drawStart;
 
-                // 断口：相对段起点 V0（segStart）绝对定位，夹到画线范围
+                // 中间断口：p[3..] 成对 (start, end)，相对段起点 V0（segStart）绝对定位，夹到画线范围
                 var breaks = new List<(double a, double b)>();
-                if (pars != null && pars.Count >= 4)
+                if (pars != null && pars.Count >= 5)
                 {
                     int pc = pars.Count;
-                    for (int pi = 2; pi + 1 < pc; pi += 2)
+                    for (int pi = 3; pi + 1 < pc; pi += 2)
                     {
                         double ba = segStart + pars[pi];
                         double bb = segStart + pars[pi + 1];

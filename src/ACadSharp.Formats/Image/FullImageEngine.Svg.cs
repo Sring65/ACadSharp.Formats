@@ -1174,11 +1174,14 @@ internal partial class ImageEngine
 
             // 提取画线段：按 DXF 41 正式定义（AutoCAD DXF Reference）——
             //   p[0] = offset（沿 miter 的偏移，已用于定位中心线 c）
-            //   p[1] = 从顶点沿元素路径到元素【实际起点】的距离（**对所有 MLine 生效**，
-            //          含 2 参数 [off,width] 的普通多线；NoStartCaps 抑制的正是 [V0, V0+p[1]] 端帽）
-            //   p[2] = 从元素起点到【第一个断口(break/cut)】的距离
-            //   p[3..] = 继续列出各断口的【起点/终点】（均相对元素起点）
-            // 即 p[2..] 是断口（间隙）区间，元素在 [elementStart, segEnd] 断口【之外】的区间被画出来。
+            //   p[1] = 端帽长度：从顶点沿元素路径到元素【实际画线端点】的距离。
+            //          **段起点 V_k 的 p[1] = 头部(startCap)**；**段终点 V_{k+1} 的 p[1] = 尾端(endCap)**。
+            //          NoStartCaps/NoEndCaps 抑制的正是这段端帽。
+            //   p[2..] = 断口(break/cut)区间，**相对段起点 V0 绝对定位**（不随头/尾端帽变化）：
+            //          p[2]=断口1起点, p[3]=断口1终点, p[4]=断口2起点, ...
+            // 画线范围 = [segStart + startCap, segEnd - endCap]，在此范围内减去断口区间即得画线段。
+            // 关键：断口用 segStart（段起点）而非 segStart+startCap 作基准 → 头/尾端帽变化
+            //       只移动画线端点，不改变中间开口位置（对齐 AutoCAD 实际行为）。
             var segs = new List<(double X1, double Y1, double X2, double Y2)>();
             for (int k = 0; k < n - 1; k++)
             {
@@ -1186,34 +1189,37 @@ internal partial class ImageEngine
                 double segEnd = cumDist[k + 1];
                 if (segEnd - segStart < 1e-12) continue;
                 var startSeg = ml.Vertices[k].Segments.Count > e ? ml.Vertices[k].Segments[e] : null;
+                var endSeg = ml.Vertices[k + 1].Segments.Count > e ? ml.Vertices[k + 1].Segments[e] : null;
                 var pars = startSeg?.Parameters;
 
-                double elementStart = segStart; // 无参数 → 从段起点画
+                // 头部缩进 = 段起点 V_k 的 p[1]；尾端缩进 = 段终点 V_{k+1} 的 p[1]
+                double startCap = (startSeg != null && startSeg.Parameters.Count >= 2) ? startSeg.Parameters[1] : 0;
+                double endCap = (endSeg != null && endSeg.Parameters.Count >= 2) ? endSeg.Parameters[1] : 0;
+                double drawStart = segStart + startCap; // 画线起点（头部）
+                double drawEnd = segEnd - endCap;       // 画线终点（尾端）
+                if (drawStart < segStart) drawStart = segStart;
+                if (drawEnd > segEnd) drawEnd = segEnd;
+                if (drawEnd < drawStart) drawEnd = drawStart;
+
+                // 断口：相对段起点 V0（segStart）绝对定位，夹到画线范围
                 var breaks = new List<(double a, double b)>();
-                if (pars != null && pars.Count >= 2)
+                if (pars != null && pars.Count >= 4)
                 {
-                    // 元素实际起点（绝对距离），夹到段内。
-                    // 注意：p[1] 对所有 MLine 生效（2 参数 [off,width] 也要应用），
-                    // 之前误只对 4+ 参数应用 → 普通多线从 V0 画全段 → 横档/梳齿偏长。
-                    elementStart = segStart + pars[1];
-                    if (elementStart < segStart) elementStart = segStart;
-                    if (elementStart > segEnd) elementStart = segEnd;
                     int pc = pars.Count;
                     for (int pi = 2; pi + 1 < pc; pi += 2)
                     {
-                        // 断口相对元素起点 → 绝对距离，夹到 [elementStart, segEnd]
-                        double ba = elementStart + pars[pi];
-                        double bb = elementStart + pars[pi + 1];
-                        if (ba < elementStart) ba = elementStart;
-                        if (ba > segEnd) ba = segEnd;
-                        if (bb < elementStart) bb = elementStart;
-                        if (bb > segEnd) bb = segEnd;
+                        double ba = segStart + pars[pi];
+                        double bb = segStart + pars[pi + 1];
+                        if (ba < drawStart) ba = drawStart;
+                        if (ba > drawEnd) ba = drawEnd;
+                        if (bb < drawStart) bb = drawStart;
+                        if (bb > drawEnd) bb = drawEnd;
                         if (bb - ba > 1e-9) breaks.Add((ba, bb));
                     }
                 }
 
-                // 在 [elementStart, segEnd] 内按断口切出画线段（断口之外画）
-                double cur = elementStart;
+                // 在 [drawStart, drawEnd] 内按断口切出画线段（断口之外画）
+                double cur = drawStart;
                 foreach (var br in breaks)
                 {
                     if (br.a > cur + 1e-9)
@@ -1224,10 +1230,10 @@ internal partial class ImageEngine
                     }
                     if (br.b > cur) cur = br.b;
                 }
-                if (segEnd - cur > 1e-9)
+                if (drawEnd - cur > 1e-9)
                 {
                     var p1 = PointAt(c, cur);
-                    var p2 = PointAt(c, segEnd);
+                    var p2 = PointAt(c, drawEnd);
                     segs.Add((p1.X, p1.Y, p2.X, p2.Y));
                 }
             }

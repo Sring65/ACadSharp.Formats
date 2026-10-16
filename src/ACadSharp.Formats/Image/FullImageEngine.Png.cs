@@ -554,7 +554,10 @@ internal partial class ImageEngine
         double r = PointGlyphRadius();                // 框半径（数据单位）= 点大小值
         if (!double.IsFinite(r) || r <= 0) return;
         double k = PngK;                              // 每数据单位像素数
-        float w = (float)Math.Max(lw * k, 0.5);      // 笔画与直线一致（像素），不加粗
+        // 笔画与直线一致（像素）不加粗，但保底 1px：ScanFill 按像素中心线(py+0.5)扫描，
+        // 亚像素(<1px)描边带可能整体落在两条采样线之间被整段丢弃（sample2004 加号臂消失根因）；
+        // 任意长度≥1 的区间必含一条采样线，且符合用户定稿"线段像素为1，点渲染1像素"。
+        float w = (float)Math.Max(lw * k, 1.0);
         double arm = r * 2.0;                         // 加号/X 半伸出 = 2r（伸出框外一 r）
         float fx = (float)PngSx(cx), fy = (float)PngSy(cy);
         float x0 = (float)PngSx(cx - r), x1 = (float)PngSx(cx + r);

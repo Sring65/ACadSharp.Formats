@@ -1196,18 +1196,22 @@ internal partial class ImageEngine
                 c[i] = (wp[i].X + dir.X * off, wp[i].Y + dir.Y * off);
             }
 
-            // 提取画线段：按 DXF 41 正式定义（AutoCAD DXF Reference）+ AutoCAD 实测——
+            // 提取画线段：按 DXF 41 正式定义（AutoCAD DXF Reference）+ AutoCAD 实测。
+            // 官方 41 定义："第 3 个值=从子线起点到第一个 break/cut 的距离；后续值继续列出 start/stop"。
+            // 结合实测，41 列表按【参数个数 count】分两种语义（成对配对模型）：
+            //   count==2 : [offset, cap]                       → 仅偏移 + 端帽内缩
+            //   count==3 : [offset, cap, ext]                  → p[2] 单独（无配对）= 画线终点
+            //             **AutoCAD 实测**：MLine#2 末端 V1 的 p[2]=9.5334/22.8132，子线从顶点偏移点
+            //             沿 MLine 方向延长该距离（965.49,401.37→974.58,404.24 / 970.02,387.07→991.77,393.95），
+            //             即末端顶点【外延】（ext>0 越过顶点），使相连多线在交汇点相接。
+            //             起点 V0 的 p[2] 同理（反方向外延）。
+            //   count>=4 : [offset, cap, b1s, b1e, b2s, b2e…]  → p[2..] 成对 (start,end) = 断口 gap（不画）
+            //             相对段起点 V0（segStart）绝对定位。如 3A8 V0 element1 [−20,0,32.5,47.5]
+            //             → 段中间 [32.5,47.5] 处断开 15 单位的口。
             //   p[0] = offset（沿 miter 的偏移，已用于定位中心线 c）
-            //   p[1] = 端帽长度（内缩）：从顶点沿元素路径到元素【实际画线端点】的距离。
-            //          **段起点 V_k 的 p[1] = 头部(startCap)**；**段终点 V_{k+1} 的 p[1] = 尾端(endCap)**。
-            //          NoStartCaps(71 bit4) 只抑制 MLine 起点 V0 的端帽，NoEndCaps(71 bit8) 只抑制
-            //          MLine 终点 V_{n-1} 的端帽；被抑制时该端元素正好画到顶点（端帽=0）。
-            //   p[2]  = 端帽【外延】：子线越过顶点、沿 MLine 方向延长的距离（与 p[1] 内缩相反）。
-            //          **AutoCAD 实测**：MLine#2 末端 V1 的 p[2]=9.5334/22.8132，子线从顶点偏移点
-            //          沿 MLine 方向延长该距离（965.49,401.37→974.58,404.24 / 970.02,387.07→991.77,393.95），
-            //          使相连多线在交汇点处相接。起点顶点的 p[2] 同理（反方向外延）。
-            //   p[3..] = 中间断口(break/cut)成对区间（相对段起点 V0 绝对定位），count>=4 时生效。
-            // 画线范围 = [segStart + startCap, segEnd - endCap]，减去中间断口即得画线段；首/尾再按 p[2] 外延。
+            //   p[1] = 端帽长度（内缩 cap）：段起点 V_k 的 p[1]=头部 startCap；段终点 V_{k+1} 的 p[1]=尾端 endCap。
+            //          NoStartCaps(71 bit4) 抑制 MLine 起点 V0 的端帽，NoEndCaps(71 bit8) 抑制 MLine 终点 V_{n-1} 的。
+            // 画线范围 = [segStart + startCap − startExt, segEnd − endCap + endExt]，再减去断口 gap 即得画线段。
             var segs = new List<(double X1, double Y1, double X2, double Y2)>();
             for (int k = 0; k < n - 1; k++)
             {
@@ -1220,7 +1224,8 @@ internal partial class ImageEngine
 
                 // 头部/尾端：
                 //   p[1] = 内缩（端帽 cap）：NoStartCaps 抑制 MLine 起点 V0 的，NoEndCaps 抑制 MLine 终点 V_{n-1} 的。
-                //   p[2] = 外延（延长）：仅作用于 MLine 端点顶点（起点 V0 / 终点 V_{n-1}），使子线越过顶点延长，
+                //   p[2] = count==3 时【单独】出现 → 末端顶点外延（延长）；count>=4 时为断口起点（见下）。
+                //          外延仅作用于 MLine 端点顶点（起点 V0 / 终点 V_{n-1}），使子线越过顶点延长，
                 //          用于相连多线在交汇点相接。**不受 NoStartCaps/NoEndCaps 抑制**。
                 bool isMlineStart = (k == 0);
                 bool isMlineEnd = (k + 1 == n - 1);
@@ -1230,23 +1235,28 @@ internal partial class ImageEngine
                 double endCap = 0;
                 if (endSeg != null && endSeg.Parameters.Count >= 2 && !(isMlineEnd && noEndCaps))
                     endCap = endSeg.Parameters[1];
-                // 外延：起点段用 V0 的 p[2]（向后延），终点段用 V_{n-1} 的 p[2]（向前延）
+                // 外延：仅当 p[2] 【单独】出现（count==3，无配对 p[3]）时，
+                // 它是"从子线起点到第一个断口的距离"且断口开放（无终点）→ 表现为末端顶点外延：
+                //   起点段(V0) p[2] 向后延、终点段(V_{n-1}) p[2] 向前延（AutoCAD 实测 MLine#2 确认）。
+                // count>=4 时 p[2] 是断口【起点】（有配对 p[3]），不作外延（见下方断口逻辑）。
                 double startExt = 0;
-                if (isMlineStart && startSeg != null && startSeg.Parameters.Count >= 3)
+                if (isMlineStart && startSeg != null && startSeg.Parameters.Count == 3)
                     startExt = startSeg.Parameters[2];
                 double endExt = 0;
-                if (isMlineEnd && endSeg != null && endSeg.Parameters.Count >= 3)
+                if (isMlineEnd && endSeg != null && endSeg.Parameters.Count == 3)
                     endExt = endSeg.Parameters[2];
                 double drawStart = segStart + startCap - startExt; // 画线起点（头部，可越过 V_k 向后延）
                 double drawEnd = segEnd - endCap + endExt;        // 画线终点（尾端，可越过 V_{k+1} 向前延）
                 if (drawEnd < drawStart) drawEnd = drawStart;
 
-                // 中间断口：p[3..] 成对 (start, end)，相对段起点 V0（segStart）绝对定位，夹到画线范围
+                // 中间断口：p[2..] 成对 (start, end)，相对段起点 V0（segStart）绝对定位，夹到画线范围。
+                //   count>=4 时 [p[2],p[3]] 为断口 gap；count>=6 时 [p[2],p[3]],[p[4],p[5]] 多断口。
+                //   count==3 时 p[2] 为外延终点（上方已处理），不进入断口。
                 var breaks = new List<(double a, double b)>();
-                if (pars != null && pars.Count >= 5)
+                if (pars != null && pars.Count >= 4)
                 {
                     int pc = pars.Count;
-                    for (int pi = 3; pi + 1 < pc; pi += 2)
+                    for (int pi = 2; pi + 1 < pc; pi += 2)
                     {
                         double ba = segStart + pars[pi];
                         double bb = segStart + pars[pi + 1];

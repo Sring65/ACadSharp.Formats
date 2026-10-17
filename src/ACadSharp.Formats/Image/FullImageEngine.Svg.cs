@@ -2441,8 +2441,15 @@ internal partial class ImageEngine
         try { fname = t.Style?.Filename; bfname = t.Style?.BigFontFilename; } catch { }
         if (string.IsNullOrWhiteSpace(fname)) return false;
         string low = fname.Trim().ToLowerInvariant();
-        if (!low.EndsWith(".shx", StringComparison.Ordinal)) return false; // 仅 SHX 走本路径，.ttf 走 TTF
-        var lat = GetShapeFont(fname); // 复用按文件名缓存的 ShxFont 加载（FileProvider 解析路径）
+        // TTF/TTC 明确走 TTF 路径（不探 SHX）。
+        if (low.EndsWith(".ttf", StringComparison.Ordinal) || low.EndsWith(".ttc", StringComparison.Ordinal)) return false;
+        // SHX 判定：样式表里 SHX 字体名可能带 .shx 也可能不带（如 "simplex"/"hztxt"——HZTXT 样式实测）。
+        // 仅当 FileProvider 能把它解析成真实 .shx 文件时才走 SHX，避免把 arial/simsun 等 TTF 族名（无扩展名写法）
+        // 误判为 SHX 并刷"形状库未找到"警告；解析不到 → 回退 TTF，行为不劣化。
+        string probe = "";
+        try { probe = _opt.FileProvider?.Invoke(fname) ?? ""; } catch { }
+        if (string.IsNullOrEmpty(probe) || !File.Exists(probe)) return false; // 无对应 .shx 文件 → TTF
+        var lat = GetShapeFont(fname); // 已确认能解析到 .shx，直接加载（按文件名缓存）
         if (lat == null) return false;
         if (lat.Format != ShxFormat.Unifont && lat.Format != ShxFormat.BigFont) return false;
         latin = lat;
@@ -2581,6 +2588,7 @@ internal partial class ImageEngine
         public List<MTextRun> Runs = new();
         public double MaxHeight;
         public double Width;
+        public double FirstIndent; // \pi 段落首行缩进（数据单位；仅段落首行生效，续行为 0）
         public void Recalc()
         {
             MaxHeight = 0; Width = 0;
@@ -2605,6 +2613,13 @@ internal partial class ImageEngine
         }
         return EstimateTextWidth(r.Text, r.Height) * wf;
     }
+
+    // 合成斜体倾斜角（度）：AutoCAD 对无真斜体（尤其 CJK）字体按固定倾斜角合成斜体。
+    // \f...|i1| 只置 Italic 标志，此处统一折算成斜切角供三引擎（SVG skewX / PNG tanA / PDF Tm 剪切）使用。
+    private const double SynthItalicOblique = 15.0;
+    // 段内有效倾斜角：显式 \Q 优先；否则斜体按 SynthItalicOblique 合成；都没有 = 0
+    private static double EffOblique(in MTextRun r)
+        => Math.Abs(r.Oblique) > 1e-6 ? r.Oblique : (r.Italic ? SynthItalicOblique : 0.0);
 
     private static bool IsCjkChar(char ch)
         => (ch >= 0x2E80 && ch <= 0x9FFF) || (ch >= 0xFF00 && ch <= 0xFFEF)
@@ -2761,6 +2776,26 @@ internal partial class ImageEngine
                             break;
                         case 'O': Flush(); curOV = true; i++; break;   // 上划线开
                         case 'o': Flush(); curOV = false; i++; break;  // 上划线关
+                        case 'p':
+                            {
+                                // \p<段落格式>;  AutoCAD 段落属性码，其中 \pi<值>; = 首行缩进（数据单位）。
+                                // 旧版把 \p 当未知码整段丢弃 → “\pi45.9;测试剧中”等段落全部顶到左边距（对齐不一致）。
+                                int end = SkipCode(i);
+                                string spec = raw.Substring(i + 2, Math.Max(0, end - i - 2));
+                                int ip = spec.IndexOf('i');
+                                if (ip >= 0)
+                                {
+                                    int st = ip + 1, j = st;
+                                    while (j < spec.Length && (char.IsDigit(spec[j]) || spec[j] == '-' || spec[j] == '+' || spec[j] == '.')) j++;
+                                    if (j > st && double.TryParse(spec.Substring(st, j - st), NumberStyles.Float, Ci, out double ind))
+                                    {
+                                        // 仅段落首行（此处紧跟 \P 后的全新行）继承缩进
+                                        if (line.Runs.Count == 0) line.FirstIndent = ind;
+                                    }
+                                }
+                                i = end;
+                            }
+                            break;
                         case 'Q':
                             {
                                 // \Q<倾斜角>; 倾斜角（度），影响其后的文本
@@ -2941,13 +2976,16 @@ internal partial class ImageEngine
             }
             // 贪心填充
             var cur = new List<(string Text, MTextRun Run)>();
-            double curW = 0;
+            double curW = line.FirstIndent; // 首行可用宽 = refWidth − 首行缩进
             bool hasText = false;
+            bool firstSub = true;           // 拆行后仅第一条子行继承段落首行缩进
             void FlushCur()
             {
                 if (cur.Count > 0)
                 {
                     var ln = new MTextLine();
+                    ln.FirstIndent = firstSub ? line.FirstIndent : 0.0;
+                    firstSub = false;
                     foreach (var (t, run) in cur)
                     {
                         if (ln.Runs.Count > 0)
@@ -3046,7 +3084,7 @@ internal partial class ImageEngine
 
         for (int li = 0; li < layout.Lines.Count; li++)
         {
-            double x = 0;
+            double x = layout.Lines[li].FirstIndent * scaleMul; // 段落首行缩进（\pi）
             foreach (var run in layout.Lines[li].Runs)
             {
                 double rw = MTextRunWidth(run) * scaleMul;
@@ -3063,7 +3101,14 @@ internal partial class ImageEngine
                     double numW = EstimateTextWidth(num, run.Height) * wf * scaleMul;
                     double denW = EstimateTextWidth(den, run.Height) * wf * scaleMul;
                     double fracW = Math.Max(numW, denW); // = rw
-                    double dyOff = 0.30 * run.Height;     // 分子/分母基线相对主基线偏移（数据单位，CAD y 向上）
+                    // 分数堆叠几何（CAD y 向上，相对主基线；AutoCAD 实测：分子体全在分数线上方、
+                    // 分母体全在线下方，线本身在主基线上方约 0.58×字高。旧版线画在主基线上 →
+                    // 分母上缘越过分数线，视觉“横线偏下/穿过 2”。）
+                    double H = run.Height;
+                    double numOff = 0.72 * H;   // 分子基线：主基线上方
+                    double denOff = 0.30 * H;   // 分母基线：主基线下方
+                    double barOff = 0.58 * H;   // 分数线：主基线上方
+                    double ob = EffOblique(run); // 斜体合成倾斜角
                     double numX = x + (fracW - numW) / 2.0; // 分子水平居中
                     double denX = x + (fracW - denW) / 2.0; // 分母水平居中
                     void Emtxt(double lx, double ly, string s)
@@ -3072,15 +3117,15 @@ internal partial class ImageEngine
                         double sx = Sx(wx), sy = Sy(wy);
                         var tf = new List<string> { $"translate({F(sx)}, {F(sy)})" };
                         if (Math.Abs(rot) > 1e-6) tf.Add($"rotate({F(-rot)})");
-                        if (Math.Abs(run.Oblique) > 1e-6) tf.Add($"skewX({F(-run.Oblique)})");
+                        if (Math.Abs(ob) > 1e-6) tf.Add($"skewX({F(-ob)})");
                         if (Math.Abs(run.WidthFactor - 1.0) > 1e-6) tf.Add($"scale({F(run.WidthFactor)}, 1)");
                         sb.AppendLine($"  <text x=\"0\" y=\"0\" font-family=\"{cssFont}\" font-size=\"{F(fs)}\" fill=\"{col}\" transform=\"{string.Join(" ", tf)}\">{EscapeXml(s)}</text>");
                     }
-                    if (!string.IsNullOrEmpty(num)) Emtxt(numX, baselines[li] + dyOff, num);
-                    if (!string.IsNullOrEmpty(den)) Emtxt(denX, baselines[li] - dyOff, den);
-                    // 分数线：主基线处，宽=分数宽
-                    ToWorld(x, baselines[li], out double f1x, out double f1y);
-                    ToWorld(x + fracW, baselines[li], out double f2x, out double f2y);
+                    if (!string.IsNullOrEmpty(num)) Emtxt(numX, baselines[li] + numOff, num);
+                    if (!string.IsNullOrEmpty(den)) Emtxt(denX, baselines[li] - denOff, den);
+                    // 分数线：主基线上方 barOff，宽=分数宽
+                    ToWorld(x, baselines[li] + barOff, out double f1x, out double f1y);
+                    ToWorld(x + fracW, baselines[li] + barOff, out double f2x, out double f2y);
                     sb.AppendLine($"  <line x1=\"{F(Sx(f1x))}\" y1=\"{F(Sy(f1y))}\" x2=\"{F(Sx(f2x))}\" y2=\"{F(Sy(f2y))}\" stroke=\"{col}\" stroke-width=\"{F(Math.Max(fs * 0.04, 0.1))}\"/>");
                 }
                 else if (!string.IsNullOrEmpty(run.Text))
@@ -3091,8 +3136,9 @@ internal partial class ImageEngine
                     // \S 堆叠：基线按 BaselineShift（em）上下移（CAD y 向上：上标=+）
                     ToWorld(x, baselines[li] + run.BaselineShift * run.Height, out double wx, out double wy);
                     double sx = Sx(wx), sy = Sy(wy);
+                    double ob = EffOblique(run); // 斜体合成倾斜角（CJK 无真斜体，用斜切合成）
 
-                    // 富文本属性：字体族/字号/颜色/加粗/斜体/下划线+上划线
+                    // 富文本属性：字体族/字号/颜色/加粗/下划线+上划线
                     var attr = new List<string>
                     {
                         $"x=\"0\" y=\"0\"",
@@ -3101,16 +3147,16 @@ internal partial class ImageEngine
                         $"fill=\"{col}\""
                     };
                     if (run.Bold) attr.Add($"font-weight=\"bold\"");
-                    if (run.Italic) attr.Add($"font-style=\"italic\"");
                     var deco = new List<string>();
                     if (run.Underline) deco.Add("underline");
                     if (run.Overline) deco.Add("overline");
                     if (deco.Count > 0) attr.Add($"text-decoration=\"{string.Join(" ", deco)}\"");
 
                     // transform：平移到基线左端点，再绕该点 rotate(旋转) / skewX(倾斜) / scale(宽度压缩)
+                    // 斜体统一用 skewX 合成（替代 font-style:italic —— CJK/无真斜体字体无效果）
                     var tf = new List<string> { $"translate({F(sx)}, {F(sy)})" };
                     if (Math.Abs(rot) > 1e-6) tf.Add($"rotate({F(-rot)})");
-                    if (Math.Abs(run.Oblique) > 1e-6) tf.Add($"skewX({F(-run.Oblique)})");
+                    if (Math.Abs(ob) > 1e-6) tf.Add($"skewX({F(-ob)})");
                     if (Math.Abs(run.WidthFactor - 1.0) > 1e-6) tf.Add($"scale({F(run.WidthFactor)}, 1)");
                     attr.Add($"transform=\"{string.Join(" ", tf)}\"");
 

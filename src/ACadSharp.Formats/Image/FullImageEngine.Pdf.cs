@@ -631,7 +631,7 @@ internal partial class ImageEngine
 
         for (int li = 0; li < layout.Lines.Count; li++)
         {
-            double x = 0;
+            double x = layout.Lines[li].FirstIndent * scaleMul; // 段落首行缩进（\pi）
             foreach (var run in layout.Lines[li].Runs)
             {
                 double rw = MTextRunWidth(run) * scaleMul;
@@ -649,7 +649,12 @@ internal partial class ImageEngine
                     double numW = EstimateTextWidth(num, run.Height) * wf * scaleMul;
                     double denW = EstimateTextWidth(den, run.Height) * wf * scaleMul;
                     double fracW = Math.Max(numW, denW);
-                    double dyOff = 0.30 * run.Height;
+                    // 分数堆叠几何（CAD y 向上，相对主基线；与 SVG/PNG 端同一套 AutoCAD 实测值）
+                    double H = run.Height;
+                    double numOff = 0.72 * H;   // 分子基线：主基线上方
+                    double denOff = 0.30 * H;   // 分母基线：主基线下方
+                    double barOff = 0.58 * H;   // 分数线：主基线上方
+                    double tk = Math.Tan(EffOblique(run) * Math.PI / 180.0); // 斜体剪切（Tm 的 c/d 列）
                     double numX = x + (fracW - numW) / 2.0;
                     double denX = x + (fracW - denW) / 2.0;
                     void EmitStackText(double lx, double ly, string s)
@@ -658,15 +663,16 @@ internal partial class ImageEngine
                         ToWorld(lx, ly, out double wx, out double wy);
                         byte[] data = font != null ? font.Encode(s) : PdfFallbackTextBytes(s);
                         if (data.Length == 0) return;
+                        // Tm = R·Skew·Scale：a=ca·wf, b=sa·wf, c=ca·tk−sa, d=sa·tk+ca（tk=0 时退化为旋转）
                         CsAscii(cs, "BT\n/F" + slot + " " + F(fs) + " Tf\n" + HexToRgbPdf(col) + " rg\n" +
-                                   F(ca * wf) + " " + F(sa * wf) + " " + F(-sa) + " " + F(ca) + " " + F(Sx(wx)) + " " + F(Py(wy)) + " Tm\n");
+                                   F(ca * wf) + " " + F(sa * wf) + " " + F(ca * tk - sa) + " " + F(sa * tk + ca) + " " + F(Sx(wx)) + " " + F(Py(wy)) + " Tm\n");
                         CsString(cs, data);
                         CsAscii(cs, " Tj\nET\n");
                     }
-                    EmitStackText(numX, baselines[li] + dyOff, num);
-                    EmitStackText(denX, baselines[li] - dyOff, den);
-                    ToWorld(x, baselines[li], out double f1x, out double f1y);
-                    ToWorld(x + fracW, baselines[li], out double f2x, out double f2y);
+                    EmitStackText(numX, baselines[li] + numOff, num);
+                    EmitStackText(denX, baselines[li] - denOff, den);
+                    ToWorld(x, baselines[li] + barOff, out double f1x, out double f1y);
+                    ToWorld(x + fracW, baselines[li] + barOff, out double f2x, out double f2y);
                     PdfStroke(cs, col, Math.Max(0.05, fs * 0.04), null, F(Sx(f1x)) + " " + F(Py(f1y)) + " m " + F(Sx(f2x)) + " " + F(Py(f2y)) + " l S");
                 }
                 else if (!string.IsNullOrEmpty(run.Text))
@@ -679,11 +685,12 @@ internal partial class ImageEngine
                     byte[] data = font != null ? font.Encode(run.Text) : PdfFallbackTextBytes(run.Text);
                     if (data.Length > 0)
                     {
-                        // R18：run 宽度因子 → Tm = [ca·WF, sa·WF, −sa, ca, x, y]（与 MText SVG 的 scale(WF,1) 对齐；
-                        // run 起点推进 MTextRunWidth 已含 WF，WF=1 时逐字节不变）
+                        // Tm = R·Skew·Scale：a=ca·wf, b=sa·wf, c=ca·tk−sa, d=sa·tk+ca
+                        // （tk=tan(倾斜角)，斜体/\\Q 剪切；tk=0 时退化为 R·Scale，与旧逐字节一致）
                         double wf = run.WidthFactor > 0 ? run.WidthFactor : 1.0;
+                        double tk = Math.Tan(EffOblique(run) * Math.PI / 180.0);
                         CsAscii(cs, "BT\n/F" + slot + " " + F(fs) + " Tf\n" + HexToRgbPdf(col) + " rg\n" +
-                                   F(ca * wf) + " " + F(sa * wf) + " " + F(-sa) + " " + F(ca) + " " + F(Sx(wx)) + " " + F(Py(wy)) + " Tm\n");
+                                   F(ca * wf) + " " + F(sa * wf) + " " + F(ca * tk - sa) + " " + F(sa * tk + ca) + " " + F(Sx(wx)) + " " + F(Py(wy)) + " Tm\n");
                         CsString(cs, data);
                         CsAscii(cs, " Tj\nET\n");
                     }

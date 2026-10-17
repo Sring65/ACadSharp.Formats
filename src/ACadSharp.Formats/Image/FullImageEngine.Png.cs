@@ -947,7 +947,7 @@ internal partial class ImageEngine
 
         for (int li = 0; li < layout.Lines.Count; li++)
         {
-            double x = 0;
+            double x = layout.Lines[li].FirstIndent * scaleMul; // 段落首行缩进（\pi）
             foreach (var run in layout.Lines[li].Runs)
             {
                 double rw = MTextRunWidth(run) * scaleMul;
@@ -964,7 +964,12 @@ internal partial class ImageEngine
                     double numW = EstimateTextWidth(num, run.Height) * wf * scaleMul;
                     double denW = EstimateTextWidth(den, run.Height) * wf * scaleMul;
                     double fracW = Math.Max(numW, denW);
-                    double dyOff = 0.30 * run.Height; // 分子/分母基线偏移（数据单位，CAD y 向上）
+                    // 分数堆叠几何（CAD y 向上，相对主基线；与 SVG 端同一套 AutoCAD 实测值）
+                    double H = run.Height;
+                    double numOff = 0.72 * H;   // 分子基线：主基线上方
+                    double denOff = 0.30 * H;   // 分母基线：主基线下方
+                    double barOff = 0.58 * H;   // 分数线：主基线上方
+                    double ob = EffOblique(run);
                     double numX = x + (fracW - numW) / 2.0;
                     double denX = x + (fracW - denW) / 2.0;
                     void LocToWorld(double lx, double ly, out double wx, out double wy)
@@ -974,18 +979,18 @@ internal partial class ImageEngine
                     }
                     if (!string.IsNullOrEmpty(num))
                     {
-                        LocToWorld(numX, baselines[li] + dyOff, out double wnx, out double wny);
-                        DrawTextPng(wnx, wny, num, fs, col, -rot, fam, run.WidthFactor, run.Bold, run.Italic, run.Oblique, false, false, numW);
+                        LocToWorld(numX, baselines[li] + numOff, out double wnx, out double wny);
+                        DrawTextPng(wnx, wny, num, fs, col, -rot, fam, run.WidthFactor, run.Bold, run.Italic, ob, false, false, numW);
                     }
                     if (!string.IsNullOrEmpty(den))
                     {
-                        LocToWorld(denX, baselines[li] - dyOff, out double wdx, out double wdy);
-                        DrawTextPng(wdx, wdy, den, fs, col, -rot, fam, run.WidthFactor, run.Bold, run.Italic, run.Oblique, false, false, denW);
+                        LocToWorld(denX, baselines[li] - denOff, out double wdx, out double wdy);
+                        DrawTextPng(wdx, wdy, den, fs, col, -rot, fam, run.WidthFactor, run.Bold, run.Italic, ob, false, false, denW);
                     }
                     if (_rc != null && fracW > 1e-6)
                     {
-                        LocToWorld(x, baselines[li], out double h1x, out double h1y);
-                        LocToWorld(x + fracW, baselines[li], out double h2x, out double h2y);
+                        LocToWorld(x, baselines[li] + barOff, out double h1x, out double h1y);
+                        LocToWorld(x + fracW, baselines[li] + barOff, out double h2x, out double h2y);
                         var pp = new List<RasterCanvas.P>
                         {
                             new RasterCanvas.P((float)PngSx(h1x), (float)PngSy(h1y)),
@@ -1004,8 +1009,9 @@ internal partial class ImageEngine
                     double dy = (baselines[li] + run.BaselineShift * run.Height - anchorY) * scaleMul;
                     double wx = px + dx * ca - dy * sa;
                     double wy = py + dx * sa + dy * ca;
+                    // 斜体：CJK/无真斜体字体无 italic 字形 → 传合成倾斜角 ob 走 tanA 斜切（与 SVG skewX 一致）
                     DrawTextPng(wx, wy, run.Text, fs, col, -rot, fam, run.WidthFactor,
-                        run.Bold, run.Italic, run.Oblique, run.Underline, run.Overline, rw);
+                        run.Bold, run.Italic, EffOblique(run), run.Underline, run.Overline, rw);
                 }
                 x += rw;
             }

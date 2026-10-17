@@ -3005,7 +3005,7 @@ internal partial class ImageEngine
                                 while (end < raw.Length && end < i + 7 && IsHexChar(raw[end])) end++;
                                 if (end > i + 3 && int.TryParse(raw.Substring(i + 3, end - i - 3), NumberStyles.HexNumber, Ci, out int cp))
                                     curText.Append((char)cp);
-                                i = end;
+                                i = end - 1; // end=第一个非hex字符，i++ 后恰指向它（不能 i=end，否则 for 的 i++ 吞掉一个字符）
                             }
                             else i = SkipCode(i); // \U<on|off>; 下划线
                             break;

@@ -1024,7 +1024,7 @@ internal partial class ImageEngine
                         // 回退 TTF（含 CJK 无 bigfont / 内联 TTF / 字形缺失）→ 原 DrawTextPng（行为不变）
                         string fam = ResolveFontFamily(effFont);
                         DrawTextPng(ox, oy, run.Text, fs, col, -rot, fam, wf,
-                            run.Bold, run.Italic, EffOblique(run), run.Underline, run.Overline, rw);
+                            run.Bold, run.Italic, EffOblique(run), run.Underline, run.Overline, rw, run.Tracking);
                     }
                 }
                 x += rw;
@@ -1041,7 +1041,7 @@ internal partial class ImageEngine
     // 字体解析：PdfFontManager.FindTtf（族名→TTF/TTC 文件）→ TrueTypeFont 取字形轮廓，纯托管填充。
     private void DrawTextPng(double x, double y, string content, double fsData, string colHex, double rotCanvas,
         string family, double widthFactor, bool bold = false, bool italic = false, double oblique = 0.0,
-        bool underline = false, bool overline = false, double runWidthData = 0.0)
+        bool underline = false, bool overline = false, double runWidthData = 0.0, double tracking = 1.0)
     {
         if (string.IsNullOrEmpty(content) || _rc == null) return;
         double sx = PngSx(x), sy = PngSy(y);
@@ -1105,7 +1105,8 @@ internal partial class ImageEngine
             // penAdv 只累加原始 advance（em），不再乘 wf：
             // Lx=(fp.X/upm+penAdv)×fs×wf 已统一乘一次 wf——若 penAdv 再乘 wf 会变成 wf²，
             // 使 \W 宽字距文本第 2 字起被右推（advance 放大 wf 倍），中文出现异常空隙。
-            penAdv += adv;
+            // \T 字距：每字符附加 (因子-1)×0.1em ÷ wf（em 单位，最终像素字距独立于 \W，与 SVG letter-spacing / PDF Tc 一致）
+            penAdv += adv + (tracking - 1.0) * 0.1 / (wf > 1e-9 ? wf : 1.0);
         }
 
         // 下/上划线：沿文字方向（旋转后的局部 x 轴），长度 = run 宽（数据单位 × PngK）

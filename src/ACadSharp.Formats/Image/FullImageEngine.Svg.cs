@@ -2828,6 +2828,7 @@ internal partial class ImageEngine
         public string Font;     // 字体族名（\f 内联）；null=随实体样式
         public double BaselineShift; // \S 堆叠基线偏移（em，+=上标/分子，-=下标/分母；0=正常）
         public bool IsFraction; // \S<num>/<den> 分数堆叠：单 run 存 "num/den"，渲染时上下分层+分数线
+        public double Tracking;   // \T<n>; 字距因子（1=正常，<1 更紧，>1 更宽；独立于 \W 宽度因子）
     }
 
     // MTEXT 一行
@@ -2848,6 +2849,14 @@ internal partial class ImageEngine
         }
     }
 
+    // \T 字距：每字符附加间距（数据单位）= (因子-1)×0.1em。1=正常(0)，<1 收窄，>1 加宽；独立于 \W（宽度因子）。
+    // 校准自参考 PDF：\T1→Tc=0、\T0.75→Tc≈-25(1/1000em)，即每字 (n-1)×0.1em。
+    private static double MTextTrackingAdd(in MTextRun r, int nChars)
+    {
+        double t = r.Tracking > 1e-9 ? r.Tracking : 1.0;
+        return nChars * (t - 1.0) * 0.1 * r.Height;
+    }
+
     private double MTextRunWidth(MTextRun r, string styleFont, string styleBig)
     {
         double wf = r.WidthFactor > 0 ? r.WidthFactor : 1.0;
@@ -2864,8 +2873,10 @@ internal partial class ImageEngine
             double denW = TryShxRunAdvance(eFont, eBig, den, r.Height, wf, out double wd) ? wd : EstimateTextWidth(den, r.Height) * wf;
             return Math.Max(numW, denW);
         }
+        // SHX 笔迹：advance 已含字形真实宽（不含 \T 字距——simplex.shx 等技术字体极少配 \T，且保持既有渲染不回退）
         if (TryShxRunAdvance(eFont, eBig, r.Text, r.Height, wf, out double w)) return w;
-        return EstimateTextWidth(r.Text, r.Height) * wf;
+        // TTF 回退：基线宽×宽度因子 + \T 字距附加
+        return EstimateTextWidth(r.Text, r.Height) * wf + MTextTrackingAdd(r, r.Text.Length);
     }
 
     // 合成斜体倾斜角（度）：AutoCAD 对无真斜体（尤其 CJK）字体按固定倾斜角合成斜体。
@@ -2888,7 +2899,7 @@ internal partial class ImageEngine
         var layout = new MTextLayout();
         MTextLine line = new MTextLine();
         layout.Lines.Add(line);
-        var stack = new Stack<(double H, double WF, int? C, bool U, bool OV, bool B, bool I, double OB, string F)>();
+        var stack = new Stack<(double H, double WF, int? C, bool U, bool OV, bool B, bool I, double OB, string F, double T)>();
         double curH = baseHeight > 0 ? baseHeight : 1.0;
         double curWF = 1.0;
         int? curC = null;
@@ -2898,6 +2909,7 @@ internal partial class ImageEngine
         bool curI = false;
         double curOB = 0.0;
         string curFont = null;
+        double curT = 1.0; // \T 字距因子（1=正常）
         var curText = new StringBuilder();
 
         void Flush()
@@ -2906,7 +2918,7 @@ internal partial class ImageEngine
                 line.Runs.Add(new MTextRun
                 {
                     Text = curText.ToString(), Height = curH, WidthFactor = curWF, Color = curC,
-                    Underline = curU, Overline = curOV, Bold = curB, Italic = curI, Oblique = curOB, Font = curFont
+                    Underline = curU, Overline = curOV, Bold = curB, Italic = curI, Oblique = curOB, Font = curFont, Tracking = curT
                 });
             curText.Length = 0;
         }
@@ -2930,12 +2942,12 @@ internal partial class ImageEngine
                 if (ch == '{')
                 {
                     Flush();
-                    stack.Push((curH, curWF, curC, curU, curOV, curB, curI, curOB, curFont));
+                    stack.Push((curH, curWF, curC, curU, curOV, curB, curI, curOB, curFont, curT));
                 }
                 else if (ch == '}')
                 {
                     Flush();
-                    if (stack.Count > 0) (curH, curWF, curC, curU, curOV, curB, curI, curOB, curFont) = stack.Pop();
+                    if (stack.Count > 0) (curH, curWF, curC, curU, curOV, curB, curI, curOB, curFont, curT) = stack.Pop();
                 }
                 else if (ch == '~' || ch == '\t')
                 {
@@ -3063,16 +3075,29 @@ internal partial class ImageEngine
                                 i = end;
                             }
                             break;
+                        case 'T':
+                            {
+                                // \T<n>; 字距（tracking）因子：1=正常，<1 更紧（字符间距收窄），>1 更宽。
+                                // 独立于 \W（宽度因子，改变字形宽/形状）。AutoCAD 实测：\T1→PDF Tc=0，\T0.75→Tc≈-25(1/1000em)。
+                                int end = SkipCode(i);
+                                string v = raw.Substring(i + 2, end - i - 2).Trim();
+                                if (double.TryParse(v, NumberStyles.Float, Ci, out double tk) && tk > 0)
+                                {
+                                    Flush(); // \T 只影响其后的文本
+                                    curT = tk;
+                                }
+                                i = end;
+                            }
+                            break;
                         case 'R':
                         case 'A':
                         case 'B':
                         case 'E':
                         case 'I':
                         case 'K':
-                        case 'T':
                         case 'X':
                         case 'Y':
-                            i = SkipCode(i); // 对齐/字距/其他——消费，不渲染
+                            i = SkipCode(i); // 对齐/其他——消费，不渲染
                             break;
                         case 'k':
                             i++; // 删除线关（无参数，暂不渲染）
@@ -3107,7 +3132,7 @@ internal partial class ImageEngine
                                     {
                                         Text = num + "/" + den, Height = curH, WidthFactor = curWF, Color = curC,
                                         Underline = curU, Overline = curOV, Bold = curB, Italic = curI,
-                                        Oblique = curOB, Font = curFont, BaselineShift = 0, IsFraction = true
+                                        Oblique = curOB, Font = curFont, BaselineShift = 0, IsFraction = true, Tracking = curT
                                     });
                                 }
                                 else if (caret >= 0)
@@ -3122,7 +3147,7 @@ internal partial class ImageEngine
                                         {
                                             Text = txt, Height = curH, WidthFactor = curWF, Color = curC,
                                             Underline = curU, Overline = curOV, Bold = curB, Italic = curI,
-                                            Oblique = curOB, Font = curFont, BaselineShift = shift
+                                            Oblique = curOB, Font = curFont, BaselineShift = shift, Tracking = curT
                                         });
                                     }
                                     AddStackRun(up, 0.35);   // 上标：基线上移 0.35em
@@ -3251,6 +3276,7 @@ internal partial class ImageEngine
                                 && last.Italic == run.Italic && last.Oblique == run.Oblique
                                 && last.BaselineShift == run.BaselineShift
                                 && last.IsFraction == run.IsFraction
+                                && last.Tracking == run.Tracking
                                 && (last.Font ?? "") == (run.Font ?? ""))
                             {
                                 last.Text += t;
@@ -3258,7 +3284,7 @@ internal partial class ImageEngine
                                 continue;
                             }
                         }
-                        ln.Runs.Add(new MTextRun { Text = t, Height = run.Height, WidthFactor = run.WidthFactor, Color = run.Color, Underline = run.Underline, Overline = run.Overline, Bold = run.Bold, Italic = run.Italic, Oblique = run.Oblique, Font = run.Font, BaselineShift = run.BaselineShift, IsFraction = run.IsFraction });
+                        ln.Runs.Add(new MTextRun { Text = t, Height = run.Height, WidthFactor = run.WidthFactor, Color = run.Color, Underline = run.Underline, Overline = run.Overline, Bold = run.Bold, Italic = run.Italic, Oblique = run.Oblique, Font = run.Font, BaselineShift = run.BaselineShift, IsFraction = run.IsFraction, Tracking = run.Tracking });
                     }
                     ln.Recalc(this, styleFont, styleBig);
                     result.Lines.Add(ln);
@@ -3270,7 +3296,8 @@ internal partial class ImageEngine
                 string eFont = !string.IsNullOrEmpty(run.Font) ? run.Font : styleFont;
                 string eBig = string.IsNullOrEmpty(run.Font) ? styleBig : null;
                 double fw = TryShxRunAdvance(eFont, eBig, t, run.Height, run.WidthFactor > 0 ? run.WidthFactor : 1.0, out double w) ? w
-                    : EstimateTextWidth(t, run.Height) * (run.WidthFactor > 0 ? run.WidthFactor : 1.0);
+                    : EstimateTextWidth(t, run.Height) * (run.WidthFactor > 0 ? run.WidthFactor : 1.0)
+                      + MTextTrackingAdd(run, t.Length);
                 if (hasText && curW + fw > refWidth) FlushCur();
                 if (!string.IsNullOrWhiteSpace(t)) hasText = true;
                 cur.Add((t, run));
@@ -3455,6 +3482,9 @@ internal partial class ImageEngine
                             $"fill=\"{col}\""
                         };
                         if (run.Bold) attr.Add($"font-weight=\"bold\"");
+                        // \T 字距：letter-spacing（文字局部坐标单位；会被后续 scale(wf) 缩放，除以 wf 使最终像素字距独立于 \W，与 MTextRunWidth/PDF Tc 一致）
+                        double trackLocal = (run.Tracking - 1.0) * 0.1 * fs / (wf > 1e-9 ? wf : 1.0);
+                        if (Math.Abs(trackLocal) > 1e-6) attr.Add($"letter-spacing=\"{F(trackLocal)}\"");
                         var deco = new List<string>();
                         if (run.Underline) deco.Add("underline");
                         if (run.Overline) deco.Add("overline");

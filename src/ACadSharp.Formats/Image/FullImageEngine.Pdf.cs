@@ -612,7 +612,8 @@ internal partial class ImageEngine
     private void EmitMTextPdf(MemoryStream cs, MText mt, Transform2D tr, double scaleMul, short layerAci, short byBlockAci, string styleFont)
     {
         string baseCol = ColorOf(EntityAciIndex(mt), layerAci, byBlockAci);
-        var layout = WrapMText(ParseMText(mt.Value ?? "", mt.Height), mt.RectangleWidth);
+        string styleBig = GetStyleBigFont(mt.Style);
+        var layout = WrapMText(ParseMText(mt.Value ?? "", mt.Height, styleFont, styleBig), mt.RectangleWidth, styleFont, styleBig);
         if (layout.Lines.Count == 0) return;
         var (baselines, anchorX, anchorY) = MTextLocalLayout(layout, mt);
 
@@ -634,7 +635,7 @@ internal partial class ImageEngine
             double x = layout.Lines[li].FirstIndent * scaleMul; // 段落首行缩进（\pi）
             foreach (var run in layout.Lines[li].Runs)
             {
-                double rw = MTextRunWidth(run) * scaleMul;
+                double rw = MTextRunWidth(run, styleFont, styleBig) * scaleMul;
                 if (run.IsFraction)
                 {
                     // \S<num>/<den> 分数：分子/分母上下分层（不同基线的 BT/ET）+ 中间分数线（与 SVG/PNG 端一致）
@@ -679,20 +680,29 @@ internal partial class ImageEngine
                 {
                     string col = run.Color.HasValue ? AciColor(run.Color.Value) : baseCol;
                     double fs = Math.Max(run.Height * scaleMul, 0.2);
-                    int slot = _pdfFonts.GetSlot(ResolveFontFamily(!string.IsNullOrEmpty(run.Font) ? run.Font : styleFont));
-                    CjkFont font = _pdfFonts.FontAt(slot);
+                    string effFont = !string.IsNullOrEmpty(run.Font) ? run.Font : styleFont;
+                    string effBig = string.IsNullOrEmpty(run.Font) ? styleBig : null;
+                    double wf = run.WidthFactor > 0 ? run.WidthFactor : 1.0;
+                    double tk = Math.Tan(EffOblique(run) * Math.PI / 180.0);
                     ToWorld(x, baselines[li], out double wx, out double wy);
-                    byte[] data = font != null ? font.Encode(run.Text) : PdfFallbackTextBytes(run.Text);
-                    if (data.Length > 0)
+                    // SHX 笔迹优先（simplex.shx 等）：真实 SHX 字形描边，字高随 em 自然（不再经 SimSun 压缩→偏小）
+                    if (TryBuildMTextShxLocal(effFont, effBig, run.Text, run.Height, wf, out List<int> st, out List<double[]> sp, out _))
                     {
-                        // Tm = R·Skew·Scale：a=ca·wf, b=sa·wf, c=ca·tk−sa, d=sa·tk+ca
-                        // （tk=tan(倾斜角)，斜体/\\Q 剪切；tk=0 时退化为 R·Scale，与旧逐字节一致）
-                        double wf = run.WidthFactor > 0 ? run.WidthFactor : 1.0;
-                        double tk = Math.Tan(EffOblique(run) * Math.PI / 180.0);
-                        CsAscii(cs, "BT\n/F" + slot + " " + F(fs) + " Tf\n" + HexToRgbPdf(col) + " rg\n" +
-                                   F(ca * wf) + " " + F(sa * wf) + " " + F(ca * tk - sa) + " " + F(sa * tk + ca) + " " + F(Sx(wx)) + " " + F(Py(wy)) + " Tm\n");
-                        CsString(cs, data);
-                        CsAscii(cs, " Tj\nET\n");
+                        EmitShxRunPdf(cs, wx, wy, st, sp, run.Height, wf, fs, ca, sa, tk, col);
+                    }
+                    else
+                    {
+                        // 回退 TTF（含 CJK 无 bigfont / 内联 TTF / 字形缺失）→ 原 BT/Tj 文本（行为不变）
+                        int slot = _pdfFonts.GetSlot(ResolveFontFamily(effFont));
+                        CjkFont font = _pdfFonts.FontAt(slot);
+                        byte[] data = font != null ? font.Encode(run.Text) : PdfFallbackTextBytes(run.Text);
+                        if (data.Length > 0)
+                        {
+                            CsAscii(cs, "BT\n/F" + slot + " " + F(fs) + " Tf\n" + HexToRgbPdf(col) + " rg\n" +
+                                       F(ca * wf) + " " + F(sa * wf) + " " + F(ca * tk - sa) + " " + F(sa * tk + ca) + " " + F(Sx(wx)) + " " + F(Py(wy)) + " Tm\n");
+                            CsString(cs, data);
+                            CsAscii(cs, " Tj\nET\n");
+                        }
                     }
                     if (run.Underline)
                     {
@@ -715,6 +725,95 @@ internal partial class ImageEngine
         for (int i = 0; i < pts.Count; i++)
             d.Append(F(Sx(pts[i].X)) + " " + F(Py(pts[i].Y)) + " " + (i == 0 ? "m" : "l") + " ");
         PdfStroke(cs, col, StrokeWidth(sp, scaleMul), dash, d + "S");
+    }
+
+    // SHX 笔迹 → PDF 描边（与 EmitMTextPdf 文本 Tm 同一变换：R·Skew(tk)·Scale(wf)，y 向上）。
+    // types/pts = TryBuildMTextShxLocal 输出（基线原点、数据单位、y 上，不含 wf）；H=字高（数据单位，1 em）。
+    // 用于 MTEXT simplex.shx 等 SHX 基础样式：真实 SHX 字形描边，字高随 em 自然（不再经 SimSun 压缩→偏小）。
+    private void EmitShxRunPdf(MemoryStream cs, double ox, double oy, List<int> types, List<double[]> pts, double H, double wf,
+        double fs, double ca, double sa, double tk, string col)
+    {
+        if (pts.Count == 0) return;
+        double Tx = Sx(ox), Ty = Py(oy);
+        double penW = Math.Max(0.05, fs * 0.04); // 笔画宽（用户单位）
+
+        // 局部点（基线原点 / 数据单位 / y 上）→ PDF 用户坐标（与文本 Tm 同：em=gx/H，先 Scale(wf) 再 Skew(tk) 再 R）
+        void ToUser(double lx, double ly, out double UX, out double UY)
+        {
+            double gx = lx / H, gy = ly / H;
+            double ex = gx * wf + tk * gy;
+            double ey = gy;
+            UX = Tx + (ca * ex - sa * ey);
+            UY = Ty + (sa * ex + ca * ey);
+        }
+
+        var cur = new List<(double X, double Y)>();
+        var d = new StringBuilder();
+        void StrokeCur()
+        {
+            if (cur.Count < 2) { cur.Clear(); return; }
+            d.Clear();
+            d.Append(F(cur[0].X) + " " + F(cur[0].Y) + " m ");
+            for (int i = 1; i < cur.Count; i++) d.Append(F(cur[i].X) + " " + F(cur[i].Y) + " l ");
+            PdfStroke(cs, col, penW, null, d + "S");
+            cur.Clear();
+        }
+        void FlatQ((double X, double Y) s, double cx, double cy, double ex, double ey)
+        {
+            int n = 12;
+            for (int i = 1; i <= n; i++)
+            {
+                double t = i / (double)n, u = 1 - t;
+                cur.Add((u * u * s.X + 2 * u * t * cx + t * t * ex, u * u * s.Y + 2 * u * t * cy + t * t * ey));
+            }
+        }
+        void FlatC((double X, double Y) s, double c1x, double c1y, double c2x, double c2y, double ex, double ey)
+        {
+            int n = 16;
+            for (int i = 1; i <= n; i++)
+            {
+                double t = i / (double)n, u = 1 - t;
+                cur.Add((u * u * u * s.X + 3 * u * u * t * c1x + 3 * u * t * t * c2x + t * t * t * ex,
+                         u * u * u * s.Y + 3 * u * u * t * c1y + 3 * u * t * t * c2y + t * t * t * ey));
+            }
+        }
+
+        for (int k = 0;k < types.Count; k++)
+        {
+            var p = pts[k];
+            switch (types[k])
+            {
+                case 0: // Move：抬笔 → 新子路径
+                    StrokeCur();
+                    ToUser(p[0], p[1], out double mx, out double my);
+                    cur.Add((mx, my));
+                    break;
+                case 1: // Line
+                    ToUser(p[0], p[1], out double lx, out double ly);
+                    cur.Add((lx, ly));
+                    break;
+                case 2: // Quad（控制, 终点）
+                    if (cur.Count > 0)
+                    {
+                        var s = cur[cur.Count - 1];
+                        ToUser(p[0], p[1], out double qcx, out double qcy);
+                        ToUser(p[2], p[3], out double qex, out double qey);
+                        FlatQ(s, qcx, qcy, qex, qey);
+                    }
+                    break;
+                case 3: // Cubic（控制1, 控制2, 终点）
+                    if (cur.Count > 0)
+                    {
+                        var s = cur[cur.Count - 1];
+                        ToUser(p[0], p[1], out double c1x, out double c1y);
+                        ToUser(p[2], p[3], out double c2x, out double c2y);
+                        ToUser(p[4], p[5], out double e1x, out double e1y);
+                        FlatC(s, c1x, c1y, c2x, c2y, e1x, e1y);
+                    }
+                    break;
+            }
+        }
+        StrokeCur();
     }
 
     // PDF HATCH（实心=rg f/f*；渐变=Type2 轴向 / Type3 径向 shading，/Sh<n> sh）

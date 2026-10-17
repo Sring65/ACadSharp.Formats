@@ -1561,7 +1561,7 @@ internal partial class ImageEngine
         }
         if (e is MText mt)
         {
-            var layout = WrapMText(ParseMText(mt.Value ?? "", mt.Height), mt.RectangleWidth);
+            var layout = WrapMText(ParseMText(mt.Value ?? "", mt.Height, GetStyleFont(mt.Style), GetStyleBigFont(mt.Style)), mt.RectangleWidth, GetStyleFont(mt.Style), GetStyleBigFont(mt.Style));
             int n = layout.Lines.Count;
             if (n == 0) return (1.0, 1.0, 1.0);
             double maxH = 0.1;
@@ -2304,23 +2304,26 @@ internal partial class ImageEngine
     }
 
     // ===== 文字样式 → 字体族解析 =====
-    private static string ResolveFontFamily(string fontName)
-    {
-        if (string.IsNullOrWhiteSpace(fontName)) return null;
-        string f = fontName.Trim();
-        string fam = f;
-        int dot = f.LastIndexOf('.');
-        if (dot > 0) fam = f.Substring(0, dot);
-        string lower = fam.ToLowerInvariant();
-        // SHX（AutoCAD 形状字体，系统无 TTF 等价）→ 默认
-        if (lower.EndsWith("shx") || lower == "txt" || lower == "simplex" || lower == "hztxt"
-            || lower == "romans" || lower == "gothic" || lower == "arial" || lower == "aaa")
-            return null;
-        // 方正字体（FZ*）：含 DengXian/等线 → DengXian；其余 → 默认
-        if (lower.StartsWith("fz"))
-            return (lower.Contains("dengxian") || lower.Contains("等线")) ? "DengXian" : null;
-        switch (lower)
+    // 已知 SHX 字体名（无 .shx 扩展名写法）：走 SHX 笔迹路径；其余无扩展名一律按 TTF 族解析。
+    // 注意：**不能**把 arial/gothic 等拉丁名塞进 SHX 集合——arial.ttf 是系统 TTF，误判成 SHX →
+    // 回退 SimSun（拉丁字高仅 ~0.56em，Arial ~0.72em）→ 视觉偏小 ~20% 且换行变少（历史 #1 根因）。
+    private static readonly System.Collections.Generic.HashSet<string> _knownShxNames =
+        new(StringComparer.OrdinalIgnoreCase)
         {
+            "txt", "simplex", "hztxt", "romans", "aaa", "cass", "fs", "khz",
+            "rd", "rs", "intecad", "ltypeshp", "bigfont"
+        };
+
+    // 字体族名规范化（统一大小写/别名 → 渲染端 FindTtf 可解析的族名）。SHX 名返回 null。
+    private static string CanonicalTtfFamily(string fam)
+    {
+        switch (fam.ToLowerInvariant())
+        {
+            case "arial": return "Arial";
+            case "helvetica": return "Helvetica";
+            case "times new roman": case "times": return "Times New Roman";
+            case "courier new": case "courier": return "Courier New";
+            case "calibri": return "Calibri";
             case "simhei": case "黑体": return "SimHei";
             case "simsun": case "宋体": return "SimSun";
             case "dengxian": case "等线": return "DengXian";
@@ -2328,16 +2331,47 @@ internal partial class ImageEngine
             case "fangsong": case "仿宋": case "仿宋_gb2312": return "FangSong";
             case "simli": case "隶书": return "SimLi";
             case "microsoft yahei": case "微软雅黑": return "Microsoft YaHei";
-            default: return fam;
+            default:
+                if (fam.Length == 0) return fam;
+                return char.ToUpperInvariant(fam[0]) + fam.Substring(1); // arial→Arial
         }
     }
 
+    private static string ResolveFontFamily(string fontName)
+    {
+        if (string.IsNullOrWhiteSpace(fontName)) return null;
+        string f = fontName.Trim();
+        string fam = f;
+        string ext = "";
+        int dot = f.LastIndexOf('.');
+        if (dot > 0) { fam = f.Substring(0, dot); ext = f.Substring(dot + 1).ToLowerInvariant(); }
+
+        // 显式 SHX 扩展名 → SHX（由调用方走 SHX 笔迹 / 兜底）
+        if (ext == "shx") return null;
+        // 显式 TTF/TTC 扩展名 → 一律按 TTF 处理（含 arial.ttf —— 旧版误映射 SimSun 的根因）
+        if (ext == "ttf" || ext == "ttc") return CanonicalTtfFamily(fam);
+
+        string lower = fam.ToLowerInvariant();
+        // 仅**无扩展名**的已知 SHX 字体名才视为 SHX
+        if (_knownShxNames.Contains(lower)) return null;
+        // 方正字体（FZ*）：含 DengXian/等线 → DengXian；其余 → 默认
+        if (lower.StartsWith("fz"))
+            return (lower.Contains("dengxian") || lower.Contains("等线")) ? "DengXian" : null;
+        return CanonicalTtfFamily(fam);
+    }
+
     // 标准族名 → CSS font-family 列表（SVG）。null/默认 → 宋体。
+    // 拉丁字体给出跨平台回退链（Windows: Arial/Helvetica；Linux: Liberation Sans/DejaVu Sans），
+    // 末尾保留 CJK 回退，保证同一 run 混排中文时仍可显示。
     private static string SvgFontFamily(string family)
     {
         if (string.IsNullOrEmpty(family)) return "SimSun, 宋体, serif";
         switch (family)
         {
+            case "Arial": return "Arial, Helvetica, Liberation Sans, DejaVu Sans, SimSun, 宋体, sans-serif";
+            case "Helvetica": return "Helvetica, Arial, Liberation Sans, DejaVu Sans, SimSun, 宋体, sans-serif";
+            case "Times New Roman": return "Times New Roman, Times, Liberation Serif, DejaVu Serif, SimSun, 宋体, serif";
+            case "Courier New": return "Courier New, Courier, Liberation Mono, DejaVu Sans Mono, SimSun, 宋体, monospace";
             case "SimHei": return "SimHei, 黑体, sans-serif";
             case "SimSun": return "SimSun, 宋体, serif";
             case "DengXian": return "DengXian, 等线, sans-serif";
@@ -2349,7 +2383,7 @@ internal partial class ImageEngine
         }
     }
 
-    // 实体样式 → 原始字体名（fork TextStyle：Filename(3) 优先，其次 BigFontFilename(4)）
+    // 实体样式 → 原始拉丁字体名（fork TextStyle：Filename(3)）
     private static string GetStyleFont(TextStyle style)
     {
         if (style == null) return null;
@@ -2361,6 +2395,15 @@ internal partial class ImageEngine
             if (!string.IsNullOrWhiteSpace(ff)) return ff;
         }
         catch { }
+        return null;
+    }
+
+    // 实体样式 → 大字型（CJK）字体名（fork TextStyle：BigFontFilename(4)）；无则 null。
+    // MTEXT 基础样式 simplex.shx 通常不含 CJK；若样式带 bigfont（如 HZTXT=simplex+Hztxt）则用于中文 run。
+    private static string GetStyleBigFont(TextStyle style)
+    {
+        if (style == null) return null;
+        try { string ff = style.BigFontFilename; if (!string.IsNullOrWhiteSpace(ff)) return ff; } catch { }
         return null;
     }
 
@@ -2561,6 +2604,132 @@ internal partial class ImageEngine
         return (wtype, wpts, penW);
     }
 
+    // ---- MTEXT 逐 run SHX 笔迹（基础样式 simplex.shx / \Fsimplex 等）----
+    // 解析给定字体名 → SHX 面（latin），并可选 bigfont（cjk）。非 SHX（无对应 .shx 文件 / .ttf/.ttc）→ false。
+    private bool TryResolveShxFaces(string fontName, string bigFontName, out ShxFont latin, out ShxFont cjk)
+    {
+        latin = null; cjk = null;
+        if (string.IsNullOrWhiteSpace(fontName)) return false;
+        string low = fontName.Trim().ToLowerInvariant();
+        if (low.EndsWith(".ttf", StringComparison.Ordinal) || low.EndsWith(".ttc", StringComparison.Ordinal)) return false;
+        string probe = "";
+        try { probe = _opt.FileProvider?.Invoke(fontName) ?? ""; } catch { }
+        if (string.IsNullOrEmpty(probe) || !File.Exists(probe)) return false;
+        var lat = GetShapeFont(fontName);
+        if (lat == null) return false;
+        if (lat.Format != ShxFormat.Unifont && lat.Format != ShxFormat.BigFont) return false;
+        latin = lat;
+        if (!string.IsNullOrWhiteSpace(bigFontName))
+        {
+            var big = GetShapeFont(bigFontName);
+            if (big != null && big.Format == ShxFormat.BigFont) cjk = big;
+        }
+        return true;
+    }
+
+    // 为一段 MTEXT run 文本构建局部 SHX 笔迹路径（原点=基线左端、+x 右 +y 上，数据单位）。
+    //   width = 实际 advance 总宽（数据单位，已乘 wf），供调用方精确定位后续 run / 换行。
+    // 返回 false = 不适配 SHX（非 SHX 字体 / 含 CJK 但无 bigfont / 全缺字形）→ 调用方回退 TTF。
+    private bool TryBuildMTextShxLocal(string fontName, string bigFontName, string text, double H, double wf,
+        out List<int> types, out List<double[]> pts, out double width)
+    {
+        types = null; pts = null; width = 0;
+        if (string.IsNullOrEmpty(text)) return false;
+        if (!TryResolveShxFaces(fontName, bigFontName, out ShxFont latin, out ShxFont cjk)) return false;
+        bool hasCjk = false;
+        foreach (var ch in text) if (ch >= 0x2E80) { hasCjk = true; break; }
+        System.Text.Encoding gbk = null;
+        if (hasCjk)
+        {
+            if (cjk == null) return false;   // 含 CJK 但无 bigfont → 回退 TTF（避免缺字）
+            gbk = ShxGbkEncoding();
+            if (gbk == null) return false;
+        }
+        if (!(H > 1e-9)) return false;
+        if (!(wf > 1e-9)) wf = 1.0;
+
+        var lt = new List<int>(text.Length * 4);
+        var lp = new List<double[]>(text.Length * 4);
+        double penX = 0.0;
+        foreach (var ch in text)
+        {
+            ShxFont face; int code;
+            if (ch < 0x80) { face = latin; code = ch; }
+            else
+            {
+                byte[] gb = gbk.GetBytes(new char[] { ch });
+                if (gb.Length != 2) continue;
+                face = cjk; code = (gb[0] << 8) | gb[1];
+            }
+            int em = face.UnitsPerEm > 0 ? face.UnitsPerEm : 1;
+            double s = H / em;
+            bool hasAdv = face.TryGetAdvance(code, out float advF);
+            double advData = (hasAdv ? advF : 0.7 * em) * s;
+            var g = new GlyphRec();
+            if (face.TryGetGlyph(code, g, ShxTextOrientation.Horizontal) && !g.Empty)
+                for (int k = 0; k < g.Type.Count; k++)
+                {
+                    var p = g.Pts[k];
+                    switch (g.Type[k])
+                    {
+                        case 0: case 1:
+                            lt.Add(g.Type[k]);
+                            lp.Add(new double[] { penX + p[0] * s, p[1] * s });
+                            break;
+                        case 2:
+                            lt.Add(2);
+                            lp.Add(new double[] { penX + p[0] * s, p[1] * s, penX + p[2] * s, p[3] * s });
+                            break;
+                        case 3:
+                            lt.Add(3);
+                            lp.Add(new double[] { penX + p[0] * s, p[1] * s, penX + p[2] * s, p[3] * s, penX + p[4] * s, p[5] * s });
+                            break;
+                    }
+                }
+            penX += advData;
+        }
+        if (lt.Count == 0) return false;
+        types = lt; pts = lp; width = penX * wf; // advance 仍乘 wf（调用方据此定位/换行）
+        return true;
+    }
+
+    // 仅求 SHX run 的 advance 总宽（数据单位，已乘 wf），不构建点集（供 MTextRunWidth / WrapMText 换行）。
+    // 返回 false = 不适配 SHX（非 SHX 字体 / 含 CJK 但无 bigfont）→ 调用方回退 TTF 估宽。
+    private bool TryShxRunAdvance(string fontName, string bigFontName, string text, double H, double wf, out double width)
+    {
+        width = 0;
+        if (string.IsNullOrEmpty(text)) return false;
+        if (!TryResolveShxFaces(fontName, bigFontName, out ShxFont latin, out ShxFont cjk)) return false;
+        bool hasCjk = false;
+        foreach (var ch in text) if (ch >= 0x2E80) { hasCjk = true; break; }
+        if (hasCjk)
+        {
+            if (cjk == null) return false;
+            if (ShxGbkEncoding() == null) return false;
+        }
+        if (!(H > 1e-9)) return false;
+        if (!(wf > 1e-9)) wf = 1.0;
+        System.Text.Encoding gbk = hasCjk ? ShxGbkEncoding() : null;
+        double penX = 0.0;
+        foreach (var ch in text)
+        {
+            ShxFont face; int code;
+            if (ch < 0x80) { face = latin; code = ch; }
+            else
+            {
+                byte[] gb = gbk.GetBytes(new char[] { ch });
+                if (gb.Length != 2) continue;
+                face = cjk; code = (gb[0] << 8) | gb[1];
+            }
+            int em = face.UnitsPerEm > 0 ? face.UnitsPerEm : 1;
+            double s = H / em;
+            bool hasAdv = face.TryGetAdvance(code, out float advF);
+            penX += (hasAdv ? advF : 0.7 * em) * s;
+        }
+        width = penX * wf;
+        return true;
+    }
+
     #endregion
 
     #region ===== MTEXT 多行文字 =====
@@ -2589,28 +2758,34 @@ internal partial class ImageEngine
         public double MaxHeight;
         public double Width;
         public double FirstIndent; // \pi 段落首行缩进（数据单位；仅段落首行生效，续行为 0）
-        public void Recalc()
+        public void Recalc(ImageEngine eng, string styleFont, string styleBig)
         {
             MaxHeight = 0; Width = 0;
             foreach (var r in Runs)
             {
                 MaxHeight = Math.Max(MaxHeight, r.Height);
-                Width += MTextRunWidth(r);
+                Width += eng.MTextRunWidth(r, styleFont, styleBig);
             }
         }
     }
 
-    private static double MTextRunWidth(MTextRun r)
+    private double MTextRunWidth(MTextRun r, string styleFont, string styleBig)
     {
         double wf = r.WidthFactor > 0 ? r.WidthFactor : 1.0;
+        // 有效字体：内联 \f 优先；否则随实体样式（含其大字型）
+        string eFont = !string.IsNullOrEmpty(r.Font) ? r.Font : styleFont;
+        string eBig = string.IsNullOrEmpty(r.Font) ? styleBig : null;
         if (r.IsFraction)
         {
             // 分数宽 = max(分子, 分母)（分数线与较宽者同宽），不是 "num/den" 整体宽
             int sl = r.Text.IndexOf('/');
             string num = sl >= 0 ? r.Text.Substring(0, sl) : r.Text;
             string den = sl + 1 < r.Text.Length ? r.Text.Substring(sl + 1) : "";
-            return Math.Max(EstimateTextWidth(num, r.Height), EstimateTextWidth(den, r.Height)) * wf;
+            double numW = TryShxRunAdvance(eFont, eBig, num, r.Height, wf, out double wn) ? wn : EstimateTextWidth(num, r.Height) * wf;
+            double denW = TryShxRunAdvance(eFont, eBig, den, r.Height, wf, out double wd) ? wd : EstimateTextWidth(den, r.Height) * wf;
+            return Math.Max(numW, denW);
         }
+        if (TryShxRunAdvance(eFont, eBig, r.Text, r.Height, wf, out double w)) return w;
         return EstimateTextWidth(r.Text, r.Height) * wf;
     }
 
@@ -2628,8 +2803,8 @@ internal partial class ImageEngine
     private static bool IsHexChar(char ch)
         => (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F');
 
-    // 解析 MTEXT 原始文本（含格式码）为行/段
-    private MTextLayout ParseMText(string raw, double baseHeight)
+    // 解析 MTEXT 原始文本（含格式码）为行/段。styleFont/styleBig 用于 SHX 字宽（换行/定位，与 CAD 一致）。
+    private MTextLayout ParseMText(string raw, double baseHeight, string styleFont, string styleBig)
     {
         var layout = new MTextLayout();
         MTextLine line = new MTextLine();
@@ -2892,7 +3067,7 @@ internal partial class ImageEngine
         }
         Flush();
 
-        foreach (var ln in layout.Lines) ln.Recalc();
+        foreach (var ln in layout.Lines) ln.Recalc(this, styleFont, styleBig);
         FinishMTextLayout(layout);
         return layout;
     }
@@ -2929,7 +3104,7 @@ internal partial class ImageEngine
     }
 
     // 按参考列宽（组码41）换行：CJK 逐字可断，拉丁按词（含尾随空格）断
-    private MTextLayout WrapMText(MTextLayout layout, double refWidth)
+    private MTextLayout WrapMText(MTextLayout layout, double refWidth, string styleFont, string styleBig)
     {
         if (refWidth <= 0) return layout;
         bool needWrap = false;
@@ -3006,14 +3181,17 @@ internal partial class ImageEngine
                         }
                         ln.Runs.Add(new MTextRun { Text = t, Height = run.Height, WidthFactor = run.WidthFactor, Color = run.Color, Underline = run.Underline, Overline = run.Overline, Bold = run.Bold, Italic = run.Italic, Oblique = run.Oblique, Font = run.Font, BaselineShift = run.BaselineShift, IsFraction = run.IsFraction });
                     }
-                    ln.Recalc();
+                    ln.Recalc(this, styleFont, styleBig);
                     result.Lines.Add(ln);
                 }
                 cur.Clear(); curW = 0; hasText = false;
             }
             foreach (var (t, run) in frags)
             {
-                double fw = EstimateTextWidth(t, run.Height) * (run.WidthFactor > 0 ? run.WidthFactor : 1.0);
+                string eFont = !string.IsNullOrEmpty(run.Font) ? run.Font : styleFont;
+                string eBig = string.IsNullOrEmpty(run.Font) ? styleBig : null;
+                double fw = TryShxRunAdvance(eFont, eBig, t, run.Height, run.WidthFactor > 0 ? run.WidthFactor : 1.0, out double w) ? w
+                    : EstimateTextWidth(t, run.Height) * (run.WidthFactor > 0 ? run.WidthFactor : 1.0);
                 if (hasText && curW + fw > refWidth) FlushCur();
                 if (!string.IsNullOrWhiteSpace(t)) hasText = true;
                 cur.Add((t, run));
@@ -3064,7 +3242,8 @@ internal partial class ImageEngine
     private void EmitMTextSvg(StringBuilder sb, MText mt, Transform2D tr, double scaleMul, short layerAci, short byBlockAci, string styleFont)
     {
         string baseCol = ColorOf(EntityAciIndex(mt), layerAci, byBlockAci);
-        var layout = WrapMText(ParseMText(mt.Value ?? "", mt.Height), mt.RectangleWidth);
+        string styleBig = GetStyleBigFont(mt.Style);
+        var layout = WrapMText(ParseMText(mt.Value ?? "", mt.Height, styleFont, styleBig), mt.RectangleWidth, styleFont, styleBig);
         if (layout.Lines.Count == 0) return;
         var (baselines, anchorX, anchorY) = MTextLocalLayout(layout, mt);
 
@@ -3087,7 +3266,7 @@ internal partial class ImageEngine
             double x = layout.Lines[li].FirstIndent * scaleMul; // 段落首行缩进（\pi）
             foreach (var run in layout.Lines[li].Runs)
             {
-                double rw = MTextRunWidth(run) * scaleMul;
+                double rw = MTextRunWidth(run, styleFont, styleBig) * scaleMul;
                 if (run.IsFraction)
                 {
                     // \S<num>/<den> 分数：分子/分母上下分层 + 中间分数线（横线宽=分数宽）
@@ -3132,35 +3311,86 @@ internal partial class ImageEngine
                 {
                     string col = run.Color.HasValue ? AciColor(run.Color.Value) : baseCol;
                     double fs = Math.Max(run.Height * scaleMul, 0.2);
-                    string cssFont = SvgFontFamily(ResolveFontFamily(!string.IsNullOrEmpty(run.Font) ? run.Font : styleFont));
-                    // \S 堆叠：基线按 BaselineShift（em）上下移（CAD y 向上：上标=+）
-                    ToWorld(x, baselines[li] + run.BaselineShift * run.Height, out double wx, out double wy);
-                    double sx = Sx(wx), sy = Sy(wy);
-                    double ob = EffOblique(run); // 斜体合成倾斜角（CJK 无真斜体，用斜切合成）
+                    double baseLineY = baselines[li] + run.BaselineShift * run.Height;
+                    string effFont = !string.IsNullOrEmpty(run.Font) ? run.Font : styleFont;
+                    string effBig = string.IsNullOrEmpty(run.Font) ? styleBig : null;
+                    double ob = EffOblique(run);                 // 斜体合成倾斜角（度，正=前倾）
+                    double obRad = ob * Math.PI / 180.0;          // 局部 y 向上坐标系：x' += tan(ob)·y（与 <text> skewX(-ob) 经 Y 翻转等价）
+                    double wf = run.WidthFactor > 0 ? run.WidthFactor : 1.0;
 
-                    // 富文本属性：字体族/字号/颜色/加粗/下划线+上划线
-                    var attr = new List<string>
+                    // 局部笔画点（基线原点 / 数据单位 / y 向上）→ wf 压缩 + 斜切 → 平移到 run 原点 → ToWorld(旋转+缩放) → Sx/Sy(翻转)
+                    void LocalToPixel(double lx, double ly, out double px, out double py)
                     {
-                        $"x=\"0\" y=\"0\"",
-                        $"font-family=\"{cssFont}\"",
-                        $"font-size=\"{F(fs)}\"",
-                        $"fill=\"{col}\""
-                    };
-                    if (run.Bold) attr.Add($"font-weight=\"bold\"");
-                    var deco = new List<string>();
-                    if (run.Underline) deco.Add("underline");
-                    if (run.Overline) deco.Add("overline");
-                    if (deco.Count > 0) attr.Add($"text-decoration=\"{string.Join(" ", deco)}\"");
+                        double ax = lx * wf + Math.Tan(obRad) * ly;
+                        double wxLocal = x + ax;
+                        double wyLocal = baseLineY + ly;
+                        ToWorld(wxLocal, wyLocal, out double wx, out double wy);
+                        px = Sx(wx); py = Sy(wy);
+                    }
 
-                    // transform：平移到基线左端点，再绕该点 rotate(旋转) / skewX(倾斜) / scale(宽度压缩)
-                    // 斜体统一用 skewX 合成（替代 font-style:italic —— CJK/无真斜体字体无效果）
-                    var tf = new List<string> { $"translate({F(sx)}, {F(sy)})" };
-                    if (Math.Abs(rot) > 1e-6) tf.Add($"rotate({F(-rot)})");
-                    if (Math.Abs(ob) > 1e-6) tf.Add($"skewX({F(-ob)})");
-                    if (Math.Abs(run.WidthFactor - 1.0) > 1e-6) tf.Add($"scale({F(run.WidthFactor)}, 1)");
-                    attr.Add($"transform=\"{string.Join(" ", tf)}\"");
+                    // SHX 笔迹优先（simplex.shx / \Fsimplex 等）：真实 SHX 字形，字高随 em 自然，不再经 SimSun 压缩→偏小
+                    if (TryBuildMTextShxLocal(effFont, effBig, run.Text, run.Height, wf, out List<int> st, out List<double[]> sp, out _))
+                    {
+                        var sd = new StringBuilder();
+                        for (int k = 0; k < st.Count; k++)
+                        {
+                            var p = sp[k];
+                            switch (st[k])
+                            {
+                                case 0:
+                                    LocalToPixel(p[0], p[1], out double m0x, out double m0y);
+                                    sd.Append("M").Append(F(m0x)).Append(',').Append(F(m0y));
+                                    break;
+                                case 1:
+                                    LocalToPixel(p[0], p[1], out double l1x, out double l1y);
+                                    sd.Append("L").Append(F(l1x)).Append(',').Append(F(l1y));
+                                    break;
+                                case 2:
+                                    LocalToPixel(p[0], p[1], out double q0x, out double q0y);
+                                    LocalToPixel(p[2], p[3], out double q1x, out double q1y);
+                                    sd.Append("Q").Append(F(q0x)).Append(',').Append(F(q0y)).Append(' ').Append(F(q1x)).Append(',').Append(F(q1y));
+                                    break;
+                                case 3:
+                                    LocalToPixel(p[0], p[1], out double c0x, out double c0y);
+                                    LocalToPixel(p[2], p[3], out double c1x, out double c1y);
+                                    LocalToPixel(p[4], p[5], out double c2x, out double c2y);
+                                    sd.Append("C").Append(F(c0x)).Append(',').Append(F(c0y)).Append(' ').Append(F(c1x)).Append(',').Append(F(c1y)).Append(' ').Append(F(c2x)).Append(',').Append(F(c2y));
+                                    break;
+                            }
+                        }
+                        double penW = Math.Max(fs * 0.05, 0.2); // SHX 笔画线宽（像素）：约 5% 字高，保底 0.2
+                        sb.AppendLine($"  <path d=\"{sd}\" fill=\"none\" stroke=\"{col}\" stroke-width=\"{F(penW)}\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>");
+                    }
+                    else
+                    {
+                        // 回退 TTF（含 CJK 无 bigfont / 内联 TTF 字体 / 字形缺失）→ 原 <text> 路径（行为不变）
+                        string cssFont = SvgFontFamily(ResolveFontFamily(effFont));
+                        ToWorld(x, baseLineY, out double wx, out double wy);
+                        double sx = Sx(wx), sy = Sy(wy);
+                        // 富文本属性：字体族/字号/颜色/加粗/下划线+上划线
+                        var attr = new List<string>
+                        {
+                            $"x=\"0\" y=\"0\"",
+                            $"font-family=\"{cssFont}\"",
+                            $"font-size=\"{F(fs)}\"",
+                            $"fill=\"{col}\""
+                        };
+                        if (run.Bold) attr.Add($"font-weight=\"bold\"");
+                        var deco = new List<string>();
+                        if (run.Underline) deco.Add("underline");
+                        if (run.Overline) deco.Add("overline");
+                        if (deco.Count > 0) attr.Add($"text-decoration=\"{string.Join(" ", deco)}\"");
 
-                    sb.AppendLine($"  <text {string.Join(" ", attr)}>{EscapeXml(run.Text)}</text>");
+                        // transform：平移到基线左端点，再绕该点 rotate(旋转) / skewX(倾斜) / scale(宽度压缩)
+                        // 斜体统一用 skewX 合成（替代 font-style:italic —— CJK/无真斜体字体无效果）
+                        var tf = new List<string> { $"translate({F(sx)}, {F(sy)})" };
+                        if (Math.Abs(rot) > 1e-6) tf.Add($"rotate({F(-rot)})");
+                        if (Math.Abs(ob) > 1e-6) tf.Add($"skewX({F(-ob)})");
+                        if (Math.Abs(run.WidthFactor - 1.0) > 1e-6) tf.Add($"scale({F(run.WidthFactor)}, 1)");
+                        attr.Add($"transform=\"{string.Join(" ", tf)}\"");
+
+                        sb.AppendLine($"  <text {string.Join(" ", attr)}>{EscapeXml(run.Text)}</text>");
+                    }
                 }
                 x += rw;
             }

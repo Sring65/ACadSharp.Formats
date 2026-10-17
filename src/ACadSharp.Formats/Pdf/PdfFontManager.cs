@@ -104,6 +104,20 @@ internal sealed class PdfFontManager
             case "FangSong": candidates = new[] { "simfang.ttf" }; break;
             case "SimLi": candidates = new[] { "SIMLI.TTF" }; break;
             case "Microsoft YaHei": candidates = new[] { "msyh.ttc", "msyh.ttf" }; break; // 系统多为 .ttc
+            // 拉丁：先找同名 TTF（Windows Arial.ttf / 项目 Support/fonts/arial.ttf），
+            // 找不到再退 Linux 常用无衬线（Liberation Sans / DejaVu Sans / Noto Sans）——保证跨平台。
+            case "Arial":
+                candidates = new[] { "arial.ttf", "Arial.ttf", "LiberationSans-Regular.ttf", "DejaVuSans.ttf", "NotoSans-Regular.ttf" };
+                break;
+            case "Helvetica":
+                candidates = new[] { "Helvetica.ttf", "LiberationSans-Regular.ttf", "DejaVuSans.ttf", "arial.ttf" };
+                break;
+            case "Times New Roman":
+                candidates = new[] { "times.ttf", "Times New Roman.ttf", "LiberationSerif-Regular.ttf", "DejaVuSerif.ttf" };
+                break;
+            case "Courier New":
+                candidates = new[] { "cour.ttf", "Courier New.ttf", "LiberationMono-Regular.ttf", "DejaVuSansMono.ttf" };
+                break;
             default: candidates = new[] { family + ".ttf", family.ToLowerInvariant() + ".ttf" }; break;
         }
         return CjkFont.FindFontFile(candidates);

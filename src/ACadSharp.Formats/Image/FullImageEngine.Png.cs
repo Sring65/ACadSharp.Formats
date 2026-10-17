@@ -935,7 +935,8 @@ internal partial class ImageEngine
     private void EmitMTextPng(MText mt, Transform2D tr, double scaleMul, short layerAci, short byBlockAci, string styleFont)
     {
         string baseCol = ColorOf(EntityAciIndex(mt), layerAci, byBlockAci);
-        var layout = WrapMText(ParseMText(mt.Value ?? "", mt.Height), mt.RectangleWidth);
+        string styleBig = GetStyleBigFont(mt.Style);
+        var layout = WrapMText(ParseMText(mt.Value ?? "", mt.Height, styleFont, styleBig), mt.RectangleWidth, styleFont, styleBig);
         if (layout.Lines.Count == 0) return;
         var (baselines, anchorX, anchorY) = MTextLocalLayout(layout, mt);
 
@@ -950,7 +951,7 @@ internal partial class ImageEngine
             double x = layout.Lines[li].FirstIndent * scaleMul; // 段落首行缩进（\pi）
             foreach (var run in layout.Lines[li].Runs)
             {
-                double rw = MTextRunWidth(run) * scaleMul;
+                double rw = MTextRunWidth(run, styleFont, styleBig) * scaleMul;
                 if (run.IsFraction)
                 {
                     // \S<num>/<den> 分数：分子/分母上下分层 + 中间分数线（与 SVG 端一致）
@@ -1003,15 +1004,27 @@ internal partial class ImageEngine
                 {
                     string col = run.Color.HasValue ? AciColor(run.Color.Value) : baseCol;
                     double fs = Math.Max(run.Height * scaleMul, 0.2);
-                    string fam = ResolveFontFamily(!string.IsNullOrEmpty(run.Font) ? run.Font : styleFont);
+                    string effFont = !string.IsNullOrEmpty(run.Font) ? run.Font : styleFont;
+                    string effBig = string.IsNullOrEmpty(run.Font) ? styleBig : null;
+                    double wf = run.WidthFactor > 0 ? run.WidthFactor : 1.0;
+                    double baseLineY = baselines[li] + run.BaselineShift * run.Height;
                     double dx = (x - anchorX) * scaleMul;
                     // \S 堆叠：基线按 BaselineShift（em）上下移（与 SVG 端一致）
-                    double dy = (baselines[li] + run.BaselineShift * run.Height - anchorY) * scaleMul;
-                    double wx = px + dx * ca - dy * sa;
-                    double wy = py + dx * sa + dy * ca;
-                    // 斜体：CJK/无真斜体字体无 italic 字形 → 传合成倾斜角 ob 走 tanA 斜切（与 SVG skewX 一致）
-                    DrawTextPng(wx, wy, run.Text, fs, col, -rot, fam, run.WidthFactor,
-                        run.Bold, run.Italic, EffOblique(run), run.Underline, run.Overline, rw);
+                    double dy = (baseLineY - anchorY) * scaleMul;
+                    double ox = px + dx * ca - dy * sa;
+                    double oy = py + dx * sa + dy * ca;
+                    // SHX 笔迹优先（simplex.shx 等）：真实 SHX 字形描边，字高随 em 自然（不再经 SimSun 压缩→偏小）
+                    if (TryBuildMTextShxLocal(effFont, effBig, run.Text, run.Height, wf, out List<int> st, out List<double[]> sp, out _))
+                    {
+                        DrawShxRunPng(ox, oy, st, sp, run.Height, wf, fs, -rot, EffOblique(run), col);
+                    }
+                    else
+                    {
+                        // 回退 TTF（含 CJK 无 bigfont / 内联 TTF / 字形缺失）→ 原 DrawTextPng（行为不变）
+                        string fam = ResolveFontFamily(effFont);
+                        DrawTextPng(ox, oy, run.Text, fs, col, -rot, fam, wf,
+                            run.Bold, run.Italic, EffOblique(run), run.Underline, run.Overline, rw);
+                    }
                 }
                 x += rw;
             }
@@ -1107,6 +1120,75 @@ internal partial class ImageEngine
             var pp = new List<RasterCanvas.P> { new RasterCanvas.P((float)x0, (float)y0), new RasterCanvas.P((float)x1, (float)y1) };
             _rc.StrokePolyline(pp, false, wline, col);
         }
+    }
+
+    // SHX 笔迹 → 画布描边（与 DrawTextPng 同一屏幕变换：wf 压缩 / tanA 倾斜 / rotCanvas 旋转）。
+    // types/pts = TryBuildMTextShxLocal 输出（基线原点、数据单位、y 上，不含 wf）；H=字高（数据单位，1 em）。
+    // 用于 MTEXT simplex.shx 等 SHX 基础样式：真实 SHX 字形描边，字高随 em 自然（不再经 SimSun 压缩→偏小）。
+    private void DrawShxRunPng(double ox, double oy, List<int> types, List<double[]> pts, double H, double wf,
+        double fsData, double rotCanvas, double oblique, string colHex)
+    {
+        if (_rc == null || pts.Count == 0) return;
+        float originSx = (float)PngSx(ox), originSy = (float)PngSy(oy);
+        float fs = (float)(fsData * PngK);
+        if (fs <= 0) return;
+        double wf2 = wf > 1e-9 ? wf : 1.0;
+        double tanA = Math.Tan(-oblique * Math.PI / 180.0); // 与 DrawTextPng 同（skewX(−oblique)）
+        double th = rotCanvas * Math.PI / 180.0;
+        double cosT = Math.Cos(th), sinT = Math.Sin(th);
+        var col = HexToRgb(colHex);
+        float penW = (float)Math.Max(fs * 0.05, 0.2);
+
+        // 局部点（基线原点、数据单位、y 上）→ 画布像素（与 DrawTextPng 同：ex_em=lx/H，ey_em=ly/H）
+        void ToScr(double lx, double ly, out float X, out float Y)
+        {
+            double ex = lx / H, ey = ly / H;
+            double Lx = ex * fs * wf2;
+            double Ly = -ey * fs;
+            Lx += tanA * Ly; // 倾斜（SVG skewX(−oblique) 经 Y 翻转等价）
+            double Xr = Lx * cosT - Ly * sinT;
+            double Yr = Lx * sinT + Ly * cosT;
+            X = originSx + (float)Xr;
+            Y = originSy + (float)Yr;
+        }
+
+        var cur = new List<RasterCanvas.P>();
+        for (int k = 0; k < types.Count; k++)
+        {
+            var p = pts[k];
+            switch (types[k])
+            {
+                case 0: // Move：抬笔 → 新子路径
+                    if (cur.Count >= 2) _rc.StrokePolyline(cur, false, penW, col);
+                    ToScr(p[0], p[1], out float mx, out float my);
+                    cur = new List<RasterCanvas.P> { new RasterCanvas.P(mx, my) };
+                    break;
+                case 1: // Line
+                    ToScr(p[0], p[1], out float lx, out float ly);
+                    cur.Add(new RasterCanvas.P(lx, ly));
+                    break;
+                case 2: // Quad（控制, 终点）
+                    ToScr(p[0], p[1], out float qcx, out float qcy);
+                    ToScr(p[2], p[3], out float qex, out float qey);
+                    if (cur.Count > 0)
+                    {
+                        var s = cur[cur.Count - 1];
+                        RasterCanvas.FlattenQuad(s.X, s.Y, qcx, qcy, qex, qey, cur);
+                    }
+                    break;
+                case 3: // Cubic（控制1, 控制2, 终点）
+                    ToScr(p[0], p[1], out float c1x, out float c1y);
+                    ToScr(p[2], p[3], out float c2x, out float c2y);
+                    ToScr(p[4], p[5], out float e1x, out float e1y);
+                    if (cur.Count > 0)
+                    {
+                        var s = cur[cur.Count - 1];
+                        RasterCanvas.FlattenCubic(s.X, s.Y, c1x, c1y, c2x, c2y, e1x, e1y, cur);
+                    }
+                    break;
+            }
+        }
+        if (cur.Count >= 2) _rc.StrokePolyline(cur, false, penW, col);
     }
 
     // 族名 → 可用 TrueTypeFont（纯托管）。先按 family（CSS 列表支持）尝试，含 CJK 时追加常用 CJK 兜底，

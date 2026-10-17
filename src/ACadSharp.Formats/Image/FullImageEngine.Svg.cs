@@ -1471,7 +1471,10 @@ internal partial class ImageEngine
     // Leader 水平着陆线（landing line）端点（三引擎共享）。
     // AutoCAD 引线在「文字坐落端」（pts 最后一个顶点）会沿 HorizontalDirection 画一段水平线，
     // 文字就摆在这段线上。仅当引线末段「不水平」时顶点序列里不含这条水平线，需渲染端补画：
-    //   端点 = V[last] + HorizontalDirection * (HookLineDirection==Opposite ? -1 : +1) * TextWidth
+    //   端点 = V[last] + HorizontalDirection * sign * TextWidth
+    //     sign：HookLineDirection==Opposite(0) → +1；Same(1) → -1
+    //     （以 CAD 实测为准：Opposite 时水平线沿 HD 正向、落在文字坐落侧，作为文字下划线；
+    //      早期按枚举字面"opposite 取反向"实现为 -1，导致线段画到文字对侧，2026-10-17 修正）
     // 末段已水平（HasHookline==true）时，该水平段已是末段本身（或末段延伸方向相同），不再叠加，
     // 否则会出现"水平线 + 又一段水平线"的重影。
     // 返回 false = 无需补画（末段已水平 / 无水平方向 / TextWidth<=0）。
@@ -1493,7 +1496,8 @@ internal partial class ImageEngine
         if (dlen < 1e-9) return false;
         double dot = (dx * hdx + dy * hdy) / dlen; // ±1 = 末段与水平线平行
         if (Math.Abs(dot) > 0.999) return false;   // 末段已水平 → 水平线已是末段，不补
-        int sign = ld.HookLineDirection == HookLineDirection.Same ? 1 : -1;
+        // CAD 实测：Opposite(0) 时水平线沿 HD 正向（+1）落在文字坐落侧；Same(1) 取反向（-1）。
+        int sign = ld.HookLineDirection == HookLineDirection.Same ? -1 : 1;
         var last = pts[pts.Count - 1];
         ex = last.X + sign * hdx * ld.TextWidth;
         ey = last.Y + sign * hdy * ld.TextWidth;

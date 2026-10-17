@@ -1368,38 +1368,79 @@ internal partial class ImageEngine
         return segs;
     }
 
-    // PolygonMesh 线框（三引擎共享）：M×N 多边形网格（顶点行优先，index = r*n + c）。
-    // MVertexCount/NVertexCount 有效且乘积 = 顶点数时画网格线（行线 + 列线）；
-    // 否则退化为按顺序顶点折线。顶点（Location）经 tr 世界化，返回世界系线段列表。
+    // PolygonMesh 线框（三引擎共享）：M×N 多边形网格。
+    // 【节点投影到显示坐标面】所有网格节点只取 Location.X/Y（丢弃 Z 高度）再经 tr 映射，
+    // 使带 Z 起伏的 3D 网格得到平整的平面栅格（而不是 3D 斜视/顺序折线锯齿）。
+    // 网格索引优先级：
+    //   1) 控制点网格：MVertexCount × NVertexCount == 顶点数（无样条拟合点）；
+    //   2) 拟合点网格：MSmoothSurfaceDensity × NSmoothSurfaceDensity == 拟合点数
+    //      （样条拟合后的真实显示网格；行优先 M 外层、N 内层，index = iM*N + iN）；
+    //   3) 退化：按顺序顶点折线。
+    // 返回世界系线段列表（顶点已投影并 tr 世界化）。
     private static List<((double AX, double AY), (double BX, double BY))> PolygonMeshWire(PolygonMesh pm, Transform2D tr)
     {
         var segs = new List<((double AX, double AY), (double BX, double BY))>();
         var verts = pm?.Vertices;
         if (verts == null || verts.Count == 0) return segs;
+
+        // 节点投影到当前显示坐标面：只取 X/Y（Z 丢弃）
         var wp = new (double X, double Y)[verts.Count];
         for (int i = 0; i < verts.Count; i++)
         {
-            var p = tr == null ? (verts[i].Location.X, verts[i].Location.Y) : tr.Apply(verts[i].Location.X, verts[i].Location.Y);
+            var l = verts[i].Location;
+            var p = tr == null ? (l.X, l.Y) : tr.Apply(l.X, l.Y);
             wp[i] = p;
         }
-        int m = pm.MVertexCount, n = pm.NVertexCount;
+
+        // 按 rows×cols（行优先，index = r*cols + c）画行线 + 列线
+        void AddGrid(int rows, int cols, IReadOnlyList<int> idx)
+        {
+            if (rows < 2 || cols < 2 || idx.Count < rows * cols) return;
+            for (int r = 0; r < rows; r++)
+                for (int c = 0; c + 1 < cols; c++)
+                { int i1 = idx[r * cols + c], i2 = idx[r * cols + c + 1]; segs.Add(((wp[i1].X, wp[i1].Y), (wp[i2].X, wp[i2].Y))); }
+            for (int r = 0; r + 1 < rows; r++)
+                for (int c = 0; c < cols; c++)
+                { int i1 = idx[r * cols + c], i2 = idx[(r + 1) * cols + c]; segs.Add(((wp[i1].X, wp[i1].Y), (wp[i2].X, wp[i2].Y))); }
+        }
+
         int total = verts.Count;
-        if (m > 0 && n > 0 && m * n == total)
+        int m = pm.MVertexCount, n = pm.NVertexCount;
+        int mD = pm.MSmoothSurfaceDensity, nD = pm.NSmoothSurfaceDensity;
+
+        // 1) 控制点网格（无拟合点）
+        if (m > 1 && n > 1 && m * n == total)
         {
-            // 行线（固定 r，沿 c）
-            for (int r = 0; r < m; r++)
-                for (int c = 0; c < n - 1; c++)
-                { int i1 = r * n + c, i2 = r * n + c + 1; segs.Add(((wp[i1].X, wp[i1].Y), (wp[i2].X, wp[i2].Y))); }
-            // 列线（固定 c，沿 r）
-            for (int r = 0; r < m - 1; r++)
-                for (int c = 0; c < n; c++)
-                { int i1 = r * n + c, i2 = (r + 1) * n + c; segs.Add(((wp[i1].X, wp[i1].Y), (wp[i2].X, wp[i2].Y))); }
+            var all = new int[total];
+            for (int i = 0; i < total; i++) all[i] = i;
+            AddGrid(m, n, all);
+            return segs;
         }
-        else
+
+        // 2) 拟合点网格（样条拟合后的真实显示网格）
+        if (mD > 1 && nD > 1)
         {
-            for (int i = 0; i + 1 < total; i++)
-                segs.Add(((wp[i].X, wp[i].Y), (wp[i + 1].X, wp[i + 1].Y)));
+            if (total == mD * nD)
+            {
+                var all = new int[total];
+                for (int i = 0; i < total; i++) all[i] = i;
+                AddGrid(mD, nD, all);
+                return segs;
+            }
+            // 混合（控制点 + 拟合点）：只取拟合点，按文件顺序（行优先 M 外层、N 内层）
+            var fit = new List<int>();
+            for (int i = 0; i < total; i++)
+                if ((verts[i].Flags & VertexFlags.SplineVertexFromSplineFitting) != 0) fit.Add(i);
+            if (fit.Count == mD * nD)
+            {
+                AddGrid(mD, nD, fit);
+                return segs;
+            }
         }
+
+        // 3) 退化：按顺序顶点折线
+        for (int i = 0; i + 1 < total; i++)
+            segs.Add(((wp[i].X, wp[i].Y), (wp[i + 1].X, wp[i + 1].Y)));
         return segs;
     }
 

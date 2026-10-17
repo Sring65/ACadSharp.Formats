@@ -1468,6 +1468,38 @@ internal partial class ImageEngine
         return true;
     }
 
+    // Leader 水平着陆线（landing line）端点（三引擎共享）。
+    // AutoCAD 引线在「文字坐落端」（pts 最后一个顶点）会沿 HorizontalDirection 画一段水平线，
+    // 文字就摆在这段线上。仅当引线末段「不水平」时顶点序列里不含这条水平线，需渲染端补画：
+    //   端点 = V[last] + HorizontalDirection * (HookLineDirection==Opposite ? -1 : +1) * TextWidth
+    // 末段已水平（HasHookline==true）时，该水平段已是末段本身（或末段延伸方向相同），不再叠加，
+    // 否则会出现"水平线 + 又一段水平线"的重影。
+    // 返回 false = 无需补画（末段已水平 / 无水平方向 / TextWidth<=0）。
+    private static bool LeaderLandingEndpoint(Leader ld, List<(double X, double Y)> pts,
+        out double ex, out double ey)
+    {
+        ex = ey = 0;
+        if (pts == null || pts.Count < 2) return false;
+        if (ld.TextWidth <= 1e-9) return false;
+        var hd = ld.HorizontalDirection;
+        double hdx = hd.X, hdy = hd.Y;
+        double hlen = Math.Sqrt(hdx * hdx + hdy * hdy);
+        if (hlen < 1e-9) return false;
+        hdx /= hlen; hdy /= hlen;
+        // 末段方向（V[last-1] → V[last]）
+        double dx = pts[pts.Count - 1].X - pts[pts.Count - 2].X;
+        double dy = pts[pts.Count - 1].Y - pts[pts.Count - 2].Y;
+        double dlen = Math.Sqrt(dx * dx + dy * dy);
+        if (dlen < 1e-9) return false;
+        double dot = (dx * hdx + dy * hdy) / dlen; // ±1 = 末段与水平线平行
+        if (Math.Abs(dot) > 0.999) return false;   // 末段已水平 → 水平线已是末段，不补
+        int sign = ld.HookLineDirection == HookLineDirection.Same ? 1 : -1;
+        var last = pts[pts.Count - 1];
+        ex = last.X + sign * hdx * ld.TextWidth;
+        ey = last.Y + sign * hdy * ld.TextWidth;
+        return true;
+    }
+
     // spline-fit（样条拟合）多段线（POLYLINE 组码 70 bit2=curved）的顶点混合两类：
     //   SplineVertexFromSplineFitting —— 样条拟合点，AutoCAD 实际渲染的显示路径；
     //   SplineFrameControlPoint      —— 样条框架控制点，AutoCAD 不显示（仅定义拟合曲线）。
@@ -2029,14 +2061,13 @@ internal partial class ImageEngine
                     {
                         double alen = ld.TextHeight > 1e-9 ? ld.TextHeight * scaleMul : Math.Max(w * 6.0, 4.0 * (tr?.Scale ?? 1.0));
                         // 引线：起点移到箭头底边中心，避免细线穿入实心三角内部
+                        var lp = new List<(double X, double Y)>(pts);
                         if (LeaderArrowBase(pts, alen, out var lbx, out var lby))
-                        {
-                            var lp = new List<(double X, double Y)>(pts);
                             lp[0] = (lbx, lby);
-                            EmitPolyline(sb, lp, col, w, false, dash);
-                        }
-                        else
-                            EmitPolyline(sb, pts, col, w, false, dash);
+                        // 水平着陆线（末段非水平时补画，供关联文字坐落）
+                        if (LeaderLandingEndpoint(ld, pts, out var lex, out var ley))
+                            lp.Add((lex, ley));
+                        EmitPolyline(sb, lp, col, w, false, dash);
                         // 实心箭头三角（AutoCAD LEADER 默认实心；尖端 pts[0] 指向目标端）
                         if (LeaderArrowWings(ld, pts, alen, out var w1x, out var w1y, out var w2x, out var w2y))
                             EmitQuadFill(sb, new List<(double X, double Y)> { (pts[0].X, pts[0].Y), (w1x, w1y), (w2x, w2y) }, col);

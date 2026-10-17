@@ -536,6 +536,12 @@ internal partial class ImageEngine
                             linePts = new List<(double X, double Y)>(pts);
                             linePts[0] = (lbx, lby);
                         }
+                        // 水平着陆线（末段非水平时补画，供关联文字坐落）
+                        if (LeaderLandingEndpoint(ld, pts, out var lex, out var ley))
+                        {
+                            if (ReferenceEquals(linePts, pts)) linePts = new List<(double X, double Y)>(pts);
+                            linePts.Add((lex, ley));
+                        }
                         var d = new StringBuilder();
                         for (int i = 0; i < linePts.Count; i++)
                             d.Append(F(Sx(linePts[i].X)) + " " + F(Py(linePts[i].Y)) + " " + (i == 0 ? "m" : "l") + " ");

@@ -2654,13 +2654,13 @@ internal partial class ImageEngine
         foreach (var ch in text)
         {
             ShxFont face; int code;
-            if (ch < 0x80) { face = latin; code = ch; }
-            else
+            if (ch >= 0x2E80)   // CJK → bigfont（hasCjk 已保证 gbk 非 null）
             {
                 byte[] gb = gbk.GetBytes(new char[] { ch });
                 if (gb.Length != 2) continue;
                 face = cjk; code = (gb[0] << 8) | gb[1];
             }
+            else { face = latin; code = ch; } // 非 CJK 一律走 latin SHX 原始码位（含 0xB0°/0x2205∅ 等 CAD 符号；缺字形仅留 0.7em 间隙，不崩）
             int em = face.UnitsPerEm > 0 ? face.UnitsPerEm : 1;
             double s = H / em;
             bool hasAdv = face.TryGetAdvance(code, out float advF);
@@ -2714,13 +2714,13 @@ internal partial class ImageEngine
         foreach (var ch in text)
         {
             ShxFont face; int code;
-            if (ch < 0x80) { face = latin; code = ch; }
-            else
+            if (ch >= 0x2E80)   // CJK → bigfont（hasCjk 已保证 gbk 非 null）
             {
                 byte[] gb = gbk.GetBytes(new char[] { ch });
                 if (gb.Length != 2) continue;
                 face = cjk; code = (gb[0] << 8) | gb[1];
             }
+            else { face = latin; code = ch; } // 非 CJK 一律走 latin SHX 原始码位（含 0xB0°/0x2205∅ 等 CAD 符号；缺字形仅留 0.7em 间隙，不崩）
             int em = face.UnitsPerEm > 0 ? face.UnitsPerEm : 1;
             double s = H / em;
             bool hasAdv = face.TryGetAdvance(code, out float advF);

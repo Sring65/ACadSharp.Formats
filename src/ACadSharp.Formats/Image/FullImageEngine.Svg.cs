@@ -675,17 +675,20 @@ internal partial class ImageEngine
             default: ang = 0; break;                   // upright
         }
         double ca = Math.Cos(ang), sa = Math.Sin(ang);
-        // offset（DXF 44/45）= 数据单位偏移：X 沿路径切向、Y 沿法向(-ty,tx)。
-        // 不随字形旋转、不乘字形缩放 S（字形缩放只作用于字形几何）。
-        // 旧实现 ox=seg.OX*S 多乘了缩放且被 ang 旋转（当字形局部坐标）→ BATTING 等带偏移
-        // 的复杂线型拱形相对路径错位（"缺少偏移判断"）。
-        double oxw = seg.OX * tx - seg.OY * ty;   // 切向*OX + 法向*OY → 世界 x
-        double oyw = seg.OX * ty + seg.OY * tx;   // → 世界 y
-        // 字形点(字体单位) → 输出坐标：平移(offset→路径点)+旋转+缩放，再经 fx/fy 映射
+        // offset（DXF 44/45）= 数据单位偏移。字形局部 +X 与路径行进方向【相反】（字形原点置于
+        // 段内位置、其 +X 指向路径前方之前），故切向分量取【负】：offset = -OX·切向 + OY·法向(-ty,tx)。
+        // 法向分量保持 OY（局部 +Y = 左法向的标准约定）。不随字形旋转、不乘字形缩放 S。
+        double oxw = -seg.OX * tx - seg.OY * ty;  // -切向*OX + 法向*OY → 世界 x
+        double oyw = -seg.OX * ty + seg.OY * tx;  // → 世界 y
+        // 【关键】SHX 字形按【原点(0,0)】锚定到"路径点+offset"（DXF 线型 shape 的插入点语义），
+        // 不是按包围盒中心。BATTING 教训（Drawing1.dxf，CAD ground truth=弹簧状相切椭圆环）：
+        // 若按包围盒中心锚定，BAT 字形弧心(1,2)=包围盒中心 → 弧心必然落在线型基线上，0°/180° 两个
+        // 交替字形只能拼成"同心整圆→相邻圆相切"；而按原点锚定，弧心相对原点偏移 (CX,CY)·S，0° 与
+        // 180° 交替使两弧分居基线上/下两侧 → 形成真正的螺旋弹簧（相邻环重叠、环内有对角弦），与参考一致。
         void Xf(float gx, float gy, out double mx, out double my)
         {
-            double lx = (gx - rec.CX) * S;
-            double ly = (gy - rec.CY) * S;
+            double lx = gx * S;   // 原点锚定：字形 (0,0) → offset 点（不是包围盒中心）
+            double ly = gy * S;
             double wx = px + oxw + lx * ca - ly * sa;
             double wy = py + oyw + lx * sa + ly * ca;
             mx = fx(wx); my = fy(wy);

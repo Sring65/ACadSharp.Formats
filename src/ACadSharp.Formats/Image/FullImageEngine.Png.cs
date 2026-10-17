@@ -885,14 +885,16 @@ internal partial class ImageEngine
             default: ang = 0; break;                   // upright
         }
         double ca = Math.Cos(ang), sa = Math.Sin(ang);
-        // offset（DXF 44/45）= 数据单位偏移：X 沿切向、Y 沿法向(-ty,tx)，不随字形旋转、不乘字形缩放。
-        // 旧实现 ox=seg.OX*S 多乘缩放且被 ang 旋转 → 带偏移的复杂线型拱形相对路径错位。
-        double oxw = seg.OX * tx - seg.OY * ty;
-        double oyw = seg.OX * ty + seg.OY * tx;
+        // offset（DXF 44/45）：字形局部 +X 与路径行进方向相反 → 切向分量取负，法向分量取 OY。
+        double oxw = -seg.OX * tx - seg.OY * ty;
+        double oyw = -seg.OX * ty + seg.OY * tx;
+        // 【关键】按字形原点(0,0)锚定到"路径点+offset"（DXF 线型 shape 插入点语义），非包围盒中心。
+        // 与 SVG/PDF 的 EmitShapeGlyph 保持一致（BATTING 实测：原点锚定使 0°/180° 两弧分居基线两侧→
+        // 螺旋弹簧/环内对角弦；按包围盒中心锚定则弧心落基线→同心圆相切，错误）。
         void Xf(float gx, float gy, out double mx, out double my)
         {
-            double lx = (gx - rec.CX) * S;
-            double ly = (gy - rec.CY) * S;
+            double lx = gx * S;   // 原点锚定
+            double ly = gy * S;
             double wx = px + oxw + lx * ca - ly * sa;
             double wy = py + oyw + lx * sa + ly * ca;
             mx = wx; my = wy;

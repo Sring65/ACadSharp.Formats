@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
+using System.IO.Compression;
 using System.Linq;
 using System.Text;
 using ACadSharp;
@@ -20,6 +21,18 @@ internal partial class ImageEngine
     private Dictionary<int, (int ShadingType, string Coords, string C0, string C1)> _pdfShadings;
     private int _pdfShadingSeq;
     private const int MaxPdfShadings = 64;
+
+    // ---- PDF 图片 / Form XObject 资源（内容流阶段登记，组装阶段写对象并注册到 Page /Resources /XObject）----
+    private sealed class PdfXObjReg
+    {
+        public string Name;                                  // /Im0
+        public Func<int, List<(int num, byte[] body)>> Build; // 输入此 XObject 基础对象号，返回所有待写对象（[0] 为 XObject 自身）
+    }
+    private List<PdfXObjReg> _pdfXObjRegs;
+    private int _pdfXObjSeq;
+    /// <summary>源文档（DWG/DXF）路径，用于解析 IMAGE/PDFUNDERLAY 的相对文件路径。</summary>
+    public string SourceFilePath { get; set; }
+    private string _srcDir;
 
     #region ===== 导出 PDF =====
     public ImageExportResult WritePdf(string outPath)
@@ -47,7 +60,10 @@ internal partial class ImageEngine
             // HATCH 渐变 shading 状态（对象号区从字体区之后顺排；内容流生成时逐个登记）
             _pdfShadings = new Dictionary<int, (int ShadingType, string Coords, string C0, string C1)>();
             _pdfShadingSeq = 0;
+            _pdfXObjRegs = new List<PdfXObjReg>();
+            _pdfXObjSeq = 0;
             _skippedCounts.Clear(); // P2：每格式单独计数，日志不跨格式累计
+            _srcDir = string.IsNullOrEmpty(SourceFilePath) ? null : Path.GetDirectoryName(Path.GetFullPath(SourceFilePath));
 
             // 1) 构建内容流（字节级：文字为 2 字节 GID，可能含任意二进制字节）
             var cs = new MemoryStream();
@@ -111,12 +127,25 @@ internal partial class ImageEngine
                 PutObj(fnObj, Encoding.ASCII.GetBytes("<< /FunctionType 2 /Domain [0 1] /C0 [" + kv.Value.C0 + "] /C1 [" + kv.Value.C1 + "] >>"));
             }
 
+            // 图片 / Form XObject 资源（在 Page 对象之前写出，供 /Resources /XObject 引用）
+            var xobjRes = new StringBuilder();
+            int xoBase = shadingBase + _pdfShadings.Count * 2;
+            int xo = xoBase;
+            foreach (var reg in _pdfXObjRegs)
+            {
+                var objs = reg.Build(xo);
+                for (int k = 0; k < objs.Count; k++) PutObj(objs[k].num, objs[k].body);
+                xobjRes.Append("/" + reg.Name + " " + xo + " 0 R ");
+                xo = objs[objs.Count - 1].num + 1;
+            }
+
             // 对象 1 Catalog / 2 Pages / 3 Page
             PutObj(1, Encoding.ASCII.GetBytes("<< /Type /Catalog /Pages 2 0 R >>"));
             PutObj(2, Encoding.ASCII.GetBytes("<< /Type /Pages /Kids [3 0 R] /Count 1 >>"));
             PutObj(3, Encoding.ASCII.GetBytes("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 " + F(_w * _opt.OutputZoom) + " " + F(_h * _opt.OutputZoom) +
                                              "] /Resources << /Font << " + fontResStr + " >>" +
                                               (shadingRes.Length > 0 ? " /Shading << " + shadingRes.ToString().Trim() + " >>" : "") +
+                                              (xobjRes.Length > 0 ? " /XObject << " + xobjRes.ToString().Trim() + " >>" : "") +
                                               " >> /Contents 4 0 R >>"));
 
             // 对象 4 内容流
@@ -374,6 +403,14 @@ internal partial class ImageEngine
                     if (!_transparentBg)
                         PdfQuadFill(cs, _whiteBg ? "#FFFFFF" : "#000000", WipeoutWorldPoly(wo, tr));
                 }
+                break;
+
+            case RasterImage ri:
+                EmitRasterImagePdf(cs, ri, tr, scaleMul);
+                break;
+
+            case PdfUnderlay pu:
+                EmitPdfUnderlayPdf(cs, pu, tr, scaleMul);
                 break;
 
             case Arc a: // 必须先于 Circle（fork 继承关系）
@@ -822,6 +859,174 @@ internal partial class ImageEngine
         StrokeCur();
     }
 
+    // 解析 IMAGE/UNDERLAY 的相对文件路径（DWG 目录优先、绝对路径、仅文件名兜底）。
+    private string ResolveAssetPath(string rel)
+    {
+        if (string.IsNullOrEmpty(rel)) return null;
+        if (Path.IsPathRooted(rel) && File.Exists(rel)) return rel;
+        var cands = new List<string>();
+        if (_srcDir != null)
+        {
+            cands.Add(Path.Combine(_srcDir, rel));
+            cands.Add(Path.Combine(_srcDir, Path.GetFileName(rel)));
+        }
+        cands.Add(rel);
+        cands.Add(Path.GetFileName(rel));
+        foreach (var c in cands)
+            if (!string.IsNullOrEmpty(c) && File.Exists(c)) return Path.GetFullPath(c);
+        return null;
+    }
+
+    // 读外部 PDF 页面 MediaBox（稳健版：字节→ASCII 近似，找 /MediaBox [x0 y0 x1 y1]）。
+    private static double[] TryReadMediaBox(string path)
+    {
+        try
+        {
+            byte[] d = File.ReadAllBytes(path);
+            var sb = new StringBuilder(d.Length);
+            foreach (var b in d) sb.Append(b >= 32 && b < 127 ? (char)b : ' ');
+            string s = sb.ToString();
+            int i = s.IndexOf("/MediaBox");
+            if (i < 0) return null;
+            var m = System.Text.RegularExpressions.Regex.Match(s.Substring(i), @"\[([-\d.eE]+)\s+([-\d.eE]+)\s+([-\d.eE]+)\s+([-\d.eE]+)\]");
+            if (!m.Success) return null;
+            return new[] { double.Parse(m.Groups[1].Value, System.Globalization.CultureInfo.InvariantCulture),
+                           double.Parse(m.Groups[2].Value, System.Globalization.CultureInfo.InvariantCulture),
+                           double.Parse(m.Groups[3].Value, System.Globalization.CultureInfo.InvariantCulture),
+                           double.Parse(m.Groups[4].Value, System.Globalization.CultureInfo.InvariantCulture) };
+        }
+        catch { return null; }
+    }
+
+    // 画四边形边框 + 两条对角线（图片/底图缺失或降级时的占位，灰色）。
+    private void PdfQuadOutline(MemoryStream cs, double ex, double ey, double a, double b, double c, double d, string col)
+    {
+        double x00 = ex, y00 = ey, x10 = ex + a, y10 = ey + b, x01 = ex + c, y01 = ey + d, x11 = ex + a + c, y11 = ey + b + d;
+        string Seg(double X1, double Y1, double X2, double Y2) => F(X1) + " " + F(Y1) + " m " + F(X2) + " " + F(Y2) + " l ";
+        // 占位框颜色传入的是 SVG hex（#888888/#6699cc），必须转 PDF RGB 分量，否则 "#6699cc RG" 是非法 token 致解析器报错。
+        CsAscii(cs, HexToRgbPdf(col) + " RG 0.5 w\n" + Seg(x00, y00, x10, y10) + Seg(x10, y10, x11, y11) + Seg(x11, y11, x01, y01) + Seg(x01, y01, x00, y00) + Seg(x00, y00, x11, y11) + Seg(x10, y10, x01, y01) + "S\n");
+    }
+
+    // PDF 光栅图片（IMAGE / RasterImage）：外部图片嵌入为 /Subtype /Image XObject。
+    // JPEG → /DCTDecode 直嵌（无损、无需解码）；PNG → 解码为 RGB + /FlateDecode（PNG Up 预测器）；
+    // 其它格式/文件缺失 → 降级为矩形边框 + 对角线（不再空白缺失）。
+    private void EmitRasterImagePdf(MemoryStream cs, RasterImage ri, Transform2D tr, double scaleMul)
+    {
+        // 图像四边形（世界四角）：a0=左下(InsertPoint)，a10=右，a01=上，a11=右上；u/v 为单像素向量，乘以像素数得总偏移。
+        var ip = ri.InsertPoint;
+        double W = ri.Size.X, H = ri.Size.Y;
+        var u = ri.UVector; var v = ri.VVector;
+        (double X, double Y) P(double x, double y)
+        {
+            if (tr == null) return (x, y);
+            var p = tr.Apply(x, y); return (p.Item1, p.Item2);
+        }
+        var a0 = P(ip.X, ip.Y);
+        var a10 = P(ip.X + u.X * W, ip.Y + u.Y * W);
+        var a01 = P(ip.X + v.X * H, ip.Y + v.Y * H);
+        double ex = Sx(a0.X), ey = Py(a0.Y);
+        double cmA = Sx(a10.X) - ex, cmB = Py(a10.Y) - ey;
+        double cmC = Sx(a01.X) - ex, cmD = Py(a01.Y) - ey;
+
+        string path = ResolveAssetPath(ri.Definition?.FileName);
+        if (string.IsNullOrEmpty(path))
+        {
+            PdfQuadOutline(cs, ex, ey, cmA, cmB, cmC, cmD, "#888888");
+            RecordSkip("IMAGE(文件缺失)");
+            _log("⚠️  IMAGE 图片文件缺失，降级为边框: " + (ri.Definition?.FileName ?? "?"));
+            return;
+        }
+        byte[] bytes = File.ReadAllBytes(path);
+        string name = "Im" + _pdfXObjSeq++;
+        _pdfXObjRegs.Add(new PdfXObjReg
+        {
+            Name = name,
+            Build = (baseNum) =>
+            {
+                var objs = new List<(int, byte[])>();
+                var jpg = RasterHelpers.ProbeJpeg(bytes);
+                if (jpg != null)
+                {
+                    string csName = jpg.Components == 1 ? "/DeviceGray" : (jpg.Components == 3 ? "/DeviceRGB" : "/DeviceCMYK");
+                    var head = "<< /Type /XObject /Subtype /Image /Width " + jpg.Width + " /Height " + jpg.Height +
+                               " /ColorSpace " + csName + " /BitsPerComponent 8 /Filter /DCTDecode /Length " + bytes.Length + " >>\nstream\n";
+                    var body = new byte[head.Length + bytes.Length + "\nendstream".Length];
+                    var hb = Encoding.ASCII.GetBytes(head);
+                    Buffer.BlockCopy(hb, 0, body, 0, hb.Length);
+                    Buffer.BlockCopy(bytes, 0, body, hb.Length, bytes.Length);
+                    var tb = Encoding.ASCII.GetBytes("\nendstream");
+                    Buffer.BlockCopy(tb, 0, body, hb.Length + bytes.Length, tb.Length);
+                    objs.Add((baseNum, body));
+                }
+                else
+                {
+                    try
+                    {
+                        var (w, h, ch, pix) = RasterHelpers.DecodePngToRgb(bytes);
+                        var raw = new byte[w * h * 3 + h]; // 每行 1 filter(0) + 3*w
+                        int o = 0;
+                        for (int y = 0;y < h; y++)
+                        {
+                            raw[o++] = 0;
+                            for (int x = 0;x < w; x++)
+                            {
+                                int src = (y * w + x) * ch;
+                                raw[o++] = pix[src]; raw[o++] = pix[src + 1]; raw[o++] = pix[src + 2];
+                            }
+                        }
+                        byte[] comp;
+                        using (var ms = new MemoryStream()) { using (var zs = new ZLibStream(ms, CompressionLevel.Optimal, true)) zs.Write(raw, 0, raw.Length); comp = ms.ToArray(); } // ZLibStream=RFC1950(zlib 头 0x78+adler32)，/FlateDecode 规范要求；DeflateStream 产裸 DEFLATE(RFC1951 无头)→查看器无法解码
+                        var head = "<< /Type /XObject /Subtype /Image /Width " + w + " /Height " + h +
+                                   " /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /FlateDecode /DecodeParms << /Predictor 15 /Colors 3 /BitsPerComponent 8 /Columns " + w + " >> /Length " + comp.Length + " >>\nstream\n";
+                        var body = new byte[head.Length + comp.Length + "\nendstream".Length];
+                        var hb = Encoding.ASCII.GetBytes(head);
+                        Buffer.BlockCopy(hb, 0, body, 0, hb.Length);
+                        Buffer.BlockCopy(comp, 0, body, hb.Length, comp.Length);
+                        var tb = Encoding.ASCII.GetBytes("\nendstream");
+                        Buffer.BlockCopy(tb, 0, body, hb.Length + comp.Length, tb.Length);
+                        objs.Add((baseNum, body));
+                    }
+                    catch
+                    {
+                        objs.Add((baseNum, Encoding.ASCII.GetBytes("<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Length 3 >>\nstream\n\xff\xff\xff\nendstream")));
+                    }
+                }
+                return objs;
+            }
+        });
+        CsAscii(cs, "q\n" + F(cmA) + " " + F(cmB) + " " + F(cmC) + " " + F(cmD) + " " + F(ex) + " " + F(ey) + " cm\n/" + name + " Do\nQ\n");
+    }
+
+    // PDF 底图引用（PDFUNDERLAY / PdfUnderlay）：将外部 PDF 页面按其正确尺寸绘制为引用占位框。
+    // 矢量嵌入（Form XObject）需递归资源导入，留待后续增强；此处先保证"显示引用位置/尺寸"，不再空白缺失。
+    private void EmitPdfUnderlayPdf(MemoryStream cs, PdfUnderlay pu, Transform2D tr, double scaleMul)
+    {
+        double pw = 595.276, ph = 841.89; // 默认 A4（pt）
+        string fpath = ResolveAssetPath(pu.Definition?.File);
+        if (!string.IsNullOrEmpty(fpath))
+        {
+            var mb = TryReadMediaBox(fpath);
+            if (mb != null) { pw = mb[2] - mb[0]; ph = mb[3] - mb[1]; }
+        }
+        // AutoCAD 将 PDF 页面 1pt 视为 1/72 inch 放入图纸（单位=inch 时）。
+        double sx = pu.XScale * (1.0 / 72.0), sy = pu.YScale * (1.0 / 72.0);
+        var ip = pu.InsertPoint;
+        (double X, double Y) P(double x, double y)
+        {
+            if (tr == null) return (x, y);
+            var p = tr.Apply(x, y); return (p.Item1, p.Item2);
+        }
+        var a0 = P(ip.X, ip.Y);
+        var a10 = P(ip.X + pw * sx, ip.Y);
+        var a01 = P(ip.X, ip.Y + ph * sy);
+        double ex = Sx(a0.X), ey = Py(a0.Y);
+        double cmA = Sx(a10.X) - ex, cmB = Py(a10.Y) - ey;
+        double cmC = Sx(a01.X) - ex, cmD = Py(a01.Y) - ey;
+        PdfQuadOutline(cs, ex, ey, cmA, cmB, cmC, cmD, "#6699cc");
+        RecordSkip("PDFUNDERLAY(降级边框)");
+        _log("ℹ️  PDF 底图引用已渲染为占位框: " + (pu.Definition?.File ?? "?") + " P" + (pu.Definition?.Page ?? ""));
+    }
+
     // PDF HATCH（实心=rg f/f*；渐变=Type2 轴向 / Type3 径向 shading，/Sh<n> sh）
     private void EmitHatchPdf(MemoryStream cs, Hatch ht, Transform2D tr, double scaleMul, short layerAci, short byBlockAci)
     {
@@ -834,25 +1039,145 @@ internal partial class ImageEngine
         string d = BuildPathDPdf(loops, x => Sx(x), y => Py(y));
         if (gradient)
         {
-            int slot = _pdfShadingSeq++;
-            if (slot >= MaxPdfShadings)
+            var gradSpec = MakeHatchGradSpec(gp);
+            if (gradSpec.Kind == HatchGradKind.Linear)
             {
-                CsAscii(cs, HexToRgbPdf(StopHex(gp.Colors[0].Color)) + " rg\n" + d + rule + "\n"); // 超限降级首色
-                RecordSkip("HATCH(渐变超限)");
-                return;
+                // 线性渐变：PDF 矢量 shading（Type2 轴向 / Type3 径向 + FunctionType 2 双端线性）可精确表达，
+                // 保持矢量——边缘锐利、文件极小、无锯齿。sh 受【当前裁剪路径】约束（Table 4.27），
+                // 正确工业标准模式(iText/FOP)：q → 构造路径 → W n(设裁剪路径,不填充不描边) → /ShN sh → Q。
+                int slot = _pdfShadingSeq++;
+                if (slot >= MaxPdfShadings)
+                {
+                    CsAscii(cs, HexToRgbPdf(StopHex(gp.Colors[0].Color)) + " rg\n" + d + rule + "\n"); // 超限降级首色
+                    RecordSkip("HATCH(渐变超限)");
+                    return;
+                }
+                _pdfShadings[slot] = MakePdfShading(loops, gp);
+                CsAscii(cs, "q\n" + d + "W n\n/Sh" + slot + " sh\nQ\n");
             }
-            _pdfShadings[slot] = MakePdfShading(loops, gp);
-            // PDF sh 操作符渲染 shading 是【受当前裁剪路径约束】(Table 4.27: "subject to the current
-            // clipping path")，不是"当前填充路径"——旧注释理解错误。正确工业标准模式(iText/FOP/pagyra-js)：
-            //   q → 构造路径 → W n(设为裁剪路径,不填充不描边) → /ShN sh(裁剪区内渲染) → Q。
-            // 旧实现只写 path+sh(无 W n)→ 裁剪路径未限定到 HATCH 区域 → 查看器 sh 无有效裁剪 → 渐变空白
-            // (边框是 S 描边不依赖裁剪所以正常显示)。q/Q 包裹使裁剪路径局部化，Q 恢复避免影响后续实体。
-            CsAscii(cs, "q\n" + d + "W n\n/Sh" + slot + " sh\nQ\n");
+            else
+            {
+                // 非线性渐变（SPHERICAL/HEMISPHERICAL/CYLINDER/CURVED，含 INV 取反）：
+                // FunctionType 2 只能做 C0→C1 双端【线性】插值，无法表达 LUT 钟形/峰谷剖面 → PDF 会画成
+                // 与 PNG/SVG 不同的错误形状（实测 PNG 蓝块 166 色钟形，PDF 矢量线性仅端点近似）。
+                // 改用与 PNG【完全一致】的 RasterCanvas.FillGradientProfile + 33 点 LUT 剖面光栅化，
+                // 嵌入为"路径裁剪的图像 XObject"→ 三引擎渐变像素级一致。线性仍走矢量（见上）。
+                EmitHatchGradientRasterPdf(cs, d, loops, gp, gradSpec);
+            }
         }
         else
         {
             CsAscii(cs, HexToRgbPdf(HatchSolidFillHex(ht, layerAci, byBlockAci)) + " rg\n" + d + rule + "\n");
         }
+    }
+
+    // 非线性渐变 HATCH（PDF）：用与 PNG 完全一致的 RasterCanvas.FillGradientProfile + 33 点 LUT 剖面
+    // 光栅化为 RGBA，嵌入为"路径裁剪的图像 XObject"（q → 路径 W n 裁剪 → cm 定位图像 → /ImN Do → Q）。
+    // 图像像素分辨率 = 渐变 bbox 尺寸 × OutputZoom（与整页渲染密度一致，1:1 像素对齐）。
+    private void EmitHatchGradientRasterPdf(MemoryStream cs, string d, List<List<XY>> loops, HatchGradientPattern gp, HatchGradSpec gradSpec)
+    {
+        double zoom = _opt.OutputZoom > 0 ? _opt.OutputZoom : 1.0;
+        // 渐变 bbox（PDF 画布系，Py y 向上不翻转）
+        double cMinX = double.MaxValue, cMaxX = double.MinValue, cMinY = double.MaxValue, cMaxY = double.MinValue;
+        foreach (var loop in loops)
+            foreach (var p in loop)
+            {
+                double px = Sx(p.X), py = Py(p.Y);
+                if (px < cMinX) cMinX = px; if (px > cMaxX) cMaxX = px;
+                if (py < cMinY) cMinY = py; if (py > cMaxY) cMaxY = py;
+            }
+        int w = Math.Max(1, (int)Math.Round((cMaxX - cMinX) * zoom));
+        int h = Math.Max(1, (int)Math.Round((cMaxY - cMinY) * zoom));
+        const int MaxGradSide = 4096;
+        if (w > MaxGradSide || h > MaxGradSide || (long)w * h > 16_000_000L)
+        {
+            double f = Math.Min(Math.Min(MaxGradSide / (double)w, MaxGradSide / (double)h),
+                                (long)w * h > 16_000_000L ? Math.Sqrt(16_000_000L / ((double)w * h)) : 1.0);
+            w = Math.Max(1, (int)(w * f)); h = Math.Max(1, (int)(h * f));
+        }
+        var rc = new RasterCanvas(w, h);
+        rc.Clear(0, 0, 0, 0); // 背景透明（裁剪外区域不绘制）
+        // 轮廓 → 像素：局部原点=渐变 bbox 左下(PDF)，行 0=顶(PDF y 向上→像素 y 向下)
+        double kw = w / Math.Max(1e-9, (cMaxX - cMinX));
+        double kh = h / Math.Max(1e-9, (cMaxY - cMinY));
+        var contours = new List<List<RasterCanvas.P>>();
+        bool evenOdd = loops.Count > 1; // 多环用奇偶规则（与 PNG/SVG 一致）
+        foreach (var loop in loops)
+        {
+            if (loop.Count < 3) continue;
+            var c = new List<RasterCanvas.P>(loop.Count);
+            foreach (var p in loop)
+            {
+                double px = Sx(p.X), py = Py(p.Y);
+                float lx = (float)((px - cMinX) * kw);          // 局部 x（0..w）
+                float ly = (float)((cMaxY - py) * kh);          // 局部 y（0..h，顶=0）
+                c.Add(new RasterCanvas.P(lx, ly));
+            }
+            contours.Add(c);
+        }
+        if (contours.Count == 0) { RecordSkip("HATCH(渐变光栅空)"); return; }
+        // 渐变几何（PDF 画布系，Py y 向上→yDown=false，与 MakePdfShading 一致）
+        double ang = gp.Angle;
+        double ux = Math.Cos(ang), uy = Math.Sin(ang);
+        var geom = ComputeHatchGradGeom(gradSpec, cMinX, cMinY, cMaxX, cMaxY, ux, uy, false);
+        // 几何（画布系）→ 局部像素系：x=(X-cMinX)*kw，y=(cMaxY-Y)*kh
+        (float lx, float ly) Loc(double X, double Y) => ((float)((X - cMinX) * kw), (float)((cMaxY - Y) * kh));
+        var c1 = HexToRgb(StopHex(gradSpec.C1));
+        var c2 = HexToRgb(StopHex(gradSpec.C2));
+        var prof = new Func<float, float>(u => (float)HatchGradProfileLut(gradSpec, u));
+        if (geom.Radial)
+        {
+            var (fx, fy) = Loc(geom.Fx, geom.Fy);
+            float r = (float)(geom.R * kh); // 半径：y 像素/k 单位；x/y 像素密度相同(方形 bbox 假设)→用 kh
+            rc.FillGradientProfile(contours, evenOdd, new RasterCanvas.P(0, 0), new RasterCanvas.P(0, 0),
+                                   c1, c2, true, fx, fy, r, prof);
+        }
+        else
+        {
+            var (ax, ay) = Loc(geom.Px0, geom.Py0);
+            var (bx, by) = Loc(geom.Px1, geom.Py1);
+            rc.FillGradientProfile(contours, evenOdd, new RasterCanvas.P(ax, ay), new RasterCanvas.P(bx, by),
+                                   c1, c2, false, 0, 0, 0, prof);
+        }
+        // 打包为 RGB（丢弃 alpha，裁剪外=透明，由路径裁剪决定可见区）
+        var rgba = rc.ToRgbaBuffer();
+        var raw = new byte[w * h * 3 + h];
+        int o = 0;
+        for (int y = 0; y < h; y++)
+        {
+            raw[o++] = 0; // 每行 PNG Up 预测器 filter byte = 0
+            int baseIdx = (y * w) * 4;
+            for (int x = 0; x < w; x++)
+            {
+                int si = baseIdx + x * 4;
+                raw[o++] = rgba[si]; raw[o++] = rgba[si + 1]; raw[o++] = rgba[si + 2];
+            }
+        }
+        byte[] comp;
+        using (var ms = new MemoryStream()) { using (var zs = new ZLibStream(ms, CompressionLevel.Optimal, true)) zs.Write(raw, 0, raw.Length); comp = ms.ToArray(); } // ZLibStream=RFC1950(zlib 头 0x78+adler32)，/FlateDecode 规范要求；DeflateStream 产裸 DEFLATE(RFC1951 无头)→查看器无法解码
+        string name = "GIm" + _pdfXObjSeq++;
+        _pdfXObjRegs.Add(new PdfXObjReg
+        {
+            Name = name,
+            Build = (baseNum) =>
+            {
+                var head = "<< /Type /XObject /Subtype /Image /Width " + w + " /Height " + h +
+                           " /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /FlateDecode " +
+                           "/DecodeParms << /Predictor 15 /Colors 3 /BitsPerComponent 8 /Columns " + w + " >> /Length " + comp.Length + " >>\nstream\n";
+                var body = new byte[head.Length + comp.Length + "\nendstream".Length];
+                var hb = Encoding.ASCII.GetBytes(head);
+                Buffer.BlockCopy(hb, 0, body, 0, hb.Length);
+                Buffer.BlockCopy(comp, 0, body, hb.Length, comp.Length);
+                var tb = Encoding.ASCII.GetBytes("\nendstream");
+                Buffer.BlockCopy(tb, 0, body, hb.Length + comp.Length, tb.Length);
+                return new List<(int, byte[])> { (baseNum, body) };
+            }
+        });
+        // 内容流：路径裁剪 → 图像平移到 bbox 左下、缩放到 bbox 尺寸 → Do
+        CsAscii(cs, "q\n" + d + "W n\n"
+                   + F(cMaxX - cMinX) + " 0 0 " + F(cMaxY - cMinY) + " " + F(cMinX) + " " + F(cMinY) + " cm\n"
+                   + "/" + name + " Do\nQ\n");
+        _log("ℹ️  PDF 非线性渐变光栅化嵌入: " + (gp?.Name ?? "?") + " " + w + "×" + h);
     }
 
     // 计算 PDF shading 参数（坐标为 PDF 用户空间，y 向上）。

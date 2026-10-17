@@ -16,7 +16,7 @@ public static class FullPdfExporter
 {
     /// <summary>导出 ACadSharp 文档的模型空间为 PDF。</summary>
     /// <returns>成功=含画布像素与数据包围盒（供生成坐标 JSON）；失败=Success=false。</returns>
-    public static ImageExportResult Export(CadDocument doc, string outPath, ImageConfiguration options = null)
+    public static ImageExportResult Export(CadDocument doc, string outPath, ImageConfiguration options = null, string sourceFilePath = null)
     {
         if (doc == null || string.IsNullOrEmpty(outPath))
             return new ImageExportResult { Success = false };
@@ -24,6 +24,7 @@ public static class FullPdfExporter
         try
         {
             var engine = new ImageEngine(doc, options);
+            engine.SourceFilePath = sourceFilePath;
             return engine.WritePdf(outPath);
         }
         catch (Exception ex)

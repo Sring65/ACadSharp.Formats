@@ -333,6 +333,10 @@ internal sealed class RasterCanvas
     }
 
     /// <summary>将当前像素缓冲编码为 PNG 写出。失败返回 false。</summary>
+    /// <summary>导出 RGBA8 原始像素缓冲（长度 W*H*4，行优先，原点左上）。
+    /// 供 PDF 引擎把光栅化渐变嵌入为 /Subtype /Image XObject（复用与 PNG 完全一致的填充结果）。</summary>
+    public byte[] ToRgbaBuffer() => (byte[])_px.Clone();
+
     public bool SavePng(string path)
     {
         try

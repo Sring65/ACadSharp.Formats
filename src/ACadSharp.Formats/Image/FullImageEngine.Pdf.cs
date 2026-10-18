@@ -784,14 +784,17 @@ internal partial class ImageEngine
         double Tx = Sx(ox), Ty = Py(oy);
         double penW = Math.Max(0.05, fs * 0.04); // 笔画宽（用户单位）
 
-        // 局部点（基线原点 / 数据单位 / y 上）→ PDF 用户坐标（与文本 Tm 同：em=gx/H，先 Scale(wf) 再 Skew(tk) 再 R）
+        // 局部点（基线原点 / 数据单位 / y 上）→ PDF 用户坐标（与文本 Tm 同：em=gx/H，先 Scale(wf) 再 Skew(tk) 再 R）。
+        // 关键：em 位移须【乘回字号 fs（PDF 单位）】——局部点经 /H 归一化到 em(cap=1)后，若直接加到 PDF
+        // 坐标只得到 ~1 PDF 单位/em（偏小 fs≈H 倍）；乘 fs=H·scaleMul 后与 TTF 路径（Tf fs）及 PNG 端
+        // DrawShxRunPng（Lx=(lx/H)*fs*wf、Ly=-(ly/H)*fs）一致。
         void ToUser(double lx, double ly, out double UX, out double UY)
         {
             double gx = lx / H, gy = ly / H;
             double ex = gx * wf + tk * gy;
             double ey = gy;
-            UX = Tx + (ca * ex - sa * ey);
-            UY = Ty + (sa * ex + ca * ey);
+            UX = Tx + (ca * ex - sa * ey) * fs;
+            UY = Ty + (sa * ex + ca * ey) * fs;
         }
 
         var cur = new List<(double X, double Y)>();

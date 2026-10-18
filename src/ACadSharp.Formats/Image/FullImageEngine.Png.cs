@@ -675,7 +675,7 @@ internal partial class ImageEngine
             }
         }
         var penCol = HexToRgb(col);
-        float pw = (float)Math.Max(0.0, w * PngK);
+        float pw = (float)Math.Max(1.0, w * PngK);
         foreach (var pl in pb.ToPolylines(false))
             if (pl.Count >= 2) _rc.StrokePolyline(pl, false, pw, penCol);
     }
@@ -704,7 +704,10 @@ internal partial class ImageEngine
     {
         if (pts == null || pts.Count < 2 || _rc == null) return;
         var colRgb = HexToRgb(col);
-        float widthPx = (float)Math.Max(0.0, w * PngK);
+        // 保底 1px：描边带半宽 h=w/2，ScanFill 在像素中心线(py+0.5)采样；
+        // 亚像素(<1px)描边带可能整体落在两条采样线之间 → 零像素覆盖 → 整条线被丢弃
+        // （低分辨率下 MLine/PolygonMesh/细多段线部分消失的根因，与 EmitPointPng 同款处理）。
+        float widthPx = (float)Math.Max(1.0, w * PngK);
         bool dashed = dash != null && dash.Length > 0;
         if (dashed)
         {
@@ -789,7 +792,7 @@ internal partial class ImageEngine
         WalkPatternPx(pb, pts, cum, pat, texts);
         if (pb.IsEmpty && texts.Count == 0) return false;
         var colRgb = HexToRgb(col);
-        float widthPx = (float)Math.Max(0.0, w * PngK);
+        float widthPx = (float)Math.Max(1.0, w * PngK);
         foreach (var pl in pb.ToPolylines(false))
             if (pl.Count >= 2) _rc.StrokePolyline(pl, false, widthPx, colRgb);
         // 文字段：用 TTF 实心字形渲染（rotCanvas 传 -数据系角）
@@ -1341,7 +1344,8 @@ internal partial class ImageEngine
         string col = HatchSolidFillHex(ht, layerAci, byBlockAci);
         double w = Math.Max(0.03, 0.1 * scaleMul);
         var colRgb = HexToRgb(col);
-        float widthPx = (float)(w * PngK);
+        // 保底 1px：图案线在低分辨率下 w*PngK 可能 <1px，亚像素描边带落在两行像素采样线之间会被整段丢弃
+        float widthPx = (float)Math.Max(1.0, w * PngK);
         foreach (var s in segs)
         {
             var pp = new List<RasterCanvas.P> {

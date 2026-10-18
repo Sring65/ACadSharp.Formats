@@ -2535,8 +2535,9 @@ internal partial class ImageEngine
     // 旧 ResolveFontFamily 把所有 .shx 映射 null→SimSun（比例字体），而 txt.shx 是等宽（数字 0.75em）、
     // SimSun 数字仅 0.5em → 拉丁/数字标签比 AutoCAD 短 25~45%，居中/右对齐文字锚点漂移。
     // 修法：SHX 样式改用真实 SHX 笔迹路径（ShxFont 字形 + advance）渲染，与 AutoCAD 完全一致。
-    // unifont（txt.shx）按字符码取字形；bigfont（Hztxt.shx）按 GBK 双字节取字形；em=UnitsPerEm，
-    // 字高 H 对应 em 盒 → 缩放 s=H/em，基线 y=0 与数据系同向。TTF 样式（.ttf）仍走原系统字体路径。
+    // unifont（txt.shx）按字符码取字形；bigfont（Hztxt.shx）按 GBK 双字节取字形；em=UnitsPerEm。
+    // 字高 H 对应【大写字母高度 cap height = above 区】→ 缩放 s=H/above（见 ShxHeightScale，非 H/em），
+    // 基线 y=0 与数据系同向。TTF 样式（.ttf）仍走原系统字体路径。
 
     // GBK 编码（bigfont CJK → 双字节码）；CodePages 包不可用时返回 null（调用方回退 TTF 路径，不劣化）。
     private static System.Text.Encoding _shxGbk;
@@ -2588,7 +2589,7 @@ internal partial class ImageEngine
     //   out Type  : 逐指令类型（0=Move 1=Line 2=Quad 3=Cubic），与 GlyphRec.Type 同序
     //   out Pts   : 与 Type 一一对应的控制点数组（[x,y] / [cx,cy,ex,ey] / [c1x,c1y,c2x,c2y,ex,ey]），世界坐标（数据单位）
     //   out PenWidth : 笔画宽度（数据单位，三端描边用）
-    // 算法：① 逐字符取 unifont/bigront 字形（局部：基线 y=0、+x 右，字体单位）→ 数据单位局部点（缩放 s=H/em、宽因子 wf 只乘一次）；
+    // 算法：① 逐字符取 unifont/bigront 字形（局部：基线 y=0、+x 右，字体单位）→ 数据单位局部点（缩放 s=H/above、宽因子 wf 只乘一次）；
     //       ② 局部总宽 W 作 widthOverride 传给 TextBaseline 得基线左端 (bx,by) 与总旋转 brot（含块变换）；
     //       ③ 局部点绕 (bx,by) 旋转 brot 得世界点。
     private (List<int> Type, List<double[]> Pts, double PenWidth)? TryBuildShxTextWorld(TextEntity t, Transform2D tr, double scaleMul)
@@ -2625,7 +2626,7 @@ internal partial class ImageEngine
                 face = cjk; code = (gb[0] << 8) | gb[1];
             }
             int em = face.UnitsPerEm > 0 ? face.UnitsPerEm : 1;
-            double s = H / em;                          // 数据单位 / 该面字体单位
+            double s = ShxHeightScale(face, H);         // 数据单位 / 该面字体单位（cap height 映射 H，见 ShxHeightScale）
             bool hasAdv = face.TryGetAdvance(code, out float advF);
             double advData = (hasAdv ? advF : 0.7 * em) * s; // 该字符 advance（数据单位）
             var g = new GlyphRec();
@@ -2681,6 +2682,16 @@ internal partial class ImageEngine
         // 复杂线型 SHX 字形一致），Fit 时随 bscale 等比缩放。线宽缺失/为 0 时 StrokeWidth 兜底最小 0.1。
         double penW = StrokeWidth(t, scaleMul) * bscale;
         return (wtype, wpts, penW);
+    }
+
+    // SHX 字高缩放（三引擎共用）：AutoCAD 约定「文字高度 H = 大写字母高度 cap height = above 区」，
+    // 故 s = H/above（**非** H/(above+below)）。这使 SHX 同高度比 TTF 略大（cap 映射到 H，而非整个 em 盒），
+    // 与实测一致：simplex H=7.5 时「This is a sample」须换行（AutoCAD 6 行）→ 需 s∈(0.295,0.385]，
+    // H/above=0.357 命中、H/em=0.268 偏低（→4 行）。above<=0（个别 bigfont 设计缺陷，如 gbcbig）回退 em。
+    private static double ShxHeightScale(ShxFont face, double H)
+    {
+        int denom = face.Above > 0 ? face.Above : (face.UnitsPerEm > 0 ? face.UnitsPerEm : 1);
+        return H / denom;
     }
 
     // ---- MTEXT 逐 run SHX 笔迹（基础样式 simplex.shx / \Fsimplex 等）----
@@ -2741,7 +2752,7 @@ internal partial class ImageEngine
             }
             else { face = latin; code = ch; } // 非 CJK 一律走 latin SHX 原始码位（含 0xB0°/0x2205∅ 等 CAD 符号；缺字形仅留 0.7em 间隙，不崩）
             int em = face.UnitsPerEm > 0 ? face.UnitsPerEm : 1;
-            double s = H / em;
+            double s = ShxHeightScale(face, H);         // cap height 映射 H（见 ShxHeightScale），非 H/em
             bool hasAdv = face.TryGetAdvance(code, out float advF);
             double advData = (hasAdv ? advF : 0.7 * em) * s;
             var g = new GlyphRec();
@@ -2801,7 +2812,7 @@ internal partial class ImageEngine
             }
             else { face = latin; code = ch; } // 非 CJK 一律走 latin SHX 原始码位（含 0xB0°/0x2205∅ 等 CAD 符号；缺字形仅留 0.7em 间隙，不崩）
             int em = face.UnitsPerEm > 0 ? face.UnitsPerEm : 1;
-            double s = H / em;
+            double s = ShxHeightScale(face, H);         // cap height 映射 H（见 ShxHeightScale），非 H/em
             bool hasAdv = face.TryGetAdvance(code, out float advF);
             penX += (hasAdv ? advF : 0.7 * em) * s;
         }
@@ -3295,10 +3306,21 @@ internal partial class ImageEngine
             {
                 string eFont = !string.IsNullOrEmpty(run.Font) ? run.Font : styleFont;
                 string eBig = string.IsNullOrEmpty(run.Font) ? styleBig : null;
-                double fw = TryShxRunAdvance(eFont, eBig, t, run.Height, run.WidthFactor > 0 ? run.WidthFactor : 1.0, out double w) ? w
-                    : EstimateTextWidth(t, run.Height) * (run.WidthFactor > 0 ? run.WidthFactor : 1.0)
-                      + MTextTrackingAdd(run, t.Length);
-                if (hasText && curW + fw > refWidth) FlushCur();
+                double wf = run.WidthFactor > 0 ? run.WidthFactor : 1.0;
+                double fw = TryShxRunAdvance(eFont, eBig, t, run.Height, wf, out double wFull) ? wFull
+                    : EstimateTextWidth(t, run.Height) * wf + MTextTrackingAdd(run, t.Length);
+                // 换行判定用【去掉尾随空白】的宽：行尾空白 AutoCAD 不渲染、不计入列宽
+                // （否则「multiline text.」恰好 80 单位时会因尾随空格被误判越界而提前断行）。
+                // curW 仍累加整段宽 fw（含尾随空白）作为下一词的分隔。
+                double fwText = fw;
+                string tTrim = t.TrimEnd();
+                if (tTrim.Length != t.Length)
+                {
+                    if (tTrim.Length == 0) fwText = 0;
+                    else fwText = TryShxRunAdvance(eFont, eBig, tTrim, run.Height, wf, out double wT) ? wT
+                        : EstimateTextWidth(tTrim, run.Height) * wf + MTextTrackingAdd(run, tTrim.Length);
+                }
+                if (hasText && curW + fwText > refWidth) FlushCur();
                 if (!string.IsNullOrWhiteSpace(t)) hasText = true;
                 cur.Add((t, run));
                 curW += fw;

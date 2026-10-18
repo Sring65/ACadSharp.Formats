@@ -691,8 +691,20 @@ internal partial class ImageEngine
         short insLayerAci = 7;
         try { insLayerAci = LayerAciIndex(ins.Layer); } catch { }
         double childLtMul = ltMul * BlockScaleOf(ins);
+        // 块内实体。ATTDEF（属性定义/模板，默认值）不在此画——它只是属性模板；
+        // 实际显示用 INSERT 跟随的 ATTRIB（ins.Attributes，本次插入的真实属性值，如 "17"）。
+        // 否则块定义里的默认值（如 "1"）会被当成文字画出来，覆盖真实属性值。
+        bool hasAttribs = ins.Attributes != null && ins.Attributes.Count > 0;
         foreach (var e in ins.Block.Entities)
+        {
+            if (hasAttribs && e is AttributeDefinition) continue; // 有实际属性值 → 跳过模板默认值
             EmitEntityPng(e, tr, tr.Scale, insAci, insDash, insPat, childLtMul, insLayerAci);
+        }
+        // 属性实际值（ATTRIB）：DXF 中其 InsertPoint 已是世界坐标（= INSERT 插入点 + 块变换），
+        // 故只受父层累积变换（parent），不再套本 INSERT 的 tr（否则平移/缩放会叠加两次）；字高仍随块缩放（tr.Scale）。
+        if (hasAttribs)
+            foreach (var att in ins.Attributes)
+                EmitEntityPng(att, parent, tr.Scale, insAci, insDash, insPat, childLtMul, insLayerAci);
     }
 
     #endregion

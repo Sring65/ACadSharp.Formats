@@ -37,6 +37,7 @@ internal partial class ImageEngine
     private Dictionary<string, LtpPattern> _ltypePattern;
     private readonly Dictionary<string, ShxFont?> _shxFonts = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, GlyphRec?> _glyphCache = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, double> _shxAscentCache = new(StringComparer.OrdinalIgnoreCase); // 实测字形最大 Y（BigFont CJK 缩放用）
 
     public ImageEngine(CadDocument doc, ImageConfiguration opt)
     {
@@ -2699,11 +2700,46 @@ internal partial class ImageEngine
     // SHX 字高缩放（三引擎共用）：AutoCAD 约定「文字高度 H = 大写字母高度 cap height = above 区」，
     // 故 s = H/above（**非** H/(above+below)）。这使 SHX 同高度比 TTF 略大（cap 映射到 H，而非整个 em 盒），
     // 与实测一致：simplex H=7.5 时「This is a sample」须换行（AutoCAD 6 行）→ 需 s∈(0.295,0.385]，
-    // H/above=0.357 命中、H/em=0.268 偏低（→4 行）。above<=0（个别 bigfont 设计缺陷，如 gbcbig）回退 em。
-    private static double ShxHeightScale(ShxFont face, double H)
+    // H/above=0.357 命中、H/em=0.268 偏低（→4 行）。
+    // **CJK BigFont 修正**：hztxt/hz 等 CJK 大字的实际字形 Y 超出声明 Above（hztxt Above=9 但字形到 10.58），
+    // 若仍用 H/Above 会偏大 ~17%。AutoCAD 对 CJK 的约定是 H = 完整 CJK 字格高度（≈实际字形最大 Y），
+    // 故对 BigFont 格式改用 denom = max(Above, 实测字形最大 Y)，使 CJK 字格高度映射到 H（GT 框高 = H 精确验证）。
+    // Unifont 拉丁（simplex/txt/romans）不受影响——其字形最大 Y ≈ Above（cap 约定正确）。
+    private double ShxHeightScale(ShxFont face, double H)
     {
-        int denom = face.Above > 0 ? face.Above : (face.UnitsPerEm > 0 ? face.UnitsPerEm : 1);
+        int above = face.Above;
+        // CJK BigFont：实测字形可能超出 Above（设计缺陷），取 max 修正。
+        if (face.Format == ShxFormat.BigFont && above > 0)
+        {
+            double measAscent = MeasuredShxAscent(face);
+            if (measAscent > above)
+                return H / measAscent; // 用实测最大 Y 替代声明 Above
+        }
+        int denom = above > 0 ? above : (face.UnitsPerEm > 0 ? face.UnitsPerEm : 1);
         return H / denom;
+    }
+
+    // 一次性测量 BigFont 中所有字形的最大 Y（字体单位），缓存结果。
+    // 用于修正 CJK 大字实际高度超出声明 Above 的缩放偏差（hztxt Above=9 但字形到 10.58）。
+    private double MeasuredShxAscent(ShxFont face)
+    {
+        string key = face.Name; // 字体定义记录里的字样名（唯一标识）
+        if (_shxAscentCache.TryGetValue(key, out double cached)) return cached;
+        double maxAscent = 0;
+        try
+        {
+            foreach (int code in face.Codes)
+            {
+                var sink = new GlyphRec();
+                if (face.TryGetGlyph(code, sink, ShxTextOrientation.Horizontal) && !sink.Empty)
+                {
+                    if (sink.MaxY > maxAscent) maxAscent = sink.MaxY; // GlyphRec 已逐点维护 MaxY
+                }
+            }
+        }
+        catch { }
+        _shxAscentCache[key] = maxAscent;
+        return maxAscent;
     }
 
     // ---- MTEXT 逐 run SHX 笔迹（基础样式 simplex.shx / \Fsimplex 等）----

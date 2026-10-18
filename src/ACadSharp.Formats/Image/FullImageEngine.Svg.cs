@@ -1955,6 +1955,10 @@ internal partial class ImageEngine
                 }
                 break;
 
+            case RasterImage ri:
+                EmitRasterImageSvg(sb, ri, tr);
+                break;
+
             case Arc a: // 必须先于 Circle（fork 继承关系）
                 {
                     string col = ColorOf(EntityAciIndex(ent), layerAci, byBlockAci);
@@ -2162,6 +2166,71 @@ internal partial class ImageEngine
                 RecordSkip(ent.GetType().Name);
                 break;
         }
+    }
+
+    // SVG 光栅图片（RasterImage）：外部图片以 data URI 内联为 <image>，用仿射矩阵把图像单位矩形
+    // 映射到 CAD 四边形（a0=左下 InsertPoint，a10=右下，a01=左上）。SVG 无原生解码，直接内联原文件字节；
+    // 浏览器原生渲染 JPEG/PNG。文件缺失或无法识别时降级为矩形边框 + 对角线。
+    private void EmitRasterImageSvg(StringBuilder sb, RasterImage ri, Transform2D tr)
+    {
+        var ip = ri.InsertPoint;
+        double W = ri.Size.X, H = ri.Size.Y;
+        var u = ri.UVector; var v = ri.VVector;
+        (double X, double Y) P(double x, double y) => tr == null ? (x, y) : tr.Apply(x, y);
+        var a0 = P(ip.X, ip.Y);
+        var a10 = P(ip.X + u.X * W, ip.Y + u.Y * W);
+        var a01 = P(ip.X + v.X * H, ip.Y + v.Y * H);
+        double a0x = Sx(a0.X), a0y = Sy(a0.Y);
+        double a10x = Sx(a10.X), a10y = Sy(a10.Y);
+        double a01x = Sx(a01.X), a01y = Sy(a01.Y);
+        string path = ResolveAssetPath(ri.Definition?.FileName);
+        if (string.IsNullOrEmpty(path))
+        {
+            SvgImageRectFallback(sb, a0x, a0y, a10x, a10y, a01x, a01y, "#888888");
+            RecordSkip("IMAGE(文件缺失)");
+            _log("⚠️  IMAGE 图片文件缺失，降级为边框: " + (ri.Definition?.FileName ?? "?"));
+            return;
+        }
+        byte[] bytes = File.ReadAllBytes(path);
+        string mime = "image/png";
+        if (bytes.Length > 3 && bytes[0] == 0xFF && bytes[1] == 0xD8) mime = "image/jpeg";
+        else if (bytes.Length > 8 && bytes[0] == 0x89 && bytes[1] == 0x50) mime = "image/png";
+        int iw = 0, ih = 0;
+        var jpg = RasterHelpers.ProbeJpeg(bytes);
+        if (jpg != null) { iw = jpg.Width; ih = jpg.Height; }
+        else { try { var d = RasterHelpers.DecodePngToRgb(bytes); iw = d.width; ih = d.height; } catch { } }
+        if (iw <= 0 || ih <= 0)
+        {
+            SvgImageRectFallback(sb, a0x, a0y, a10x, a10y, a01x, a01y, "#888888");
+            RecordSkip("IMAGE(无法读取)");
+            _log("⚠️  IMAGE 图片无法识别，降级为边框: " + path);
+            return;
+        }
+        string b64 = Convert.ToBase64String(bytes);
+        // 矩阵：SVG <image> 局部 (0,0)=图像顶行左 → a01(左上)；(IW,0)=顶行右 → a11(右上)；(0,IH)=底行左 → a0(左下)
+        // SVG 局部 v 向下(row 增加向下)，故图像底行(底左)应映射到 a0，垂直向量取 (a0-a01)（注意符号，与 PDF y 向上相反）
+        double m = (a10x - a0x) / iw;
+        double bb = (a10y - a0y) / iw;
+        double c = (a0x - a01x) / ih;
+        double dd = (a0y - a01y) / ih;
+        double e = a01x, f = a01y;
+        sb.Append("  <image x=\"0\" y=\"0\" width=\"").Append(iw).Append("\" height=\"").Append(ih)
+          .Append("\" preserveAspectRatio=\"none\" transform=\"matrix(")
+          .Append(F(m)).Append(' ').Append(F(bb)).Append(' ').Append(F(c)).Append(' ')
+          .Append(F(dd)).Append(' ').Append(F(e)).Append(' ').Append(F(f))
+          .Append(")\" href=\"data:").Append(mime).Append(";base64,").Append(b64).Append("\"/>\n");
+    }
+
+    // SVG 图片降级：用四边形边框 + 对角线表示图片位置/尺寸
+    private void SvgImageRectFallback(StringBuilder sb, double a0x, double a0y, double a10x, double a10y, double a01x, double a01y, string col)
+    {
+        double a11x = a10x + a01x - a0x, a11y = a10y + a01y - a0y;
+        sb.Append("  <polygon points=\"")
+          .Append(F(a0x)).Append(',').Append(F(a0y)).Append(' ')
+          .Append(F(a10x)).Append(',').Append(F(a10y)).Append(' ')
+          .Append(F(a11x)).Append(',').Append(F(a11y)).Append(' ')
+          .Append(F(a01x)).Append(',').Append(F(a01y))
+          .Append("\" fill=\"none\" stroke=\"").Append(col).Append("\" stroke-width=\"0.5\"/>\n");
     }
 
     // 构建 SHX Shape 实体的 path d 串（世界坐标 → fx/fy 映射）。AutoCAD shape 变换：

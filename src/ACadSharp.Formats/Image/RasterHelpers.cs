@@ -177,4 +177,362 @@ internal static class RasterHelpers
         return outms.ToArray();
     }
     #endregion
+
+    #region ===== JPEG 解码（baseline / 扩展序列 Huffman → RGBA，零外部依赖）=====
+
+    /// <summary>统一解码入口：自动识别 JPEG / PNG，统一输出 RGBA（长度 w*h*4，行优先，原点左上）。
+    /// 供 PNG 引擎把光栅图像（RasterImage）绘制到软件光栅化缓冲。失败抛异常。</summary>
+    public static (int width, int height, byte[] rgba) DecodeToRgba(byte[] img)
+    {
+        if (img != null && img.Length > 3 && img[0] == 0xFF && img[1] == 0xD8)
+            return DecodeJpegToRgba(img);
+        var (w, h, ch, pix) = DecodePngToRgb(img);
+        byte[] rgba = new byte[w * h * 4];
+        if (ch == 4) Array.Copy(pix, rgba, pix.Length);
+        else for (int i = 0, j = 0; i < pix.Length; i += ch, j += 4)
+        { rgba[j] = pix[i]; rgba[j + 1] = pix[i + 1]; rgba[j + 2] = pix[i + 2]; rgba[j + 3] = 255; }
+        return (w, h, rgba);
+    }
+
+    /// <summary>解码 baseline / 扩展序列（Huffman）JPEG 为 RGBA。不支持算术编码 / 渐进式（将抛异常，由调用方降级）。</summary>
+    public static (int width, int height, byte[] rgba) DecodeJpegToRgba(byte[] jpg)
+    {
+        if (jpg == null || jpg.Length < 2 || jpg[0] != 0xFF || jpg[1] != 0xD8) throw new Exception("非 JPEG");
+        int p = 2;
+        int width = 0, height = 0, nComp = 0;
+        var compId = new int[4];
+        var compH = new int[4];
+        var compV = new int[4];
+        var compQ = new int[4];
+        var quant = new short[4][];
+        var huffDC = new HuffTable[4];
+        var huffAC = new HuffTable[4];
+        var scanComp = new int[4];
+        var scanDc = new int[4];
+        var scanAc = new int[4];
+        int scanN = 0, restartInterval = 0;
+        bool sof = false;
+
+        while (p + 1 < jpg.Length)
+        {
+            if (jpg[p] != 0xFF) { p++; continue; }
+            int marker = jpg[p + 1];
+            if (marker == 0xFF) { p++; continue; }
+            if (marker == 0xD8) { p += 2; continue; }            // SOI
+            if (marker == 0xD9) break;                           // EOI
+            if (marker >= 0xD0 && marker <= 0xD7) { p += 2; continue; } // RSTn
+            if (p + 4 >= jpg.Length) break;
+            int len = (jpg[p + 2] << 8) | jpg[p + 3];
+            int segStart = p + 4;
+            int segEnd = p + 2 + len;
+
+            if (marker == 0xDB) // DQT
+            {
+                int q = segStart;
+                while (q + 1 < segEnd)
+                {
+                    int pqtq = jpg[q++];
+                    int prec = pqtq >> 4, tq = pqtq & 0x0F;
+                    var table = new short[64];
+                    for (int i = 0; i < 64; i++)
+                    {
+                        int val = prec == 0 ? jpg[q++] : (jpg[q++] << 8) | jpg[q++];
+                        table[ZigZag[i]] = (short)val; // 还原为自然顺序
+                    }
+                    quant[tq] = table;
+                }
+            }
+            else if (marker == 0xC0 || (marker >= 0xC1 && marker <= 0xCF && marker != 0xC4 && marker != 0xC8 && marker != 0xCC)) // SOFn
+            {
+                height = (jpg[segStart + 1] << 8) | jpg[segStart + 2];
+                width = (jpg[segStart + 3] << 8) | jpg[segStart + 4];
+                nComp = jpg[segStart + 5];
+                int q = segStart + 6;
+                for (int i = 0; i < nComp && i < 4; i++)
+                {
+                    compId[i] = jpg[q++];
+                    int hv = jpg[q++];
+                    compH[i] = hv >> 4; compV[i] = hv & 0x0F;
+                    compQ[i] = jpg[q++];
+                }
+                sof = true;
+            }
+            else if (marker == 0xC4) // DHT
+            {
+                int q = segStart;
+                while (q + 1 < segEnd)
+                {
+                    int tcTh = jpg[q++];
+                    int tc = tcTh >> 4, th = tcTh & 0x0F;
+                    int[] counts = new int[16];
+                    int total = 0;
+                    for (int i = 0; i < 16; i++) { counts[i] = jpg[q++]; total += counts[i]; }
+                    byte[] values = new byte[total];
+                    for (int i = 0; i < total; i++) values[i] = jpg[q++];
+                    var tbl = new HuffTable();
+                    tbl.Build(counts, values);
+                    if (tc == 0) huffDC[th] = tbl; else huffAC[th] = tbl;
+                }
+            }
+            else if (marker == 0xDD) // DRI
+            {
+                restartInterval = (jpg[segStart] << 8) | jpg[segStart + 1];
+            }
+            else if (marker == 0xDA) // SOS
+            {
+                scanN = jpg[segStart];
+                int q = segStart + 1;
+                for (int i = 0; i < scanN && i < 4; i++)
+                {
+                    int cid = jpg[q++];
+                    int tdta = jpg[q++];
+                    scanDc[i] = tdta >> 4; scanAc[i] = tdta & 0x0F;
+                    for (int k = 0; k < nComp; k++) if (compId[k] == cid) { scanComp[i] = k; break; }
+                }
+                if (!sof) throw new Exception("JPEG 缺少 SOF");
+                return DecodeScan(jpg, segEnd, width, height, nComp, compId, compH, compV, compQ,
+                    quant, huffDC, huffAC, scanComp, scanDc, scanAc, scanN, restartInterval);
+            }
+            p = segEnd;
+        }
+        throw new Exception("JPEG 未找到 SOS");
+    }
+
+    private static (int, int, byte[]) DecodeScan(byte[] jpg, int dataStart,
+        int width, int height, int nComp, int[] compId, int[] compH, int[] compV, int[] compQ,
+        short[][] quant, HuffTable[] huffDC, HuffTable[] huffAC, int[] scanComp, int[] scanDc, int[] scanAc, int scanN, int restartInterval)
+    {
+        int maxH = 1, maxV = 1;
+        for (int i = 0; i < nComp; i++) { if (compH[i] > maxH) maxH = compH[i]; if (compV[i] > maxV) maxV = compV[i]; }
+        int mcuW = maxH * 8, mcuH = maxV * 8;
+        int mcusX = (width + mcuW - 1) / mcuW;
+        int mcusY = (height + mcuH - 1) / mcuH;
+        var compWs = new int[nComp];
+        var compHs = new int[nComp];
+        for (int i = 0; i < nComp; i++) { compWs[i] = mcusX * compH[i] * 8; compHs[i] = mcusY * compV[i] * 8; }
+        var planes = new byte[nComp][];
+        for (int i = 0; i < nComp; i++) planes[i] = new byte[compWs[i] * compHs[i]];
+        var pred = new int[4];
+        var br = new BitReader(jpg, dataStart);
+        int mcuCount = 0;
+
+        for (int my = 0; my < mcusY; my++)
+        {
+            for (int mx = 0; mx < mcusX; mx++)
+            {
+                for (int s = 0; s < scanN; s++)
+                {
+                    int ci = scanComp[s];
+                    var dc = huffDC[scanDc[s]];
+                    var ac = huffAC[scanAc[s]];
+                    int h = compH[ci], v = compV[ci];
+                    for (int by = 0; by < v; by++)
+                    {
+                        for (int bx = 0; bx < h; bx++)
+                        {
+                            var blk = new float[64];
+                            int t = dc.DecodeHuff(br);
+                            int diff = t == 0 ? 0 : br.ReceiveExtend(t);
+                            pred[ci] += diff;
+                            blk[0] = pred[ci] * quant[compQ[ci]][0];
+                            int k = 1;
+                            while (k < 64)
+                            {
+                                int rs = ac.DecodeHuff(br);
+                                int r = rs >> 4, sval = rs & 0x0F;
+                                if (sval == 0)
+                                {
+                                    if (r == 15) { k += 16; continue; }
+                                    break; // EOB
+                                }
+                                k += r;
+                                if (k >= 64) break;
+                                blk[k] = br.ReceiveExtend(sval) * quant[compQ[ci]][k];
+                                k++;
+                            }
+                            var outp = IDCT(blk);
+                            int px = mx * h * 8 + bx * 8;
+                            int py = my * v * 8 + by * 8;
+                            for (int yy = 0; yy < 8; yy++)
+                            {
+                                int planeY = py + yy;
+                                if (planeY >= compHs[ci]) continue;
+                                for (int xx = 0; xx < 8; xx++)
+                                {
+                                    int planeX = px + xx;
+                                    if (planeX >= compWs[ci]) continue;
+                                    int val = (int)Math.Round(outp[yy * 8 + xx]) + 128;
+                                    if (val < 0) val = 0; else if (val > 255) val = 255;
+                                    planes[ci][planeY * compWs[ci] + planeX] = (byte)val;
+                                }
+                            }
+                        }
+                    }
+                }
+                mcuCount++;
+                if (restartInterval > 0 && mcuCount % restartInterval == 0)
+                {
+                    br.AlignByte();
+                    br.SkipMarker();
+                    for (int i = 0; i < nComp; i++) pred[i] = 0;
+                }
+            }
+        }
+
+        var rgba = new byte[width * height * 4];
+        if (nComp == 1)
+        {
+            for (int y = 0; y < height; y++)
+                for (int x = 0; x < width; x++)
+                {
+                    int sx = (int)((x * (double)compWs[0]) / width);
+                    int sy = (int)((y * (double)compHs[0]) / height);
+                    byte g = planes[0][sy * compWs[0] + sx];
+                    int o = (y * width + x) * 4;
+                    rgba[o] = rgba[o + 1] = rgba[o + 2] = g; rgba[o + 3] = 255;
+                }
+        }
+        else // YCbCr → RGB（JFIF 顺序 Y,Cb,Cr）
+        {
+            for (int y = 0; y < height; y++)
+                for (int x = 0; x < width; x++)
+                {
+                    int sx0 = (int)((x * (double)compWs[0]) / width), sy0 = (int)((y * (double)compHs[0]) / height);
+                    int sx1 = (int)((x * (double)compWs[1]) / width), sy1 = (int)((y * (double)compHs[1]) / height);
+                    int sx2 = (int)((x * (double)compWs[2]) / width), sy2 = (int)((y * (double)compHs[2]) / height);
+                    double Y = planes[0][sy0 * compWs[0] + sx0];
+                    double Cb = planes[1][sy1 * compWs[1] + sx1];
+                    double Cr = planes[2][sy2 * compWs[2] + sx2];
+                    int r = (int)(Y + 1.402 * (Cr - 128) + 0.5);
+                    int g = (int)(Y - 0.344136 * (Cb - 128) - 0.714136 * (Cr - 128) + 0.5);
+                    int b = (int)(Y + 1.772 * (Cb - 128) + 0.5);
+                    if (r < 0) r = 0; else if (r > 255) r = 255;
+                    if (g < 0) g = 0; else if (g > 255) g = 255;
+                    if (b < 0) b = 0; else if (b > 255) b = 255;
+                    int o = (y * width + x) * 4;
+                    rgba[o] = (byte)r; rgba[o + 1] = (byte)g; rgba[o + 2] = (byte)b; rgba[o + 3] = 255;
+                }
+        }
+        return (width, height, rgba);
+    }
+
+    private static readonly int[] ZigZag = {
+        0,1,8,16,9,2,3,10, 17,24,32,25,18,11,4,5,
+        12,19,26,33,40,48,41,34, 27,20,13,6,7,14,21,28,
+        35,42,49,56,57,50,43,36, 29,22,15,23,30,37,44,51,
+        58,59,52,45,38,31,39,46, 53,60,61,54,47,55,62,63 };
+
+    private static float[] IDCT(float[] c)
+    {
+        var tmp = new float[64];
+        for (int y = 0; y < 8; y++)
+            for (int x = 0; x < 8; x++)
+            {
+                double sum = 0;
+                for (int u = 0; u < 8; u++)
+                {
+                    double cu = u == 0 ? 0.70710678118654752 : 1.0;
+                    sum += cu * c[y * 8 + u] * Math.Cos((2 * x + 1) * u * Math.PI / 16.0);
+                }
+                tmp[y * 8 + x] = (float)(sum * 0.5);
+            }
+        var res = new float[64];
+        for (int x = 0; x < 8; x++)
+            for (int y = 0; y < 8; y++)
+            {
+                double sum = 0;
+                for (int v = 0; v < 8; v++)
+                {
+                    double cv = v == 0 ? 0.70710678118654752 : 1.0;
+                    sum += cv * tmp[v * 8 + x] * Math.Cos((2 * y + 1) * v * Math.PI / 16.0);
+                }
+                res[y * 8 + x] = (float)(sum * 0.5);
+            }
+        return res;
+    }
+
+    private sealed class HuffTable
+    {
+        private readonly int[] _mincode = new int[16];
+        private readonly int[] _maxcode = new int[16];
+        private readonly int[] _valptr = new int[16];
+        private byte[] _huffval;
+        public void Build(int[] bits, byte[] vals)
+        {
+            _huffval = vals;
+            int code = 0, k = 0;
+            for (int l = 0; l < 16; l++)
+            {
+                if (bits[l] == 0) { _maxcode[l] = -1; }
+                else
+                {
+                    _valptr[l] = k;
+                    _mincode[l] = code;
+                    code += bits[l];
+                    _maxcode[l] = code - 1;
+                    k += bits[l];
+                }
+                code <<= 1;
+            }
+        }
+        public int DecodeHuff(BitReader br)
+        {
+            int code = 0;
+            for (int l = 0; l < 16; l++)
+            {
+                int bit = br.ReadBit();
+                code = (code << 1) | bit;
+                if (_maxcode[l] >= 0 && code <= _maxcode[l])
+                    return _huffval[_valptr[l] + (code - _mincode[l])];
+            }
+            throw new Exception("Huffman 解码越界");
+        }
+    }
+
+    private sealed class BitReader
+    {
+        private readonly byte[] _data;
+        private int _bp;
+        private int _cache;
+        private int _cacheBits;
+        public BitReader(byte[] d, int start) { _data = d; _bp = start; _cache = 0; _cacheBits = 0; }
+        private int NextByte()
+        {
+            if (_bp >= _data.Length) return 0;
+            int b = _data[_bp++];
+            if (b == 0xFF)
+            {
+                int n = _bp < _data.Length ? _data[_bp] : 0;
+                if (n == 0x00) _bp++;            // 填充 0：0xFF 是真实数据
+                else if (n >= 0xD0 && n <= 0xD7) _bp++; // 重启标记（理论上已被对齐消费）
+            }
+            return b;
+        }
+        public int ReadBit()
+        {
+            if (_cacheBits == 0) { _cache = NextByte(); _cacheBits = 8; }
+            _cacheBits--;
+            return (_cache >> _cacheBits) & 1;
+        }
+        public int GetBits(int n)
+        {
+            int v = 0;
+            for (int i = 0; i < n; i++) v = (v << 1) | ReadBit();
+            return v;
+        }
+        public int ReceiveExtend(int s)
+        {
+            if (s == 0) return 0;
+            int v = GetBits(s);
+            if (v < (1 << (s - 1))) v += (-1 << s) + 1;
+            return v;
+        }
+        public void AlignByte() { _cacheBits = 0; _cache = 0; }
+        public void SkipMarker()
+        {
+            if (_bp < _data.Length && _data[_bp] == 0xFF) _bp++;
+            if (_bp < _data.Length) _bp++;
+        }
+    }
+    #endregion
 }

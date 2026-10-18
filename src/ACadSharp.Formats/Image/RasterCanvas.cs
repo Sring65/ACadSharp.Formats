@@ -284,6 +284,62 @@ internal sealed class RasterCanvas
         return p;
     }
 
+    /// <summary>把解码后的 RGBA 位图按任意平行四边形绘制到画布（仿射贴图 + 双线性采样）。
+    /// 顶点语义（画布像素系）：p0=左下(a0)、p10=右下(a10)、p01=左上(a01)；
+    /// 图像像素 (0,0)=左上 → p01，(IW,0)=右上 → p10，(0,IH)=左下 → p0（与 CAD 光栅图朝向一致）。</summary>
+    public void DrawImageParallelogram(int iw, int ih, byte[] rgba,
+        double p0x, double p0y, double p10x, double p10y, double p01x, double p01y)
+    {
+        if (iw <= 0 || ih <= 0 || rgba == null || rgba.Length < iw * ih * 4) return;
+        double A = (p10x - p0x) / iw;
+        double B = (p0x - p01x) / ih;
+        double C = p01x;
+        double D = (p10y - p0y) / iw;
+        double E = (p0y - p01y) / ih;
+        double F = p01y;
+        double det = A * E - B * D;
+        if (Math.Abs(det) < 1e-9) return;
+
+        double p11x = p10x + p01x - p0x, p11y = p10y + p01y - p0y;
+        double minX = Math.Min(Math.Min(p0x, p10x), Math.Min(p01x, p11x));
+        double maxX = Math.Max(Math.Max(p0x, p10x), Math.Max(p01x, p11x));
+        double minY = Math.Min(Math.Min(p0y, p10y), Math.Min(p01y, p11y));
+        double maxY = Math.Max(Math.Max(p0y, p10y), Math.Max(p01y, p11y));
+        int x0 = Math.Max(0, (int)Math.Floor(minX));
+        int x1 = Math.Min(Width - 1, (int)Math.Ceiling(maxX));
+        int y0 = Math.Max(0, (int)Math.Floor(minY));
+        int y1 = Math.Min(Height - 1, (int)Math.Ceiling(maxY));
+        if (x0 > x1 || y0 > y1) return;
+
+        for (int dy = y0; dy <= y1; dy++)
+        {
+            for (int dx = x0; dx <= x1; dx++)
+            {
+                double u = ((dx - C) * E - B * (dy - F)) / det;
+                double v = (A * (dy - F) - D * (dx - C)) / det;
+                if (u < 0 || v < 0 || u > iw - 1 || v > ih - 1) continue;
+                int sx0 = (int)u, sy0 = (int)v;
+                double fx = u - sx0, fy = v - sy0;
+                int sx1 = sx0 + 1 < iw ? sx0 + 1 : sx0;
+                int sy1 = sy0 + 1 < ih ? sy0 + 1 : sy0;
+                int i00 = (sy0 * iw + sx0) * 4;
+                int i10 = (sy0 * iw + sx1) * 4;
+                int i01 = (sy1 * iw + sx0) * 4;
+                int i11 = (sy1 * iw + sx1) * 4;
+                float w00 = (float)((1 - fx) * (1 - fy));
+                float w10 = (float)(fx * (1 - fy));
+                float w01 = (float)((1 - fx) * fy);
+                float w11 = (float)(fx * fy);
+                int r = (int)(rgba[i00] * w00 + rgba[i10] * w10 + rgba[i01] * w01 + rgba[i11] * w11);
+                int g = (int)(rgba[i00 + 1] * w00 + rgba[i10 + 1] * w10 + rgba[i01 + 1] * w01 + rgba[i11 + 1] * w11);
+                int b = (int)(rgba[i00 + 2] * w00 + rgba[i10 + 2] * w10 + rgba[i01 + 2] * w01 + rgba[i11 + 2] * w11);
+                int a = (int)(rgba[i00 + 3] * w00 + rgba[i10 + 3] * w10 + rgba[i01 + 3] * w01 + rgba[i11 + 3] * w11);
+                if (a < 0) a = 0; else if (a > 255) a = 255;
+                Blend(dx, dy, (byte)r, (byte)g, (byte)b, a / 255f);
+            }
+        }
+    }
+
     // ===== PNG 编码（零依赖：ZLibStream + CRC32）=====
 
     private static readonly byte[] _pngSig = { 137, 80, 78, 71, 13, 10, 26, 10 };

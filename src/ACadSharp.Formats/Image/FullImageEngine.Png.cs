@@ -294,6 +294,10 @@ internal partial class ImageEngine
                 }
                 break;
 
+            case RasterImage ri:
+                EmitRasterImagePng(ri, tr);
+                break;
+
             case Arc a: // 必须先于 Circle（fork 继承关系）
                 {
                     string col = ColorOf(EntityAciIndex(ent), layerAci, byBlockAci);
@@ -540,6 +544,59 @@ internal partial class ImageEngine
                 RecordSkip(ent.GetType().Name);
                 break;
         }
+    }
+
+    // PNG 光栅图片（RasterImage）：外部图片解码为 RGBA 后，按 CAD 四边形（a0=左下、a10=右下、a01=左上）
+    // 仿射贴图绘制到软件光栅化缓冲。JPEG 走新增的基线解码器，PNG 走既有解码器；任一失败降级为灰色矩形。
+    private void EmitRasterImagePng(RasterImage ri, Transform2D tr)
+    {
+        if (_rc == null) return;
+        var ip = ri.InsertPoint;
+        double W = ri.Size.X, H = ri.Size.Y;
+        var u = ri.UVector; var v = ri.VVector;
+        (double X, double Y) P(double x, double y) => tr == null ? (x, y) : tr.Apply(x, y);
+        var a0 = P(ip.X, ip.Y);
+        var a10 = P(ip.X + u.X * W, ip.Y + u.Y * W);
+        var a01 = P(ip.X + v.X * H, ip.Y + v.Y * H);
+        double p0x = PngSx(a0.X), p0y = PngSy(a0.Y);
+        double p10x = PngSx(a10.X), p10y = PngSy(a10.Y);
+        double p01x = PngSx(a01.X), p01y = PngSy(a01.Y);
+        string path = ResolveAssetPath(ri.Definition?.FileName);
+        if (string.IsNullOrEmpty(path))
+        {
+            PngImageRectFallback(p0x, p0y, p10x, p10y, p01x, p01y, 136, 136, 136);
+            RecordSkip("IMAGE(文件缺失)");
+            _log("⚠️  IMAGE 图片文件缺失，降级为边框: " + (ri.Definition?.FileName ?? "?"));
+            return;
+        }
+        byte[] bytes = File.ReadAllBytes(path);
+        int iw = 0, ih = 0; byte[] pix = null;
+        try { var d = RasterHelpers.DecodeToRgba(bytes); iw = d.width; ih = d.height; pix = d.rgba; }
+        catch (Exception ex)
+        {
+            _log("⚠️  IMAGE 解码失败，降级为边框: " + path + " (" + ex.Message + ")");
+        }
+        if (iw <= 0 || ih <= 0 || pix == null)
+        {
+            PngImageRectFallback(p0x, p0y, p10x, p10y, p01x, p01y, 136, 136, 136);
+            RecordSkip("IMAGE(无法解码)");
+            return;
+        }
+        _rc.DrawImageParallelogram(iw, ih, pix, p0x, p0y, p10x, p10y, p01x, p01y);
+    }
+
+    // PNG 图片降级：把 CAD 四边形（画布像素）填充为灰色矩形
+    private void PngImageRectFallback(double p0x, double p0y, double p10x, double p10y, double p01x, double p01y, byte r, byte g, byte b)
+    {
+        double p11x = p10x + p01x - p0x, p11y = p10y + p01y - p0y;
+        var pp = new List<RasterCanvas.P>(4)
+        {
+            new RasterCanvas.P((float)p0x, (float)p0y),
+            new RasterCanvas.P((float)p10x, (float)p10y),
+            new RasterCanvas.P((float)p11x, (float)p11y),
+            new RasterCanvas.P((float)p01x, (float)p01y),
+        };
+        _rc.Fill(new List<List<RasterCanvas.P>> { pp }, false, new RasterCanvas.Rgb(r, g, b));
     }
 
     // 点样式（$PDMODE/$PDSIZE）→ PNG 位图，与 SVG/PDF 端逐样式一致（2026-10-16 定稿 + 10-17 缩小一半）：

@@ -1108,7 +1108,11 @@ internal partial class ImageEngine
             }
         int w = Math.Max(1, (int)Math.Round((cMaxX - cMinX) * zoom));
         int h = Math.Max(1, (int)Math.Round((cMaxY - cMinY) * zoom));
-        const int MaxGradSide = 4096;
+        // 渐变光栅图分辨率上限：渐变色块本身平滑，无需 1:1 画布像素（PDF 会以平滑插值放大显示）。
+        // 旧值 4096 使 100 单位的渐变块生成 1000×1000 图、41 个渐变 → PDF 11MB；
+        // 浏览器 PDF 查看器（Chrome/Edge）渲染大量大尺寸裁剪图像时负担重，
+        // 部分块延迟/不绘制（用户反馈"pdf 缺了个样式 兼容看不到"）。降到 256 后文件约 1MB、兼容性大幅提升。
+        const int MaxGradSide = 256;
         if (w > MaxGradSide || h > MaxGradSide || (long)w * h > 16_000_000L)
         {
             double f = Math.Min(Math.Min(MaxGradSide / (double)w, MaxGradSide / (double)h),

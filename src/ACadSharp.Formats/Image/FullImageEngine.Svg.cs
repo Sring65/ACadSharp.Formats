@@ -4666,6 +4666,9 @@ internal partial class ImageEngine
 
     // 按 LUT 剖面生成 SVG <stop> 序列：u=0..1 步进 0.03（34 点，≥LUT 33 点保精度），
     // 颜色 = lerp(c1,c2,LutProfile(u))。LINEAR 恒等；非线性（圆柱/球/抛物钟形）由采样逼近。
+    // 注意：**不要强制端点 i==0→c1 / i==N→c2**——径向类的 LUT 首/尾并不等于 C1/C2
+    //   （如 SPHERICAL_s0 首值 0.998≈C2、尾值 0.000=C1），强制端点会在中心/边缘造成颜色突变的"点/环"
+    //   （曾致 SVG 径向渐变中心出现深色小点聚集）。统一按 LUT 计算，与 PNG/PDF 逐像素结果一致。
     private void AppendGradientProfileStops(HatchGradSpec spec, string c1, string c2)
     {
         const int N = 33; // 与 LUT 点数一致
@@ -4673,7 +4676,7 @@ internal partial class ImageEngine
         {
             double u = i / (double)N;
             double f = HatchGradProfileLut(spec, u);
-            string col = (i == 0) ? c1 : (i == N) ? c2 : LerpHex(c1, c2, f);
+            string col = LerpHex(c1, c2, f);
             _svgDefs.AppendLine($"      <stop offset=\"{u.ToString("0.###", Ci)}\" stop-color=\"{col}\"/>");
         }
     }

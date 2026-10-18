@@ -1238,7 +1238,11 @@ internal partial class ImageEngine
     {
         var segs = BuildPatternSegments(loops, ht, tr, MaxPatternLinesPerHatch);
         if (segs.Count == 0) { RecordSkip("HATCH(图案)"); return; }
-        string col = HexToRgbPdf(HatchSolidFillHex(ht, layerAci, byBlockAci));
+        // 注意：PdfStroke 的参数契约是【hex】（内部会调 HexToRgbPdf 转换），
+        // 所有其他调用者（ColorOf→AciColor）均传 hex。此处若预先转成 RGB 字符串
+        // （"1 0.749 0"）再传入，PdfStroke 会二次 HexToRgbPdf → 非 #RRGGBB → 兜底白(1 1 1)
+        // → 白底 PDF 上图案线不可见。必须传 hex（HatchSolidFillHex 返回 #RRGGBB）。
+        string col = HatchSolidFillHex(ht, layerAci, byBlockAci);
         double w = Math.Max(0.03, 0.1 * scaleMul);
         var d = new StringBuilder();
         foreach (var s in segs)

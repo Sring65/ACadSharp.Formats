@@ -2710,7 +2710,9 @@ internal partial class ImageEngine
             int em = face.UnitsPerEm > 0 ? face.UnitsPerEm : 1;
             double s = ShxHeightScale(face, H);         // 数据单位 / 该面字体单位（cap height 映射 H，见 ShxHeightScale）
             bool hasAdv = face.TryGetAdvance(code, out float advF);
-            double advData = (hasAdv ? advF : 0.7 * em) * s; // 该字符 advance（数据单位）
+            double advU = ShxGlyphAdvance(face, hasAdv ? advF : 0f); // CJK BigFont 方格字宽（严格对齐包盒，见注释）
+            if (advU <= 0) advU = 0.7 * em;                             // 缺字形仅留 0.7em 间隙
+            double advData = advU * s; // 该字符 advance（数据单位）
             var g = new GlyphRec();
             bool ok = face.TryGetGlyph(code, g, ShxTextOrientation.Horizontal);
             if (ok && !g.Empty)
@@ -2811,6 +2813,20 @@ internal partial class ImageEngine
         return maxAscent;
     }
 
+    // CJK BigFont 字宽（字体单位）：用户定稿——单行 CJK 文字渲染宽度须严格对齐 DXF 中绘制的文字包盒宽度。
+    // 依据：hztxt 全角汉字 pen-end advance=10.0，但实测字形高（最大 Y）=10.75；CAD 全角字格为方格
+    //（字格宽=字格高），advance 取 max(penEnd, 实测最大字形高) 后，"测试中文显示"(H=15.58) 的
+    // ink 宽 84.2→90.1，命中包盒 90.173（+0.04%）。拉丁 Unifont 不受影响（返回 penEnd）。
+    private float ShxGlyphAdvance(ShxFont face, float penEnd)
+    {
+        if (face.Format == ShxFormat.BigFont)
+        {
+            double asc = MeasuredShxAscent(face);
+            if (asc > penEnd) return (float)asc;
+        }
+        return penEnd;
+    }
+
     // ---- MTEXT 逐 run SHX 笔迹（基础样式 simplex.shx / \Fsimplex 等）----
     // 解析给定字体名 → SHX 面（latin），并可选 bigfont（cjk）。非 SHX（无对应 .shx 文件 / .ttf/.ttc）→ false。
     private bool TryResolveShxFaces(string fontName, string bigFontName, out ShxFont latin, out ShxFont cjk)
@@ -2871,7 +2887,9 @@ internal partial class ImageEngine
             int em = face.UnitsPerEm > 0 ? face.UnitsPerEm : 1;
             double s = ShxHeightScale(face, H);         // cap height 映射 H（见 ShxHeightScale），非 H/em
             bool hasAdv = face.TryGetAdvance(code, out float advF);
-            double advData = (hasAdv ? advF : 0.7 * em) * s;
+            double advU = ShxGlyphAdvance(face, hasAdv ? advF : 0f); // CJK BigFont 方格字宽（严格对齐包盒）
+            if (advU <= 0) advU = 0.7 * em;
+            double advData = advU * s;
             var g = new GlyphRec();
             if (face.TryGetGlyph(code, g, ShxTextOrientation.Horizontal) && !g.Empty)
                 for (int k = 0; k < g.Type.Count; k++)
@@ -2931,7 +2949,9 @@ internal partial class ImageEngine
             int em = face.UnitsPerEm > 0 ? face.UnitsPerEm : 1;
             double s = ShxHeightScale(face, H);         // cap height 映射 H（见 ShxHeightScale），非 H/em
             bool hasAdv = face.TryGetAdvance(code, out float advF);
-            penX += (hasAdv ? advF : 0.7 * em) * s;
+            double advU = ShxGlyphAdvance(face, hasAdv ? advF : 0f); // CJK BigFont 方格字宽（严格对齐包盒）
+            if (advU <= 0) advU = 0.7 * em;
+            penX += advU * s;
         }
         width = penX * wf;
         return true;

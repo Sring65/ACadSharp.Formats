@@ -754,10 +754,15 @@ internal partial class ImageEngine
                         byte[] data = font != null ? font.Encode(run.Text) : PdfFallbackTextBytes(run.Text);
                         if (data.Length > 0)
                         {
-                            // \T 字距：Tc（1/1000 em/字符）= (因子-1)×0.1em×1000 ÷ wf。
-                            // ÷wf 抵消 Tm 的 scale(wf)，使最终像素字距独立于 \W（与参考 PDF 一致：\T1→Tc=0、\T0.75→Tc≈-25）
-                            double tc1000 = (run.Tracking - 1.0) * 100.0 / (wf > 1e-9 ? wf : 1.0);
-                            string tcLine = Math.Abs(tc1000) > 1e-6 ? F(tc1000) + " Tc\n" : "";
+                            // \T 字距：PDF Tc 的单位是【文本空间单位】(unscaled text space units, PDF 32000 §9.3.2)，
+                            // 直接加在每个字形的 advance 上（且跨 BT/ET 持久！）——不是 1/1000 em。
+                            // 旧版误按 1/1000 em 发 "−25 Tc" → 每字 advance = w + (−25) 为负 → 整行从右往左倒序散射
+                            // （这也是后续不设 Tc 的文字块被泄漏污染而乱序的根因）。
+                            // 正确换算：期望额外间距 = (因子−1)×0.1em，1em = fs（文本空间字号）→ Tc = (T−1)×0.1×fs ÷ wf
+                            //（÷wf 抵消 Tm 的横向 scale，使字距视觉量不受 \W 影响）。
+                            double tc = (run.Tracking - 1.0) * 0.1 * fs / (wf > 1e-9 ? wf : 1.0);
+                            // Tc 是文本状态操作符，只能在 BT..ET 内设置；且跨 BT/ET 持久 → 每块显式写（含 0 Tc 复位）
+                            string tcLine = Math.Abs(tc) > 1e-9 ? F(tc) + " Tc\n" : "0 Tc\n";
                             CsAscii(cs, "BT\n/F" + slot + " " + F(fs) + " Tf\n" + HexToRgbPdf(col) + " rg\n" + tcLine +
                                        F(ca * wf) + " " + F(sa * wf) + " " + F(ca * tk - sa) + " " + F(sa * tk + ca) + " " + F(Sx(wx)) + " " + F(Py(wy)) + " Tm\n");
                             CsString(cs, data);

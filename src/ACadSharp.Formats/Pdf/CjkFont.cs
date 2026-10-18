@@ -30,6 +30,9 @@ internal sealed class CjkFont
     private readonly Dictionary<int, int> _unicodeToGid = new();
     /// <summary>已使用的 GID → Unicode（用于生成 ToUnicode CMap 与 /W 字宽数组）</summary>
     public readonly Dictionary<int, int> UsedGidToUnicode = new();
+    // 字体表目录与 unitsPerEm（供 /W 从 hmtx 读真实字宽）
+    private Dictionary<string, (int off, int len)> _tables;
+    private int _upem = 2048;
 
     /// <summary>默认 CJK 字体候选（按优先级）。</summary>
     public static readonly string[] DefaultCandidates = { "simhei.ttf", "msyh.ttf", "simkai.ttf", "simfang.ttf", "Deng.ttf" };
@@ -128,6 +131,8 @@ internal sealed class CjkFont
                 log?.Invoke($"⚠️  字体 cmap 表解析失败：{path}，PDF 中文文字将显示为 ?");
                 return null;
             }
+            f._tables = tables;
+            f._upem = upem;
             f.PatchFontMetrics(tables, upem);
             log?.Invoke($"  PDF 中文字体：{Path.GetFileName(path)}（{f.TtfBytes.Length / 1024 / 1024} MB，{f._unicodeToGid.Count} 个字形映射，unitsPerEm={upem}）");
             return f;
@@ -141,7 +146,7 @@ internal sealed class CjkFont
 
     /// <summary>
     /// 修补内嵌字体的度量表（原地修改 TtfBytes）：
-    /// head.unitsPerEm、head bbox、OS/2 usWinAscent/usWinDescent。
+    /// head.unitsPerEm(+18)、head bbox(xMin@36/yMin@38/xMax@40/yMax@42)、OS/2 usWinAscent(+74)/usWinDescent(+76)。
     /// 字形轮廓（glyf/loca）与 cmap 完好，无需处理。
     /// </summary>
     private void PatchFontMetrics(Dictionary<string, (int off, int len)> tables, int upem)
@@ -149,14 +154,14 @@ internal sealed class CjkFont
         byte[] t = TtfBytes;
         if (tables.TryGetValue("head", out var hd))
         {
-            WriteU16(t, hd.off + 16, upem);
+            WriteU16(t, hd.off + 18, upem); // head.unitsPerEm 位于 +18（+16 是 flags，旧版误写会破坏 flags）
             // bbox 用安全范围（-0.3em .. 1.3em / -0.3em .. 1.2em）
-            WriteI16(t, hd.off + 34, (int)(-0.3 * upem));
             WriteI16(t, hd.off + 36, (int)(-0.3 * upem));
-            WriteI16(t, hd.off + 38, (int)(1.3 * upem));
-            WriteI16(t, hd.off + 40, (int)(1.2 * upem));
+            WriteI16(t, hd.off + 38, (int)(-0.3 * upem));
+            WriteI16(t, hd.off + 40, (int)(1.3 * upem));
+            WriteI16(t, hd.off + 42, (int)(1.2 * upem));
         }
-        if (tables.TryGetValue("OS/2", out var o2) && o2.len >= 88)
+        if (tables.TryGetValue("OS/2", out var o2) && o2.len >= 78)
         {
             int asc = (int)(0.88 * upem), desc = (int)(0.12 * upem);
             if (tables.TryGetValue("hhea", out var hh))
@@ -164,8 +169,8 @@ internal sealed class CjkFont
                 int a = ReadI16(t, hh.off + 4), d = ReadI16(t, hh.off + 6);
                 if (a > 0 && a < upem * 2 && d < 0 && d > -upem) { asc = a; desc = -d; }
             }
-            WriteU16(t, o2.off + 84, asc);
-            WriteU16(t, o2.off + 86, desc);
+            WriteU16(t, o2.off + 74, asc);  // OS/2.usWinAscent
+            WriteU16(t, o2.off + 76, desc); // OS/2.usWinDescent
         }
     }
 
@@ -234,7 +239,9 @@ internal sealed class CjkFont
         return 500; // 拉丁字母/数字/半角标点
     }
 
-    /// <summary>生成 /W 字宽数组（仅含实际用到的 GID，1/1000 em）。</summary>
+    /// <summary>生成 /W 字宽数组（仅含实际用到的 GID，1/1000 em）。
+    /// 优先从内嵌字体 hmtx 读真实 advance（比例拉丁字距正确，如 arial T=611/i=222），
+    /// 无效（缺失/越界）时回退按码位类别估算（CJK=1em、其余≈0.5em）。</summary>
     public string WidthArray()
     {
         var sb = new StringBuilder();
@@ -242,10 +249,33 @@ internal sealed class CjkFont
         foreach (var kv in UsedGidToUnicode.OrderBy(k => k.Key, Comparer<int>.Default))
         {
             if (!first) sb.Append(' ');
-            sb.Append(kv.Key).Append(' ').Append(kv.Key).Append(' ').Append(WidthOf(kv.Value));
+            sb.Append(kv.Key).Append(' ').Append(kv.Key).Append(' ').Append(AdvanceOfGid(kv.Key, kv.Value));
             first = false;
         }
         return sb.ToString();
+    }
+
+    /// <summary>单个 GID 的字宽（1/1000 em）：优先 hmtx 真实值，越界/缺失回退类别估算。</summary>
+    private int AdvanceOfGid(int gid, int unicode)
+    {
+        try
+        {
+            if (_tables != null && TtfBytes != null &&
+                _tables.TryGetValue("hmtx", out var hm) && _tables.TryGetValue("hhea", out var hh))
+            {
+                byte[] t = TtfBytes;
+                int numH = ReadU16(t, hh.off + 34); // hhea.numberOfHMetrics
+                if (numH > 0)
+                {
+                    int idx = Math.Min(gid, numH - 1);
+                    int adv = ReadU16(t, hm.off + idx * 4);
+                    if (adv > 0 && adv <= 2 * _upem)
+                        return (int)Math.Round(adv * 1000.0 / _upem);
+                }
+            }
+        }
+        catch { /* 度量表异常：回退估算 */ }
+        return WidthOf(unicode);
     }
 
     /// <summary>生成 ToUnicode CMap 流（GID → Unicode）。</summary>
@@ -321,7 +351,7 @@ internal sealed class CjkFont
         int upem = 0;
         if (tables.TryGetValue("head", out var head))
         {
-            int h = ReadU16(t, head.off + 16);
+            int h = ReadU16(t, head.off + 18); // head.unitsPerEm 位于 +18（+16 是 flags）
             if (h >= 16 && h <= 8192) upem = h;
         }
         if (upem <= 0 && tables.TryGetValue("hmtx", out var hm) && hm.off + 2 <= t.Length)

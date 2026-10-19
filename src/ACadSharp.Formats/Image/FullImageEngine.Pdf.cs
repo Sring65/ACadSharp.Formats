@@ -499,9 +499,9 @@ internal partial class ImageEngine
                         PdfStroke(cs, col, shx.Value.PenWidth, null, d + "S");
                         break;
                     }
-                    // TTF 样式：原系统字体路径（不变）
+                    // TTF 样式：cap-height 字号映射（AutoCAD 把 H 当 cap height，非 em，见 TtfCapScale）
                     var (bx, by, brot, bscale) = TextBaseline(t, tr);
-                    double fs = t.Height * scaleMul * bscale;
+                    double fs = t.Height * scaleMul * bscale * TtfCapScale(ResolveFontFamily(GetStyleFont(t.Style)));
                     int slot = _pdfFonts.GetSlot(ResolveFontFamily(GetStyleFont(t.Style)));
                     PdfText(cs, col, fs, Sx(bx), Py(by), brot, t.Value ?? "", slot, t.WidthFactor);
                 }
@@ -578,14 +578,18 @@ internal partial class ImageEngine
                         }
                     if (pts.Count >= 2)
                     {
-                        double alen = ld.TextHeight > 1e-9 ? ld.TextHeight * scaleMul : Math.Max(w * 6.0, 4.0 * (tr?.Scale ?? 1.0));
                         bool arrow = ld.ArrowHeadEnabled; // DXF 组码71：缺省=有箭头，0=无箭头
-                        // 引线：有箭头时起点移到箭头底边中心（避免细线穿入实心三角内部）；无箭头时折线直达尖端 pts[0]
+                        // 箭头形状 + 缩放：LeaderArrow(341) 块 + ArrowSize(41, DIMASZ)。fallback 用旧启发式长度。
+                        double alen = Math.Max(w * 6.0, 4.0 * (tr?.Scale ?? 1.0));
+                        var (arrowBr, asz) = LeaderArrowResolve(ld, _doc, alen);
+                        var trA = arrow ? LeaderArrowTransform(pts, asz) : null;
+                        // 引线：有箭头时起点移到箭头底边中心（避免细线穿入箭头内部）；无箭头时折线直达尖端 pts[0]
                         var linePts = pts;
-                        if (arrow && LeaderArrowBase(pts, alen, out var lbx, out var lby))
+                        if (arrow && trA != null)
                         {
+                            var bp = LeaderArrowBasePoint(pts, asz);
                             linePts = new List<(double X, double Y)>(pts);
-                            linePts[0] = (lbx, lby);
+                            linePts[0] = (bp.X, bp.Y);
                         }
                         // 水平着陆线（末段非水平时补画，供关联文字坐落）——独立于箭头，按 TextWidth/HookLineDirection 判断
                         if (LeaderLandingEndpoint(ld, pts, out var lex, out var ley))
@@ -597,9 +601,34 @@ internal partial class ImageEngine
                         for (int i = 0; i < linePts.Count; i++)
                             d.Append(F(Sx(linePts[i].X)) + " " + F(Py(linePts[i].Y)) + " " + (i == 0 ? "m" : "l") + " ");
                         PdfStroke(cs, col, w, dash, d + "S");
-                        // 实心箭头三角（AutoCAD LEADER 默认实心；尖端 pts[0] 指向目标端）。无箭头(71=0)时不画
-                        if (arrow && LeaderArrowWings(ld, pts, alen, out var w1x, out var w1y, out var w2x, out var w2y))
-                            PdfQuadFill(cs, col, new List<(double X, double Y)> { (pts[0].X, pts[0].Y), (w1x, w1y), (w2x, w2y) });
+                        // 箭头（无箭头 71=0 时不画）：实心闭合=单个填充三角；其余按块几何描边/填充
+                        if (arrow && trA != null)
+                        {
+                            if (arrowBr != null && IsClosedFilledArrow(arrowBr))
+                            {
+                                var tip = trA.Apply(0, 0);
+                                var c1 = trA.Apply(-1.0, 0.16666667);
+                                var c2 = trA.Apply(-1.0, -0.16666667);
+                                PdfQuadFill(cs, col, new List<(double X, double Y)> { tip, c1, c2 });
+                            }
+                            else if (arrowBr != null)
+                            {
+                                var strokes = new List<List<(double X, double Y)>>();
+                                var fills = new List<List<(double X, double Y)>>();
+                                LeaderArrowGeom(arrowBr, trA, strokes, fills);
+                                foreach (var s in strokes)
+                                {
+                                    if (s.Count < 2) continue;
+                                    var ds = new StringBuilder();
+                                    for (int i = 0; i < s.Count; i++)
+                                        ds.Append(F(Sx(s[i].X)) + " " + F(Py(s[i].Y)) + " " + (i == 0 ? "m" : "l") + " ");
+                                    PdfStroke(cs, col, w, dash, ds + "S");
+                                }
+                                foreach (var f in fills) if (f.Count >= 3) PdfQuadFill(cs, col, f);
+                            }
+                            else if (LeaderArrowWings(ld, pts, alen, out var w1x, out var w1y, out var w2x, out var w2y))
+                                PdfQuadFill(cs, col, new List<(double X, double Y)> { (pts[0].X, pts[0].Y), (w1x, w1y), (w2x, w2y) });
+                        }
                     }
                 }
                 break;

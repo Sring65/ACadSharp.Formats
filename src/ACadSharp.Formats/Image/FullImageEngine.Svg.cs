@@ -1549,6 +1549,141 @@ internal partial class ImageEngine
         return true;
     }
 
+    // ===== Leader 箭头块（三引擎共享）=====
+    // 引线箭头由两个属性决定：
+    //   ① 箭头形状 = DimensionStyle.LeaderArrow（DXF 组码 341 / DIMLDRBLK）——指向一个箭头块
+    //      （_Open/_ArchTick/_Dot/_BoxFilled/_Integral/_Origin 等标准块）；为 null = 默认实心闭合箭头(_Closed)。
+    //   ② 箭头缩放 = DimensionStyle.ArrowSize（DXF 组码 41 / DIMASZ）——标准箭头块长度归一为 1.0，
+    //      故 DIMASZ 即箭头长度（闭合箭头长宽比 6:1，与 AutoCAD 一致）。
+    // 解析出 (箭头块, 缩放)；块无法解析时 Block=null，调用方回退旧实心三角。缩放取 DIMASZ，<=0 时回退 fallbackScale。
+    private static (BlockRecord Block, double Scale) LeaderArrowResolve(Leader ld, CadDocument doc, double fallbackScale)
+    {
+        double asz = 0;
+        try { asz = ld.Style?.ArrowSize ?? 0; } catch { }
+        double scale = asz > 1e-9 ? asz : fallbackScale;
+        BlockRecord br = null;
+        try { br = ld.Style?.LeaderArrow; } catch { }
+        bool ok = br != null && br.Entities != null && br.Entities.Count > 0;
+        if (!ok)
+        {
+            // 默认（LeaderArrow=null）= 实心闭合箭头。优先用文档内的 _Closed 块（像素级还原其几何）。
+            try
+            {
+                foreach (var b in doc?.BlockRecords)
+                    if (b.Name == "_Closed" && b.Entities != null && b.Entities.Count > 0) { br = b; ok = true; break; }
+            }
+            catch { }
+        }
+        return ok ? (br, scale) : (null, scale);
+    }
+
+    // 是否为"实心闭合"箭头（默认 / _Closed）：AutoCAD 将其渲染为**填充**三角（块内是轮廓线+中线，
+    // 但标准闭合箭头显示为实心）。其余标准块（_Open/_Dot/_BoxFilled/_Integral…）按块几何如实绘制。
+    private static bool IsClosedFilledArrow(BlockRecord br)
+    {
+        try { return br != null && br.Name == "_Closed"; } catch { return false; }
+    }
+
+    // 箭头放置变换：块局部「尖端=(0,0)、主体朝 -X」→ 尖端对齐 pts[0]（指向目标），主体沿 pts[0]→pts[1]
+    // （离开目标方向）展开，整体缩放 ascale（世界单位）。返回 null = 顶点退化。
+    private static Transform2D LeaderArrowTransform(List<(double X, double Y)> pts, double ascale)
+    {
+        if (pts == null || pts.Count < 2 || ascale <= 1e-9) return null;
+        double dx = pts[1].X - pts[0].X, dy = pts[1].Y - pts[0].Y;
+        double len = Math.Sqrt(dx * dx + dy * dy);
+        if (len < 1e-9) return null;
+        double ux = dx / len, uy = dy / len;
+        // 块 -X 轴 → (ux,uy)  ⇒  旋转矩阵列 (Ca,Sa) = (-ux,-uy)
+        return new Transform2D { Ca = -ux, Sa = -uy, Sx = ascale, Sy = ascale, Tx = pts[0].X, Ty = pts[0].Y };
+    }
+
+    // 箭头底边中心（引线止点）：尖端 pts[0] 沿入段方向推进 ascale（钳制首段长，避免箭头比首段长时折线反向）。
+    private static (double X, double Y) LeaderArrowBasePoint(List<(double X, double Y)> pts, double ascale)
+    {
+        if (pts == null || pts.Count < 2) return pts?[0] ?? (0, 0);
+        double dx = pts[1].X - pts[0].X, dy = pts[1].Y - pts[0].Y;
+        double len = Math.Sqrt(dx * dx + dy * dy);
+        if (len < 1e-9) return pts[0];
+        double adv = Math.Min(ascale, len);
+        return (pts[0].X + dx / len * adv, pts[0].Y + dy / len * adv);
+    }
+
+    // 圆弧采样为折线点（世界坐标，含旋转）。startDeg/endDeg 为**世界**角度（度）。
+    private static List<(double X, double Y)> SampleArcWorld(double cx, double cy, double r, double startDeg, double endDeg)
+    {
+        var pts = new List<(double X, double Y)>(33);
+        double s = startDeg * Math.PI / 180.0, e = endDeg * Math.PI / 180.0;
+        double span = e - s;
+        while (span < 0) span += 2 * Math.PI;
+        if (span < 1e-6) span = 2 * Math.PI; // 整圆
+        int n = Math.Max(8, (int)Math.Ceiling(span / (Math.PI / 24.0))); // 每段 ≤7.5°
+        for (int i = 0; i <= n; i++)
+        {
+            double a = s + span * i / n;
+            pts.Add((cx + r * Math.Cos(a), cy + r * Math.Sin(a)));
+        }
+        return pts;
+    }
+
+    // 圆采样为闭合折线（世界坐标）。
+    private static List<(double X, double Y)> SampleCircleWorld(double cx, double cy, double r)
+        => SampleArcWorld(cx, cy, r, 0, 360);
+
+    // 提取箭头块几何 → 世界坐标的"待描边折线"(strokes) 与"待填充多边形"(fills)。三引擎共享：
+    //   各引擎只需对 strokes 描边、对 fills 填充，无需各自理解块内实体类型，也规避了
+    //   EmitEntity 对"旋转块内圆弧"不叠加旋转角的缺陷（此处弧/圆直接采样为折线，旋转已含在 trA 内）。
+    // 实心闭合箭头(_Closed)不在此处理（由调用方生成单个填充三角）。
+    private static void LeaderArrowGeom(BlockRecord br, Transform2D trA,
+        List<List<(double X, double Y)>> strokes, List<List<(double X, double Y)>> fills)
+    {
+        if (br == null || trA == null || br.Entities == null) return;
+        foreach (var e in br.Entities)
+        {
+            switch (e)
+            {
+                case Line ln:
+                {
+                    var p1 = trA.Apply(ln.StartPoint.X, ln.StartPoint.Y);
+                    var p2 = trA.Apply(ln.EndPoint.X, ln.EndPoint.Y);
+                    strokes.Add(new List<(double X, double Y)> { p1, p2 });
+                    break;
+                }
+                case LwPolyline pl:
+                {
+                    var pp = LwPolylineSamplePoints(pl, trA); // 含闭合段（首尾回 v0）
+                    if (pp.Count >= 2) strokes.Add(pp);
+                    break;
+                }
+                case Arc a: // 必须先于 Circle（fork 继承关系）
+                {
+                    var ctr = trA.Apply(a.Center.X, a.Center.Y);
+                    double rot = trA.Rotation; // 块内弧须叠加放置旋转角（EmitEntity 的 Arc 分支缺失此项，此处显式补上）
+                    strokes.Add(SampleArcWorld(ctr.X, ctr.Y, a.Radius * trA.Scale,
+                        a.StartAngle * 180.0 / Math.PI + rot, a.EndAngle * 180.0 / Math.PI + rot));
+                    break;
+                }
+                case Circle c:
+                {
+                    var ctr = trA.Apply(c.Center.X, c.Center.Y);
+                    strokes.Add(SampleCircleWorld(ctr.X, ctr.Y, c.Radius * trA.Scale));
+                    break;
+                }
+                case Solid so:
+                {
+                    fills.Add(SolidQuadPts(so.FirstCorner, so.SecondCorner, so.ThirdCorner, so.FourthCorner, trA));
+                    break;
+                }
+                case Ellipse el:
+                {
+                    // 箭头块不含椭圆；兜底按外接圆近似（保持不崩溃）。
+                    var ctr = trA.Apply(el.Center.X, el.Center.Y);
+                    strokes.Add(SampleCircleWorld(ctr.X, ctr.Y, Math.Max(el.MajorAxis, el.MinorAxis) / 2.0 * trA.Scale));
+                    break;
+                }
+            }
+        }
+    }
+
     // spline-fit（样条拟合）多段线（POLYLINE 组码 70 bit2=curved）的顶点混合两类：
     //   SplineVertexFromSplineFitting —— 样条拟合点，AutoCAD 实际渲染的显示路径；
     //   SplineFrameControlPoint      —— 样条框架控制点，AutoCAD 不显示（仅定义拟合曲线）。
@@ -2025,9 +2160,9 @@ internal partial class ImageEngine
                         sb.AppendLine($"  <path d=\"{d}\" fill=\"none\" stroke=\"{col}\" stroke-width=\"{F(shx.Value.PenWidth)}\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>");
                         break;
                     }
-                    // TTF 样式：原系统字体路径（不变）
+                    // TTF 样式：cap-height 字号映射（AutoCAD 把 H 当 cap height，非 em，见 TtfCapScale）
                     var (bx, by, brot, bscale) = TextBaseline(t, tr);
-                    double fs = t.Height * scaleMul * bscale;
+                    double fs = t.Height * scaleMul * bscale * TtfCapScale(ResolveFontFamily(GetStyleFont(t.Style)));
                     string cssFont = SvgFontFamily(ResolveFontFamily(GetStyleFont(t.Style)));
                     EmitText(sb, bx, by, t.Value ?? "", Math.Max(fs, 0.5), col, -brot, cssFont, t.WidthFactor);
                 }
@@ -2112,19 +2247,43 @@ internal partial class ImageEngine
                         }
                     if (pts.Count >= 2)
                     {
-                        double alen = ld.TextHeight > 1e-9 ? ld.TextHeight * scaleMul : Math.Max(w * 6.0, 4.0 * (tr?.Scale ?? 1.0));
                         bool arrow = ld.ArrowHeadEnabled; // DXF 组码71：缺省=有箭头，0=无箭头
-                        // 引线：有箭头时起点移到箭头底边中心（避免细线穿入实心三角内部）；无箭头时折线直达尖端 pts[0]
+                        // 箭头形状 + 缩放：LeaderArrow(341) 块 + ArrowSize(41, DIMASZ)。fallback 用旧启发式长度。
+                        double alen = Math.Max(w * 6.0, 4.0 * (tr?.Scale ?? 1.0));
+                        var (arrowBr, asz) = LeaderArrowResolve(ld, _doc, alen);
+                        var trA = arrow ? LeaderArrowTransform(pts, asz) : null;
+                        // 引线：有箭头时起点移到箭头底边中心（避免细线穿入箭头内部）；无箭头时折线直达尖端 pts[0]
                         var lp = new List<(double X, double Y)>(pts);
-                        if (arrow && LeaderArrowBase(pts, alen, out var lbx, out var lby))
-                            lp[0] = (lbx, lby);
+                        if (arrow && trA != null)
+                        {
+                            var bp = LeaderArrowBasePoint(pts, asz);
+                            lp[0] = (bp.X, bp.Y);
+                        }
                         // 水平着陆线（末段非水平时补画，供关联文字坐落）——独立于箭头，按 TextWidth/HookLineDirection 判断
                         if (LeaderLandingEndpoint(ld, pts, out var lex, out var ley))
                             lp.Add((lex, ley));
                         EmitPolyline(sb, lp, col, w, false, dash);
-                        // 实心箭头三角（AutoCAD LEADER 默认实心；尖端 pts[0] 指向目标端）。无箭头(71=0)时不画
-                        if (arrow && LeaderArrowWings(ld, pts, alen, out var w1x, out var w1y, out var w2x, out var w2y))
-                            EmitQuadFill(sb, new List<(double X, double Y)> { (pts[0].X, pts[0].Y), (w1x, w1y), (w2x, w2y) }, col);
+                        // 箭头（无箭头 71=0 时不画）：实心闭合=单个填充三角；其余按块几何描边/填充
+                        if (arrow && trA != null)
+                        {
+                            if (arrowBr != null && IsClosedFilledArrow(arrowBr))
+                            {
+                                var tip = trA.Apply(0, 0);
+                                var c1 = trA.Apply(-1.0, 0.16666667);
+                                var c2 = trA.Apply(-1.0, -0.16666667);
+                                EmitQuadFill(sb, new List<(double X, double Y)> { tip, c1, c2 }, col);
+                            }
+                            else if (arrowBr != null)
+                            {
+                                var strokes = new List<List<(double X, double Y)>>();
+                                var fills = new List<List<(double X, double Y)>>();
+                                LeaderArrowGeom(arrowBr, trA, strokes, fills);
+                                foreach (var s in strokes) EmitPolyline(sb, s, col, w, false, dash);
+                                foreach (var f in fills) EmitQuadFill(sb, f, col);
+                            }
+                            else if (LeaderArrowWings(ld, pts, alen, out var w1x, out var w1y, out var w2x, out var w2y))
+                                EmitQuadFill(sb, new List<(double X, double Y)> { (pts[0].X, pts[0].Y), (w1x, w1y), (w2x, w2y) }, col);
+                        }
                     }
                 }
                 break;
@@ -2418,15 +2577,15 @@ internal partial class ImageEngine
                 TextHorizontalAlignment.Right => -W,
                 _ => 0
             };
-            // R21（用户反馈"图框字体坐标偏移"，实测 test1234 图框数值 武汉钢铁有限公司 V=Middle 偏低 1.35px）：
-            // V=Middle 用字体真实 em-box 中心，而非旧 H-box 模型。旧模型假设字形全在基线上方
-            // （ascent=H, descent=0）→ 基线=11y−H/2；但实测 SimSun/SimHei ascent=0.859、descent=0.141，
-            // em-box 中心=基线+(asc−desc)/2=0.359H，故 V=Middle 文本整体偏低 0.141H（=H/2−0.359H）。
-            // SHX 样式 family=null → centerFrac=0.5（保持 SHX 路径原行为，不劣化）；V=Baseline 仍 dy=0。
-            double vcf = GetEmBoxCenterFraction(ResolveFontFamily(GetStyleFont(t.Style)));
+            // R22（cap-height 约定，GT 精确验证 2026-10-19）：AutoCAD 把 H 当 cap height，
+            // 垂直对齐以【cap 盒】（高 H：基线→基线+H）为中心定位，而非 em 盒。
+            //   Middle: baseline=anchorY−H/2。GT 英文 arial H=5(73=Middle) 实测 baseline=11y−2.5=15.70，
+            //           cap 顶=20.70、descender 底=14.23 全部像素级命中。旧 −vcf·H（em 盒中心）偏低 0.14H，已废。
+            //   Top: cap 顶对齐锚点（−H，与 cap 盒一致，保持）。Baseline/Bottom: 基线对齐锚点（0）。
+            // 注：仅影响 TTF 路径（SHX 走 TryBuildShxTextWorld，MText 走 EmitMText*，均不经过此处）。
             double dy = t.VerticalAlignment switch
             {
-                TextVerticalAlignmentType.Middle => -vcf * H,
+                TextVerticalAlignmentType.Middle => -H / 2,
                 TextVerticalAlignmentType.Top => -H,
                 _ => 0 // Baseline/Bottom（保持旧行为，避免影响其他文字）
             };
@@ -2608,6 +2767,39 @@ internal partial class ImageEngine
         catch { frac = 0.5; } // 度量失败 → 回退 0.5（不劣化）
         _emCenterCache[first] = frac;
         return frac;
+    }
+
+    // ===== TTF cap-height 字号映射（与 SHX cap-height 约定对齐，2026-10-19）=====
+    // 根因：AutoCAD 把文字高度 H 解释为【大写字母高度 cap height】，而非整 em 盒。
+    //   实测 arial：capHeight/upem = 1467/2048 = 0.7163。旧 TTF 路径 fs=H（把 H 当 em）
+    //   → cap 只渲染 0.716H → 英文单行文字偏短 ~28%（GT 71.995 vs 渲染 51.491）。
+    //   正确：fs = H * (upem/capHeight) = H/0.7163 = 1.396H → cap=H → 宽 72.16（+0.23% 命中 GT）。
+    // 与已确立的 SHX 约定一致（SHX: s=H/above，above=cap 区）。本 helper 返回字号放大因子
+    //   factor = upem/capHeight；capHeight 未知（字体缺失/OS/2<2/CFF 轮廓）→ 返回 1.0（保持旧行为，不劣化）。
+    // 调用方：fs = H * scaleMul * bscale * TtfCapScale(family)。
+    private static readonly Dictionary<string, double> _ttfCapScaleCache = new(StringComparer.OrdinalIgnoreCase);
+    private static double TtfCapScale(string family)
+    {
+        if (string.IsNullOrEmpty(family)) return 1.0; // SHX（family=null）→ 不缩放
+        string first = family.Split(',')[0].Trim();
+        if (first.Length == 0) return 1.0;
+        if (_ttfCapScaleCache.TryGetValue(first, out double cached)) return cached;
+        double factor = 1.0;
+        try
+        {
+            string? path = PdfFontManager.FindTtf(first);
+            if (!string.IsNullOrEmpty(path))
+            {
+                var tf = TrueTypeFont.LoadFromFile(path!);
+                if (tf != null && tf.UnitsPerEm > 0 && tf.CapHeight > 0)
+                    factor = tf.UnitsPerEm / tf.CapHeight;
+            }
+        }
+        catch { factor = 1.0; } // 度量失败 → 回退 1.0（不劣化）
+        if (factor < 0.5) factor = 1.0;   // 异常值保护（capHeight 异常大）
+        if (factor > 2.5) factor = 2.5;   // 异常值保护（capHeight 异常小）
+        _ttfCapScaleCache[first] = factor;
+        return factor;
     }
 
     #endregion

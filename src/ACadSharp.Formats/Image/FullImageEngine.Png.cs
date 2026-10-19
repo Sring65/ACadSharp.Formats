@@ -77,7 +77,9 @@ internal partial class ImageEngine
             // （char→ushort 是无符号精确转换，优于 char→int），把 Unicode 码点当字形索引 → 越界返回 0。
             // 中文汉字码点大（U+4E00+）必越界 → advance 读成 0 → 渲染时后续字符叠上前字符（"文字重叠"）。
             total += fr.GetAdvanceWidth((int)txt[i]) / fr.UnitsPerEm;
-        return total * t.Height * wf;
+        // cap-height 字号映射（与 DrawTextPng 的 fs=H*TtfCapScale 一致，见 TtfCapScale）：
+        // 实际渲染宽度 = total/em * fs * wf = total/em * H * capScale * wf。
+        return total * t.Height * TtfCapScale(family) * wf;
     }
 
     public ImageExportResult WritePng(string outPath)
@@ -406,7 +408,7 @@ internal partial class ImageEngine
                     string family = ResolveFontFamily(GetStyleFont(t.Style));
                     double? wReal = _useRealTextWidth ? PngTextWidth(t, family) : null;
                     var (bx, by, brot, bscale) = TextBaseline(t, tr, wReal);
-                    double fs = t.Height * scaleMul * bscale;
+                    double fs = t.Height * scaleMul * bscale * TtfCapScale(family);
                     DrawTextPng(bx, by, t.Value ?? "", Math.Max(fs, 0.5), col, -brot, family, t.WidthFactor);
                 }
                 break;
@@ -492,19 +494,43 @@ internal partial class ImageEngine
                         }
                     if (pts.Count >= 2)
                     {
-                        double alen = ld.TextHeight > 1e-9 ? ld.TextHeight * scaleMul : Math.Max(w * 6.0, 4.0 * (tr?.Scale ?? 1.0));
                         bool arrow = ld.ArrowHeadEnabled; // DXF 组码71：缺省=有箭头，0=无箭头
-                        // 引线：有箭头时起点移到箭头底边中心（避免细线穿入实心三角内部）；无箭头时折线直达尖端 pts[0]
+                        // 箭头形状 + 缩放：LeaderArrow(341) 块 + ArrowSize(41, DIMASZ)。fallback 用旧启发式长度。
+                        double alen = Math.Max(w * 6.0, 4.0 * (tr?.Scale ?? 1.0));
+                        var (arrowBr, asz) = LeaderArrowResolve(ld, _doc, alen);
+                        var trA = arrow ? LeaderArrowTransform(pts, asz) : null;
+                        // 引线：有箭头时起点移到箭头底边中心（避免细线穿入箭头内部）；无箭头时折线直达尖端 pts[0]
                         var lp = new List<(double X, double Y)>(pts);
-                        if (arrow && LeaderArrowBase(pts, alen, out var lbx, out var lby))
-                            lp[0] = (lbx, lby);
+                        if (arrow && trA != null)
+                        {
+                            var bp = LeaderArrowBasePoint(pts, asz);
+                            lp[0] = (bp.X, bp.Y);
+                        }
                         // 水平着陆线（末段非水平时补画，供关联文字坐落）——独立于箭头，按 TextWidth/HookLineDirection 判断
                         if (LeaderLandingEndpoint(ld, pts, out var lex, out var ley))
                             lp.Add((lex, ley));
                         StrokePts(lp, false, col, w, dash);
-                        // 实心箭头三角（AutoCAD LEADER 默认实心；尖端 pts[0] 指向目标端）。无箭头(71=0)时不画
-                        if (arrow && LeaderArrowWings(ld, pts, alen, out var w1x, out var w1y, out var w2x, out var w2y))
-                            EmitQuadFillPng(new List<(double X, double Y)> { (pts[0].X, pts[0].Y), (w1x, w1y), (w2x, w2y) }, col);
+                        // 箭头（无箭头 71=0 时不画）：实心闭合=单个填充三角；其余按块几何描边/填充
+                        if (arrow && trA != null)
+                        {
+                            if (arrowBr != null && IsClosedFilledArrow(arrowBr))
+                            {
+                                var tip = trA.Apply(0, 0);
+                                var c1 = trA.Apply(-1.0, 0.16666667);
+                                var c2 = trA.Apply(-1.0, -0.16666667);
+                                EmitQuadFillPng(new List<(double X, double Y)> { tip, c1, c2 }, col);
+                            }
+                            else if (arrowBr != null)
+                            {
+                                var strokes = new List<List<(double X, double Y)>>();
+                                var fills = new List<List<(double X, double Y)>>();
+                                LeaderArrowGeom(arrowBr, trA, strokes, fills);
+                                foreach (var s in strokes) StrokePts(s, false, col, w, dash);
+                                foreach (var f in fills) EmitQuadFillPng(f, col);
+                            }
+                            else if (LeaderArrowWings(ld, pts, alen, out var w1x, out var w1y, out var w2x, out var w2y))
+                                EmitQuadFillPng(new List<(double X, double Y)> { (pts[0].X, pts[0].Y), (w1x, w1y), (w2x, w2y) }, col);
+                        }
                     }
                 }
                 break;

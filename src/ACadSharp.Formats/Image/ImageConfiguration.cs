@@ -45,6 +45,17 @@ public class ImageConfiguration
 	public int PngTileSize { get; set; } = 4096;
 
 	/// <summary>
+	/// PNG 分块时是否启用「点精灵缓存」（仅 PNG 光栅端、且 PngMergeToSingle=false 分块时生效）。
+	/// ⚠️ 默认 false（实测结论）：点符号在瓦片内本就稀疏，精灵缓存把点按 4r 包围盒渲染成大张离屏精灵，
+	///   blit 时按【精灵面积】逐像素遍历（99% 透明像素也要过一遍），开销远大于直接重画小字形。
+	///   实测 800 点/36 瓦片：开缓存 24.4s vs 关缓存 6.4s（**慢 4 倍**），且引入亚像素相位差（约 0.07% 像素）。
+	///   空间剔除（像素级精确，已默认开启）才是「PNG 太慢」的主解法（剔除 95%）。
+	/// true = 相同点符号（同 $PDMODE/半径/线宽/颜色/背景）离屏渲染 1 次 + 整数平移 blit；仅当存在大量
+	///   【大块/高密度】重复符号（渲染成本 ≫ blit 面积成本）时才有收益，一般点块场景请勿开启。
+	/// </summary>
+	public bool PngPointSpriteCache { get; set; } = false;
+
+	/// <summary>
 	/// 日志回调（进度/告警）。
 	/// </summary>
 	public Action<string> Log { get; set; }

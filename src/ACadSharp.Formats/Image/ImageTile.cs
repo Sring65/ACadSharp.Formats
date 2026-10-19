@@ -8,10 +8,14 @@ namespace ACadSharp.Formats.Image;
 /// tilePxW/tilePxH 为子区域像素尺寸），渲染时把整幅场景画进该子区域画布（越界像素自动裁剪）。
 /// 故每张瓦片的「0 点」（子区域左上角）与「对角点」（子区域右下角）对应的真实数据坐标可由
 /// 整幅画布包围盒（ImageExportResult.DataX0/X1/Y0/Y1）线性反算。
+///
+/// OGC WMTS 命名：瓦片按标准 WMTS 斜切图（slippy/quadkey 风格）三层地址 {z}/{row}/{col}.png 存放，
+/// z=缩放层级（本工具单层网格，默认 z=0）、row=自顶向下的行号、col=自左向右的列号。
+/// 文件路径 = {输出目录}/tiles/{z}/{row}/{col}.png（见 <see cref="RelPath"/>）。
 /// </summary>
 public sealed class ImageTile
 {
-    /// <summary>瓦片 PNG 文件名（不含目录）。</summary>
+    /// <summary>瓦片 PNG 文件名（不含目录，如 "0_0.png"）。</summary>
     public string FileName { get; init; } = "";
 
     /// <summary>瓦片 PNG 绝对路径。</summary>
@@ -28,4 +32,21 @@ public sealed class ImageTile
 
     /// <summary>瓦片左上角在整幅画布中的像素 Y 偏移。</summary>
     public int Py0 { get; init; }
+
+    /// <summary>OGC WMTS 缩放层级 z（单层网格默认 0）。</summary>
+    public int Z { get; init; }
+
+    /// <summary>OGC WMTS 列号 col（自左向右，0 起）。</summary>
+    public int X { get; init; }
+
+    /// <summary>OGC WMTS 行号 row（自顶向下，0 起）。</summary>
+    public int Y { get; init; }
+
+    /// <summary>
+    /// OGC WMTS 标准相对路径（正斜杠）：tiles/{z}/{row}/{col}.png。
+    /// 供坐标 JSON 与下游按 WMTS 协议取瓦片使用。
+    /// </summary>
+    [System.Text.Json.Serialization.JsonIgnore]
+    public string RelPath =>
+        "tiles/" + Z + "/" + Y + "/" + X + ".png";
 }

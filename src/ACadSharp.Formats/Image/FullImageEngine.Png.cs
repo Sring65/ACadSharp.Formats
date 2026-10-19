@@ -41,6 +41,187 @@ internal partial class ImageEngine
     private double PngSy(double y) => _h * _pngKy - (_margin * _pngKy + (y - _minY) * _pngKy) - _tileOy;
     private double PngK => (_pngKx + _pngKy) * 0.5;
 
+    #region ===== 空间剔除 + 文字精灵缓存（降低分块重复渲染）=====
+    //
+    // 性能优化（2026-10-19 用户：PNG 分块太慢、大量点块/文字被每个瓦片重复渲染）：
+    //   ① 空间剔除：预计算每个顶层实体的世界空间 AABB（与 ComputeExtents 同展开，含 Insert 嵌套），
+    //      分块时仅对与瓦片数据区域相交（按安全外扩）的实体调用 EmitEntityPng，跳过不相交实体。
+    //      像素级精确：AABB 不相交 ⇒ 该实体对本瓦片贡献 0 像素（含线宽/点字形半径/余量外扩保证不裁到）。
+    //   ② 点/文字精灵缓存：位置无关图形（点块/文字）按【全局像素比例】渲染一次到离屏透明精灵，再用整数
+    //      平移 alpha 合成 blit 到每个相交瓦片，相同符号跨瓦片只光栅化 1 次（大量点块场景收益最大）。
+    //      ⚠️ 亚像素相位量化（诚实说明）：精灵把锚点取整到整数像素栅格渲染，blit 亦按整数落点；而直接渲染
+    //      （无缓存）锚点落在真实【小数】像素。故缓存路径与直接渲染最多差 0.5px 亚像素相位——填充类字形
+    //      在 10× 下不可见，但 1px 细线（加号/X 臂）可能整体位移 1 个像素。空间剔除是逐像素精确的，本缓存
+    //      是标准"精灵图集"近似，换取"大量相同符号"的显著提速；若需逐字节一致请走无缓存直接渲染路径。
+    //
+    private List<Entity> _topEnts;
+    private (double minX, double minY, double maxX, double maxY)[] _topAabb;
+    private bool _cullReady;
+    private bool _tiledMode;                        // 仅分块模式启用精灵缓存（单图无重复，省离屏开销）
+    private const int MaxSprites = 8000;           // 精灵缓存上限（防内存膨胀）
+    private const int MaxSpriteSide = 8192;        // 单精灵边长上限（超此直接渲染不缓存）
+    private readonly Dictionary<string, PngSprite> _sprites = new();
+
+    private sealed class PngSprite
+    {
+        public byte[] Rgba;   // 精灵透明 RGBA 像素
+        public int W, H;      // 精灵像素尺寸
+        public int Bx, By;    // 精灵内锚点（图形中心/文字基线起点）的整数局部坐标
+    }
+
+    // 可变 AABB 持有器：局部函数 Ex 通过它累加（out 参数不能在 lambda/局部函数中赋值，故用引用类型）。
+    private sealed class AabbBox
+    {
+        public double mnx = double.MaxValue, mny = double.MaxValue, mxx = double.MinValue, mxy = double.MinValue;
+        public bool any = false;
+        public void Ex(double x, double y) { if (x < mnx) mnx = x; if (y < mny) mny = y; if (x > mxx) mxx = x; if (y > mxy) mxy = y; any = true; }
+    }
+
+    // 取实体的世界空间 AABB（与 ComputeExtents 的逐类型展开一致；Insert 用 ExpandInsert 世界点）。
+    // 未知类型/无限线(XLine/Ray)返回覆盖全图盒（保证不被剔除）。
+    private bool EntityWorldAabb(Entity ent, out double mnx, out double mny, out double mxx, out double mxy)
+    {
+        var b = new AabbBox();
+        switch (ent)
+        {
+            case Point pt: b.Ex(pt.Location.X, pt.Location.Y); break;
+            case Line ln: b.Ex(ln.StartPoint.X, ln.StartPoint.Y); b.Ex(ln.EndPoint.X, ln.EndPoint.Y); break;
+            case MLine ml: foreach (var el in MLineElements(ml, null)) foreach (var p in el.Center) b.Ex(p.X, p.Y); break;
+            case LwPolyline p2: foreach (var p in LwPolylineSamplePoints(p2, null)) b.Ex(p.X, p.Y); break;
+            case Polyline3D p3: foreach (var v in p3.Vertices) if (IsDisplayVertex(v)) b.Ex(v.Location.X, v.Location.Y); break;
+            case Polyline2D p2d: foreach (var v in p2d.Vertices) if (IsDisplayVertex(v)) b.Ex(v.Location.X, v.Location.Y); break;
+            case Mesh mesh: if (mesh.Vertices != null) foreach (var v in mesh.Vertices) b.Ex(v.X, v.Y); break;
+            case PolyfaceMesh pf: if (pf.Vertices != null) foreach (var v in pf.Vertices) b.Ex(v.Location.X, v.Location.Y); break;
+            case PolygonMesh pm: if (pm.Vertices != null) foreach (var v in pm.Vertices) b.Ex(v.Location.X, v.Location.Y); break;
+            case Wipeout wo: foreach (var p in WipeoutWorldPoly(wo, null)) b.Ex(p.X, p.Y); break;
+            case Arc a: b.Ex(a.Center.X - a.Radius, a.Center.Y - a.Radius); b.Ex(a.Center.X + a.Radius, a.Center.Y + a.Radius); break;
+            case Circle c: b.Ex(c.Center.X - c.Radius, c.Center.Y - c.Radius); b.Ex(c.Center.X + c.Radius, c.Center.Y + c.Radius); break;
+            case Ellipse el: { double r = Math.Max(el.MajorAxis, el.MinorAxis) / 2.0; b.Ex(el.Center.X - r, el.Center.Y - r); b.Ex(el.Center.X + r, el.Center.Y + r); break; }
+            case TextEntity t: ExpandTextBox(t.InsertPoint.X, t.InsertPoint.Y, TextMetrics(t), b.Ex); break;
+            case MText mt: ExpandTextBox(mt.InsertPoint.X, mt.InsertPoint.Y, TextMetrics(mt), b.Ex); break;
+            case Solid sd: b.Ex(sd.FirstCorner.X, sd.FirstCorner.Y); b.Ex(sd.SecondCorner.X, sd.SecondCorner.Y); b.Ex(sd.ThirdCorner.X, sd.ThirdCorner.Y); b.Ex(sd.FourthCorner.X, sd.FourthCorner.Y); break;
+            case Face3D fd: b.Ex(fd.FirstCorner.X, fd.FirstCorner.Y); b.Ex(fd.SecondCorner.X, fd.SecondCorner.Y); b.Ex(fd.ThirdCorner.X, fd.ThirdCorner.Y); b.Ex(fd.FourthCorner.X, fd.FourthCorner.Y); break;
+            case Spline sp: foreach (var p in SplineSample(sp, null, 4)) b.Ex(p.X, p.Y); break;
+            case Hatch ht: foreach (var loop in BuildHatchLoops(ht, null)) foreach (var p in loop) b.Ex(p.X, p.Y); break;
+            case RasterImage ri:
+                {
+                    b.Ex(ri.InsertPoint.X, ri.InsertPoint.Y);
+                    b.Ex(ri.InsertPoint.X + ri.UVector.X * ri.Size.X, ri.InsertPoint.Y + ri.UVector.Y * ri.Size.Y);
+                    b.Ex(ri.InsertPoint.X + ri.VVector.X * ri.Size.Y, ri.InsertPoint.Y + ri.VVector.Y * ri.Size.Y);
+                    break;
+                }
+            case Insert ins: ExpandInsert(ins, b.Ex); break;
+            case XLine _: b.mnx=_minX; b.mny=_minY; b.mxx=_maxX; b.mxy=_maxY; b.any=true; break; // 无限线：不剔除
+            case Ray _: b.mnx=_minX; b.mny=_minY; b.mxx=_maxX; b.mxy=_maxY; b.any=true; break;
+            default: b.mnx=_minX; b.mny=_minY; b.mxx=_maxX; b.mxy=_maxY; b.any=true; break; // 未知：不剔除（安全）
+        }
+        mnx=b.mnx; mny=b.mny; mxx=b.mxx; mxy=b.mxy;
+        return b.any;
+    }
+
+    // 递归取文档所有实体（含块嵌套）在各自缩放下的最大线宽半宽（数据单位），用于剔除安全外扩。
+    private double MaxHalfStroke(Entity ent, double scaleMul)
+    {
+        double max = 0;
+        if (ent is Insert ins)
+        {
+            if (ins.Block == null) return 0;
+            double s = ins.XScale; if (ins.YScale > s) s = ins.YScale; if (s < 0) s = -s;
+            double cs = scaleMul * (s > 1e-9 ? s : 1.0);
+            foreach (var e in ins.Block.Entities) { double m = MaxHalfStroke(e, cs); if (m > max) max = m; }
+            if (ins.Attributes != null) foreach (var a in ins.Attributes) { double m = MaxHalfStroke(a, scaleMul); if (m > max) max = m; }
+            return max;
+        }
+        // 线型实体（含线宽）
+        try { max = StrokeWidth(ent, scaleMul) * 0.5; } catch { max = 0; }
+        return max;
+    }
+
+    // 预计算顶层实体世界 AABB（含安全外扩），供分块按瓦片剔除。须在 _h/_w 定稿（ExpandViewForPointGlyphs 后）调用。
+    private void BuildCullData()
+    {
+        _topEnts = AllEntities().ToList();
+        var abbs = new (double minX, double minY, double maxX, double maxY)[_topEnts.Count];
+        double maxHalf = 0;
+        foreach (var e in _topEnts) { double m = MaxHalfStroke(e, 1.0); if (m > maxHalf) maxHalf = m; }
+        double inflate = maxHalf + PointGlyphRadius() + 1.0; // 线宽半宽 + 点字形半径 + 余量（数据单位）
+        for (int i = 0; i < _topEnts.Count; i++)
+        {
+            if (EntityWorldAabb(_topEnts[i], out double a, out double b, out double c, out double d))
+                abbs[i] = (a - inflate, b - inflate, c + inflate, d + inflate);
+            else
+                abbs[i] = (-double.MaxValue, -double.MaxValue, double.MaxValue, double.MaxValue); // 空盒=总是渲染（保守）
+        }
+        _topAabb = abbs;
+        _cullReady = true;
+    }
+
+    // 与瓦片数据区域相交的顶层实体（剔除后）。dx0/dy0=瓦片数据左下，dx1/dy1=瓦片数据右上。
+    private IEnumerable<Entity> CulledTopEntities(double dx0, double dy0, double dx1, double dy1)
+    {
+        if (!_cullReady) { foreach (var e in AllEntities()) yield return e; yield break; }
+        for (int i = 0; i < _topEnts.Count; i++)
+        {
+            var bb = _topAabb[i];
+            if (bb.minX < dx1 && bb.maxX > dx0 && bb.minY < dy1 && bb.maxY > dy0)
+                yield return _topEnts[i];
+        }
+    }
+
+    // 把缓存精灵 blit 到当前瓦片画布：锚点(全局像素)对齐 sp 内 (Bx,By)，整数平移（越界由 BlitRgba 裁剪）。
+    // 光栅化是像素位置的纯函数，整数平移不改变亚像素 AA 覆盖 → 与逐瓦片重绘视觉一致。
+    private void BlitSprite(PngSprite sp, double anchorX, double anchorY)
+    {
+        // 锚点全局像素 = 当前 PngSx/PngSy + 当前瓦片偏移（还原到整幅画布系）
+        double gxg = PngSx(anchorX) + _tileOx;
+        double gyg = PngSy(anchorY) + _tileOy;
+        int sx = (int)Math.Round(gxg - sp.Bx - _tileOx);
+        int sy = (int)Math.Round(gyg - sp.By - _tileOy);
+        _rc.BlitRgba(sp.Rgba, sp.W, sp.H, sx, sy);
+    }
+
+    // 通用精灵缓存渲染（位置无关图形：点块/文字/MText）。命中→blit；未命中→离屏按全局比例渲染一次缓存后 blit。
+    //   anchorX/Y：图形锚点（世界数据坐标）；点=中心、文字=基线起点。
+    //   left/right：锚点左/右延伸（数据单位，>=0）；top/bottom：锚点上方/下方延伸（数据单位，>=0，世界 y 向上）。
+    //   draw：把该图形画到「当前 _rc」的委托（内部用 PngSx/PngSy 映射世界点 → 随 _rc/_tileOx/_tileOy 重定位）。
+    // 关键：渲染离屏精灵时临时把 _tileOx/_tileOy 设为「全局像素 - 锚点局部偏移」，使 PngSx(anchor)=Bx、PngSy(anchor)=By，
+    //       从而同一图形在离屏精灵与任意瓦片里像素坐标完全一致（仅整数平移之差）。
+    private bool TryEmitSprite(string key, double anchorX, double anchorY,
+        double left, double right, double top, double bottom, Action draw)
+    {
+        if (_sprites.TryGetValue(key, out var hit)) { BlitSprite(hit, anchorX, anchorY); return true; }
+
+        double k = PngK;
+        int pad = 2;
+        int Bx = (int)Math.Ceiling(Math.Max(left, 0) * k) + pad;     // 锚点在精灵内的 x
+        int By = (int)Math.Ceiling(Math.Max(top, 0) * k) + pad;       // 锚点在精灵内的 y（上=small y）
+        int sw = (int)Math.Ceiling((Math.Max(left, 0) + Math.Max(right, 0)) * k) + Bx + pad;
+        int sh = (int)Math.Ceiling((Math.Max(top, 0) + Math.Max(bottom, 0)) * k) + By + pad;
+        if (sw < 1) sw = 1; if (sh < 1) sh = 1;
+        if (sw > MaxSpriteSide || sh > MaxSpriteSide || _sprites.Count >= MaxSprites)
+        {
+            draw(); // 过大/缓存满：直接渲染（仍受剔除保护）
+            return true;
+        }
+
+        var sprite = new RasterCanvas(sw, sh);
+        sprite.Clear(0, 0, 0, 0);
+        // 临时重定位：让锚点映射到精灵内 (Bx,By)。PngSx_global(a)=PngSx(当前)(a)+_tileOx；
+        // 设 _tileOx = PngSx_global(a) - Bx ⇒ PngSx(精灵)(a)=PngSx_global(a)-_tileOx=Bx。
+        double prevOx = _tileOx, prevOy = _tileOy; var prevRc = _rc;
+        _rc = sprite;
+        _tileOx = PngSx(anchorX) + _tileOx - Bx;
+        _tileOy = PngSy(anchorY) + _tileOy - By;
+        try { draw(); } finally { _rc = prevRc; _tileOx = prevOx; _tileOy = prevOy; }
+
+        var sp = new PngSprite { Rgba = sprite.ToRgbaBuffer(), W = sw, H = sh, Bx = Bx, By = By };
+        _sprites[key] = sp;
+        BlitSprite(sp, anchorX, anchorY);
+        return true;
+    }
+
+    #endregion
+
     #region ===== 颜色工具 =====
 
     // hex(#RRGGBB) → Rgb（带缓存；引擎内所有颜色均为该格式）
@@ -137,6 +318,7 @@ internal partial class ImageEngine
     private ImageExportResult WritePngSingle(string outPath, int W, int H, bool merged)
     {
         _skippedCounts.Clear();
+        _tiledMode = false; _sprites.Clear(); // 单图：无跨瓦片重复，关闭精灵缓存（省离屏开销）
         _useRealTextWidth = true; // PNG 端：文字对齐锚点用真实字体度量（修正居中/右对正漂移）
         var rc = new RasterCanvas(W, H);
         ClearPngBg(rc);
@@ -173,14 +355,16 @@ internal partial class ImageEngine
         int rows = (int)Math.Ceiling(fullH / (double)tile);
 
         string dir = Path.GetDirectoryName(Path.GetFullPath(outPath)) ?? ".";
-        string noExt = Path.GetFileNameWithoutExtension(outPath);
-        string ext = Path.GetExtension(outPath);
+        string ext = string.IsNullOrEmpty(Path.GetExtension(outPath)) ? ".png" : Path.GetExtension(outPath);
 
         _skippedCounts.Clear();
+        _tiledMode = true; _sprites.Clear(); // 分块模式启用精灵缓存：相同点/文字跨瓦片只渲染一次、其余瓦片整数平移 blit
         _useRealTextWidth = true;
+        BuildCullData(); // 预计算顶层实体世界 AABB（含线宽/点字形安全外扩），供按瓦片空间剔除
 
         var tiles = new List<ImageTile>();
         int seq = 0;
+        long renderedPairs = 0, totalPairs = 0;
         for (int cy = 0; cy < rows; cy++)
         {
             int y0 = cy * tile;
@@ -199,12 +383,27 @@ internal partial class ImageEngine
                 _pngKx = (double)fullW / _w;
                 _pngKy = (double)fullH / _h;
                 _tileOx = x0; _tileOy = y0;
-                foreach (var ent in AllEntities())
+
+                // 空间剔除：仅渲染与瓦片数据区域相交的顶层实体（AABB 不相交 ⇒ 本瓦片 0 像素贡献，像素级安全）。
+                // 瓦片像素 [x0,x0+tw]×[y0,y0+th] → 数据坐标矩形（Y 翻转）。
+                double dx0 = _minX - _margin + x0 / (double)_pngKx;
+                double dx1 = _minX - _margin + (x0 + tw) / (double)_pngKx;
+                double dy1 = _maxY + _margin - y0 / (double)_pngKy;
+                double dy0 = _maxY + _margin - (y0 + th) / (double)_pngKy;
+                totalPairs += _topEnts != null ? _topEnts.Count : 0;
+                foreach (var ent in CulledTopEntities(dx0, dy0, dx1, dy1))
+                {
                     EmitEntityPng(ent, null, 1.0, 7, null, null, _ltScale);
+                    renderedPairs++;
+                }
                 _rc = null;
 
-                string name = (cols == 1 && rows == 1) ? $"{noExt}{ext}" : $"{noExt}_tile_{seq:000}{ext}";
-                string fp = Path.Combine(dir, name);
+                // OGC WMTS 标准命名：tiles/{z}/{row}/{col}.png（z=0 单层网格，row=cy 自顶向下，col=cx 自左向右）。
+                // 叶子文件名即 col（同一 (z,row) 目录下 col 唯一，无碰撞），与 ImageTile.RelPath 一致。
+                const int z = 0;
+                string name = $"{cx}{ext}";
+                string fp = Path.Combine(dir, "tiles", z.ToString(), cy.ToString(), name);
+                Directory.CreateDirectory(Path.GetDirectoryName(fp));
                 if (!rc.SavePng(fp))
                 {
                     _log($"❌  PNG 瓦片写文件失败：{fp}");
@@ -218,13 +417,18 @@ internal partial class ImageEngine
                     TilePxH = th,
                     Px0 = x0,
                     Py0 = y0,
+                    Z = z,
+                    X = cx,
+                    Y = cy,
                 });
                 seq++;
             }
         }
 
         LogSkipped("PNG");
-        _log($"✅  PNG 分块输出：{seq} 张瓦片（{cols} 列 × {rows} 行，单瓦片 ≤ {tile}×{tile}px，整幅 {fullW}×{fullH} @1:1×{F(zoom)}{(_transparentBg ? "，透明背景" : "")}）→ {dir}\\{noExt}_tile_*.png");
+        double skipPct = totalPairs > 0 ? 100.0 * (1 - (double)renderedPairs / totalPairs) : 0;
+        _log($"✅  PNG 分块输出：{seq} 张瓦片（{cols} 列 × {rows} 行，单瓦片 ≤ {tile}×{tile}px，整幅 {fullW}×{fullH} @1:1×{F(zoom)}，OGC WMTS 命名 tiles/0/{{row}}/{{col}}.png{(_transparentBg ? "，透明背景" : "")}）");
+        _log($"   空间剔除：{seq} 瓦片共需 {totalPairs} 次实体渲染，实际 {renderedPairs} 次（剔除 {skipPct:F0}%）");
         return PngResult(fullW, fullH, false, tiles);
     }
 
@@ -474,7 +678,24 @@ internal partial class ImageEngine
                     var (cx, cy) = tr == null ? (pt.Location.X, pt.Location.Y) : tr.Apply(pt.Location.X, pt.Location.Y);
                     double lw = StrokeWidth(ent, scaleMul);
                     var col = HexToRgb(ColorOf(EntityAciIndex(ent), layerAci, byBlockAci));
-                    EmitPointPng(cx, cy, col, lw);
+                    // 分块 + 开启点精灵缓存时走离屏精灵 blit；否则逐瓦片直接光栅化（像素级精确）。
+                    bool usePtSprite = _tiledMode && _opt.PngPointSpriteCache;
+                    if (usePtSprite)
+                    {
+                        // 点字形以中心为原点、位置无关，仅由 (PDMODE, 半径, 线宽, 颜色, 背景) 决定
+                        // → 相同点符号跨瓦片只光栅化 1 次，其余瓦片整数平移 blit（大量点块场景收益最大）。
+                        // ⚠️ 亚像素相位量化见 ImageConfiguration.PngPointSpriteCache（1px 细线可能位移 1 像素）。
+                        double k = PngK;
+                        double r = PointGlyphRadius();
+                        double wPx = Math.Max(lw * k, 1.0);
+                        double ext = 2.0 * r + 0.5 * wPx / k + 1.0 / k; // 加号/X 半伸出 2r + 线宽半宽 + 1px 余量（数据单位）
+                        string key = "P" + _pdMode + "|" + r.ToString("R") + "|" + wPx.ToString("R")
+                            + "|" + col.R + "," + col.G + "," + col.B
+                            + "|" + (_transparentBg ? 1 : 0) + (_whiteBg ? 1 : 0);
+                        TryEmitSprite(key, cx, cy, ext, ext, ext, ext, () => EmitPointPng(cx, cy, col, lw));
+                    }
+                    else
+                        EmitPointPng(cx, cy, col, lw);
                 }
                 break;
 
@@ -1155,14 +1376,16 @@ internal partial class ImageEngine
                 {
                     // \S<num>/<den> 分数：分子/分母上下分层 + 中间分数线（与 SVG 端一致）
                     string col = run.Color.HasValue ? AciColor(run.Color.Value) : baseCol;
-                    double fs = Math.Max(run.Height * scaleMul, 0.2);
-                    string fam = ResolveFontFamily(!string.IsNullOrEmpty(run.Font) ? run.Font : styleFont);
+                    string fracFont = !string.IsNullOrEmpty(run.Font) ? run.Font : styleFont;
+                    string fam = ResolveFontFamily(fracFont);
+                    double fracCap = TtfCapScale(fam);
+                    double fs = Math.Max(run.Height * scaleMul * fracCap, 0.2);
                     int sl = run.Text.IndexOf('/');
                     string num = run.Text.Substring(0, sl);
                     string den = sl + 1 < run.Text.Length ? run.Text.Substring(sl + 1) : "";
                     double wf = run.WidthFactor > 0 ? run.WidthFactor : 1.0;
-                    double numW = EstimateTextWidth(num, run.Height) * wf * scaleMul;
-                    double denW = EstimateTextWidth(den, run.Height) * wf * scaleMul;
+                    double numW = EstimateTextWidth(num, run.Height) * wf * scaleMul * fracCap;
+                    double denW = EstimateTextWidth(den, run.Height) * wf * scaleMul * fracCap;
                     double fracW = Math.Max(numW, denW);
                     // 分数堆叠几何（CAD y 向上，相对主基线；与 SVG 端同一套 AutoCAD 实测值）
                     double H = run.Height;
@@ -1219,9 +1442,13 @@ internal partial class ImageEngine
                     }
                     else
                     {
-                        // 回退 TTF（含 CJK 无 bigfont / 内联 TTF / 字形缺失）→ 原 DrawTextPng（行为不变）
+                        // 回退 TTF（含 CJK 无 bigfont / 内联 TTF / 字形缺失）→ DrawTextPng
                         string fam = ResolveFontFamily(effFont);
-                        DrawTextPng(ox, oy, run.Text, fs, col, -rot, fam, wf,
+                        // TTF cap-height 字号映射（Phase 2）：AutoCAD 把 H 当 cap height，非 em。
+                        // 与单行 TTF（line 510）及宽度估算 TtfMTextWidth 一致——此前 MText TTF 未套
+                        // cap-scale，字形比单行/AutoCAD 小 ~28%（"多行富文本字体不一致"）。SHX 分支不受影响。
+                        double ttfFs = Math.Max(run.Height * scaleMul * TtfCapScale(fam), 0.2);
+                        DrawTextPng(ox, oy, run.Text, ttfFs, col, -rot, fam, wf,
                             run.Bold, run.Italic, EffOblique(run), run.Underline, run.Overline, rw, run.Tracking);
                     }
                 }

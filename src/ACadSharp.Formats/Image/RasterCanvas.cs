@@ -340,6 +340,33 @@ internal sealed class RasterCanvas
         }
     }
 
+    /// <summary>
+    /// 把一张透明 RGBA 精灵（sprite）按【整数】像素偏移 blit 到画布（alpha over 合成，越界自动裁剪）。
+    /// 用于点/文字精灵缓存：精灵先渲染到离屏透明画布（锚点取整数全局像素原点），再按瓦片整数偏移
+    /// 平移合成——因光栅化是像素位置的纯函数，整数平移不改变亚像素 AA 覆盖，故与逐瓦片重绘像素级一致。
+    /// sw/sh 为精灵宽高（像素）；sx/sy 为精灵左上角在画布中的整数落点（可为负，越界裁剪）。
+    /// </summary>
+    public void BlitRgba(byte[] rgba, int sw, int sh, int sx, int sy)
+    {
+        if (rgba == null || sw <= 0 || sh <= 0 || rgba.Length < sw * sh * 4) return;
+        for (int yy = 0; yy < sh; yy++)
+        {
+            int dy = sy + yy;
+            if (dy < 0 || dy >= Height) continue;
+            int srow = yy * sw * 4;
+            int drow = dy * Width * 4;
+            for (int xx = 0; xx < sw; xx++)
+            {
+                int dx = sx + xx;
+                if (dx < 0 || dx >= Width) continue;
+                int si = srow + xx * 4;
+                byte sa = rgba[si + 3];
+                if (sa == 0) continue;
+                Blend(dx, dy, rgba[si], rgba[si + 1], rgba[si + 2], sa / 255f);
+            }
+        }
+    }
+
     // ===== PNG 编码（零依赖：ZLibStream + CRC32）=====
 
     private static readonly byte[] _pngSig = { 137, 80, 78, 71, 13, 10, 26, 10 };

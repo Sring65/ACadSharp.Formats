@@ -3187,6 +3187,28 @@ internal partial class ImageEngine
         return true;
     }
 
+    // 末字尾部留白（世界单位）：SHX latin 字形 advance − 墨迹右缘（字体单位）经 cap-height 缩放映射世界。
+    // 仅处理 latin（非 CJK）；bigfont CJK 走方格 advance、墨迹通常填满方格，暂不计尾留白（保守）。
+    private double ShxTrailingGapWorld(string text, double H, double wf, string fontName, string bigFontName)
+    {
+        if (string.IsNullOrEmpty(text)) return 0;
+        int last = text.Length - 1;
+        while (last >= 0 && char.IsWhiteSpace(text[last])) last--;
+        if (last < 0) return 0;
+        char ch = text[last];
+        if (ch >= 0x2E80) return 0; // CJK bigfont → 不计
+        if (!(H > 1e-9)) return 0;
+        if (!(wf > 1e-9)) wf = 1.0;
+        if (!TryResolveShxFaces(fontName, bigFontName, out ShxFont latin, out _)) return 0;
+        if (latin == null) return 0;
+        if (!latin.TryGetAdvance(ch, out float advF)) return 0;
+        if (!latin.TryGetInkRight(ch, out float inkR)) return 0;
+        double gapFont = advF - inkR;
+        if (gapFont <= 0) return 0;
+        double s = ShxHeightScale(latin, H); // cap height 映射 H（同 TryShxRunAdvance）
+        return gapFont * s * wf;
+    }
+
     #endregion
 
     #region ===== MTEXT 多行文字 =====
@@ -3248,6 +3270,21 @@ internal partial class ImageEngine
         double w = wPerH * H * wf;
         w += MTextTrackingAdd(r, text.Length) * cap;
         return w;
+    }
+
+    // 末字尾部留白（世界单位）：advance − 墨迹右缘。换行判定须剔除（AutoCAD 以末字墨迹越界为准）。
+    // text 取去尾随空白后的串，取末尾非空白字符度量。TTF：字体单位 (adv−xMax) 经 cap·H·wf/upem 映射到世界。
+    private static double TtfTrailingGapWorld(string text, double H, double wf, string font)
+    {
+        if (string.IsNullOrEmpty(text)) return 0;
+        int last = text.Length - 1;
+        while (last >= 0 && char.IsWhiteSpace(text[last])) last--;
+        if (last < 0) return 0;
+        var tf = GetTtfForWidth(font);
+        if (tf == null || tf.UnitsPerEm <= 0) return 0;
+        double cap = TtfCapScale(font);
+        double scale = (cap * H * wf) / tf.UnitsPerEm; // 世界单位/字体单位（与 TtfMTextWidth 一致）
+        return tf.GetGlyphTrailingGap(text[last]) * scale;
     }
 
     private double MTextRunWidth(MTextRun r, string styleFont, string styleBig)
@@ -3583,9 +3620,9 @@ internal partial class ImageEngine
             layout.MaxLineWidth = Math.Max(layout.MaxLineWidth, ln.Width);
     }
 
-    // 行距（基线到基线）：AutoCAD 默认 1× 行距 = 字体定义的“自然行高占位”（非 1.5× 硬编码、亦非字形墨迹实际高宽）。
-    //   自然行高比值 = 基线到基线距离 ÷ 字高 H；TTF = (Ascent-Descent+LineGap)/CapHeight，SHX = (Above+Below)/Above (=em/cap 区)。
-    //   Exact=直接用组码44值；AtLeast=max(44值, 自然行高)；默认=自然行高。
+    // 行距（基线到基线）：AutoCAD 默认 1×（单倍）行距 = 字体定义的占位行高。
+    //   TTF = (Ascent-Descent+LineGap)/CapHeight；SHX = 1.66（官方文档“单倍行距=字符高度1.66倍”统一值）。
+    //   Exact=直接用组码44值；AtLeast=max(44值, 占位行高)；默认=占位行高。
     private double MTextLineGap(MTextLine prev, MTextLine cur, LineSpacingStyleType style, double factor, double lineRatio)
     {
         double maxH = Math.Max(Math.Max(prev.MaxHeight, cur.MaxHeight), 0.1);
@@ -3601,12 +3638,16 @@ internal partial class ImageEngine
         }
     }
 
-    // 字体“自然行高占位”比值（世界单位 gap ÷ 字高 H），即 AutoCAD 默认 1× 行距所依据的“字体定义占位高度”。
-    // TTF 取 (Ascent-Descent+LineGap)/CapHeight（cap=0 时退化为 /UnitsPerEm）；SHX 取 (Above+Below)/Above（=em/cap 区）。
-    // 【关键】读取字体度量定义里的占位，而非字形渲染墨迹的实际高宽——保证 1× 行距与 AutoCAD 一致。
+    // 字体“自然行高占位”比值（世界单位 gap ÷ 字高 H），即 AutoCAD 默认 1×（单倍）行距所依据的“字体定义占位高度”。
+    // TTF 取 (Ascent-Descent+LineGap)/CapHeight（cap=0 时退化为 /UnitsPerEm）——SimSun=1.6686，经实测校准。
+    // SHX：AutoCAD 官方文档明确“单倍行距 = 文字字符高度的 1.66 倍”（统一常数，与字体 above/below 无关）。
+    //   ✗ 旧公式 (Above+Below)/Above = 28/21 = 1.333 → 比 AutoCAD 窄 ~24%（图#3“间距不一致”根因）。
+    //   ✗ SHX LF(shape#10) 下移量（simplex=36/21=1.714）仅用于 DTEXT 重复换行，非 MTEXT。
+    //   ✓ 实测默认 1× = 1.665×H ≈ 文档 1.66×H；1.5× = 1.5×单倍。故 SHX 固定取 MTextShxSingleSpacing。
+    private const double MTextShxSingleSpacing = 1.66;
     private double MTextFontLineRatio(string font, string styleBig)
     {
-        if (string.IsNullOrEmpty(font)) return 1.5; // 无字体（纯形状）→ 保守默认
+        if (string.IsNullOrEmpty(font)) return MTextShxSingleSpacing; // 无字体（纯形状）→ 文档统一默认
         // TTF（含 CJK）：族名→ttf，取 hhea/OS/2 自然行高（SimSun: (220-(-36)+36)/175 = 1.6686）
         var tf = GetTtfForWidth(font);
         if (tf != null && tf.UnitsPerEm > 0)
@@ -3615,14 +3656,10 @@ internal partial class ImageEngine
             double nat = (tf.Ascent - tf.Descent + tf.LineGap) / denom;
             if (nat > 0.5 && nat < 4.0) return nat;
         }
-        // SHX：字体文件名→shx，取 above/below 定义占位（simplex.shx: (21+7)/21 = 1.3333）
+        // SHX：MTEXT 单倍行距 = 1.66×H（官方文档统一常数，见上注释）
         var shx = GetShapeFont(font);
-        if (shx != null && shx.Above > 0)
-        {
-            double nat = (double)(shx.Above + shx.Below) / shx.Above; // em / cap 区
-            if (nat > 0.5 && nat < 4.0) return nat;
-        }
-        return 1.5;
+        if (shx != null) return MTextShxSingleSpacing;
+        return MTextShxSingleSpacing;
     }
 
     // 按参考列宽（组码41）换行：CJK 逐字可断，拉丁按词（含尾随空格）断
@@ -3717,7 +3754,8 @@ internal partial class ImageEngine
                 string eFont = !string.IsNullOrEmpty(run.Font) ? run.Font : styleFont;
                 string eBig = string.IsNullOrEmpty(run.Font) ? styleBig : null;
                 double wf = run.WidthFactor > 0 ? run.WidthFactor : 1.0;
-                double fw = TryShxRunAdvance(eFont, eBig, t, run.Height, wf, out double wFull) ? wFull
+                bool shxOK = TryShxRunAdvance(eFont, eBig, t, run.Height, wf, out double wFull);
+                double fw = shxOK ? wFull
                     : TtfMTextWidth(t, run.Height, wf, eFont, run);
                 // 换行判定用【去掉尾随空白】的宽：行尾空白 AutoCAD 不渲染、不计入列宽
                 // （否则「multiline text.」恰好 80 单位时会因尾随空格被误判越界而提前断行）。
@@ -3727,10 +3765,19 @@ internal partial class ImageEngine
                 if (tTrim.Length != t.Length)
                 {
                     if (tTrim.Length == 0) fwText = 0;
-                    else fwText = TryShxRunAdvance(eFont, eBig, tTrim, run.Height, wf, out double wT) ? wT
+                    else fwText = shxOK ? (TryShxRunAdvance(eFont, eBig, tTrim, run.Height, wf, out double wT) ? wT : fw)
                         : TtfMTextWidth(tTrim, run.Height, wf, eFont, run);
                 }
-                if (hasText && curW + fwText > refWidth) FlushCur();
+                // 换行判定须用【末字墨迹右缘】而非 advance 占位：advance 含末字右侧留白（CJK 约 6% em），
+                // 导致比 AutoCAD 早换行（导出图多换行、AutoCAD 不换行）。墨迹右缘 = advance − 尾留白。
+                // 定位 pen 仍按 advance 累加（保证字间距/字母定位正确），仅换行测试剔除尾留白。
+                string inkSrc = tTrim.Length == 0 ? t : tTrim;
+                double trailing = shxOK
+                    ? ShxTrailingGapWorld(inkSrc, run.Height, wf, eFont, eBig)
+                    : TtfTrailingGapWorld(inkSrc, run.Height, wf, eFont);
+                double inkExtent = fwText - trailing;
+                if (inkExtent < 0) inkExtent = 0;
+                if (hasText && curW + inkExtent > refWidth) FlushCur();
                 if (!string.IsNullOrWhiteSpace(t)) hasText = true;
                 cur.Add((t, run));
                 curW += fw;
@@ -3779,8 +3826,11 @@ internal partial class ImageEngine
             double ratio = MTextFontLineRatio(lineFont, styleBig);
             baselines[i] = baselines[i - 1] - MTextLineGap(layout.Lines[i - 1], layout.Lines[i], mt.LineSpacingStyle, mt.LineSpacing, ratio);
         }
-        // 文本框：顶=首行基线+0.8×行高（上升部），底=末行基线-0.2×行高（下降部）
-        double top = 0.8 * layout.Lines[0].MaxHeight;
+        // 文本框：顶=首行基线 + cap height（字高 H 即 cap：H→大写顶部，见 ShxHeightScale/TtfCapScale）。
+        //   H 对应 cap height（非 em），故首行 cap 顶 = baseline + MaxHeight。旧值 0.8×H 使 cap 高出
+        //   插入点 0.2×H（图#2“顶部高出插入点”根因）；改为 MaxHeight 使首行 cap 顶恰在插入点（图#1 实测，不超出）。
+        //   底=末行基线 − 0.2×行高（下降部，容纳 g/p/y 等下伸部）。
+        double top = layout.Lines[0].MaxHeight;
         double bottom = baselines[n - 1] - 0.2 * layout.Lines[n - 1].MaxHeight;
         double boxH = top - bottom;
         double anchorX = 0, anchorY = top;

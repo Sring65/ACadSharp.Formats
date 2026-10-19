@@ -3621,7 +3621,8 @@ internal partial class ImageEngine
     }
 
     // 行距（基线到基线）：AutoCAD 默认 1×（单倍）行距 = 字体定义的占位行高。
-    //   TTF = (Ascent-Descent+LineGap)/CapHeight；SHX = 1.66（官方文档“单倍行距=字符高度1.66倍”统一值）。
+    //   用户公式：行距 = 字体占位高 × 字体大小(字高) × 行距倍数 + 固定间隙。
+    //   实测 1.5× 行距 = 1.5×单倍（比值精确 1.5）→ 倍数为整体缩放，固定间隙已含在占位高内（SHX=below、TTF=LineGap）故加项为 0。
     //   Exact=直接用组码44值；AtLeast=max(44值, 占位行高)；默认=占位行高。
     private double MTextLineGap(MTextLine prev, MTextLine cur, LineSpacingStyleType style, double factor, double lineRatio)
     {
@@ -3639,11 +3640,16 @@ internal partial class ImageEngine
     }
 
     // 字体“自然行高占位”比值（世界单位 gap ÷ 字高 H），即 AutoCAD 默认 1×（单倍）行距所依据的“字体定义占位高度”。
-    // TTF 取 (Ascent-Descent+LineGap)/CapHeight（cap=0 时退化为 /UnitsPerEm）——SimSun=1.6686，经实测校准。
-    // SHX：AutoCAD 官方文档明确“单倍行距 = 文字字符高度的 1.66 倍”（统一常数，与字体 above/below 无关）。
+    // 用户公式：行距 = 字体占位高 × 字体大小(字高) × 行距倍数 + 固定间隙。
+    //   TTF 占位高 = (Ascent-Descent+LineGap)/CapHeight（cap=0 时退化为 /UnitsPerEm）——SimSun=1.6686，经实测校准；
+    //     等价 em 口径：(asc-desc)/upem(占位=1em) + LineGap/upem(固定间隙=行间 gap，SimSun 0.1406em)。
+    //   SHX 占位高 = (Above+2×Below)/Above = (em 盒 Above+Below + 一个下降部 Below 作行间间隙)/Above；
+    //     simplex.shx: (21+14)/21 = 35/21 = 1.6667 —— 实测默认 1× = 1.665×H（误差 0.1%）；
+    //     txt/romans 同为 above:below=3:1 度量 → 1.6667。
     //   ✗ 旧公式 (Above+Below)/Above = 28/21 = 1.333 → 比 AutoCAD 窄 ~24%（图#3“间距不一致”根因）。
-    //   ✗ SHX LF(shape#10) 下移量（simplex=36/21=1.714）仅用于 DTEXT 重复换行，非 MTEXT。
-    //   ✓ 实测默认 1× = 1.665×H ≈ 文档 1.66×H；1.5× = 1.5×单倍。故 SHX 固定取 MTextShxSingleSpacing。
+    //   ✗ SHX LF(shape#10) 下移量（simplex 裸移笔 36、净落 34；21+14=35 才合实测）仅用于 DTEXT 重复换行，非 MTEXT。
+    //   固定间隙项：实测 1.5× 行距 = 1.5×单倍（比值精确 1.5）→ 倍数是整体缩放，无不缩放加项；间隙已含于占位高（below/LineGap），故加项为 0。
+    //   非 Unifont（bigfont/shapes 无有效 above/below 度量）回落文档统一常数 1.66。
     private const double MTextShxSingleSpacing = 1.66;
     private double MTextFontLineRatio(string font, string styleBig)
     {
@@ -3656,9 +3662,15 @@ internal partial class ImageEngine
             double nat = (tf.Ascent - tf.Descent + tf.LineGap) / denom;
             if (nat > 0.5 && nat < 4.0) return nat;
         }
-        // SHX：MTEXT 单倍行距 = 1.66×H（官方文档统一常数，见上注释）
+        // SHX：占位高由字体度量推导 = (Above + 2×Below)/Above
+        //   —— em 盒(Above+Below) + 一个下降部(Below)作行间固定间隙；simplex=(21+14)/21=1.6667。
+        //   bigfont/shapes 无有效 above/below 文本度量 → 回落文档统一常数 1.66。
         var shx = GetShapeFont(font);
-        if (shx != null) return MTextShxSingleSpacing;
+        if (shx != null && shx.Format == ShxFormat.Unifont && shx.Above > 0)
+        {
+            double nat = (double)(shx.Above + 2 * shx.Below) / shx.Above;
+            if (nat > 0.5 && nat < 4.0) return nat;
+        }
         return MTextShxSingleSpacing;
     }
 

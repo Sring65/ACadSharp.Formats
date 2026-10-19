@@ -1777,7 +1777,7 @@ internal partial class ImageEngine
         }
         if (e is MText mt)
         {
-            var layout = WrapMText(ParseMText(mt.Value ?? "", mt.Height, GetStyleFont(mt.Style), GetStyleBigFont(mt.Style)), mt.RectangleWidth, GetStyleFont(mt.Style), GetStyleBigFont(mt.Style));
+            var layout = WrapMText(ParseMText(mt.Value ?? "", mt.Height, GetStyleFont(mt.Style), GetStyleBigFont(mt.Style), MTextCacheParaProps(mt)), mt.RectangleWidth, GetStyleFont(mt.Style), GetStyleBigFont(mt.Style));
             int n = layout.Lines.Count;
             if (n == 0) return (1.0, 1.0, 1.0);
             double maxH = 0.1;
@@ -3238,6 +3238,7 @@ internal partial class ImageEngine
         public double MaxHeight;
         public double Width;
         public double FirstIndent; // \pi 段落首行缩进（数据单位；仅段落首行生效，续行为 0）
+        public double? ParaSpacing; // \pxsm<N>; 段落行距倍数（扩展字典缓存/内联 \px）；null=用实体组码 44
         public void Recalc(ImageEngine eng, string styleFont, string styleBig)
         {
             MaxHeight = 0; Width = 0;
@@ -3246,6 +3247,15 @@ internal partial class ImageEngine
                 MaxHeight = Math.Max(MaxHeight, r.Height);
                 Width += eng.MTextRunWidth(r, styleFont, styleBig);
             }
+        }
+        // 行内【有墨迹】run 的最大字高：空白 run（任意字号的空格）AutoCAD 不渲染、不参与行距
+        // （参考图实测：行首/行尾大字号空格均不改变基线距）。
+        public double InkMaxHeight()
+        {
+            double mh = 0;
+            foreach (var r in Runs)
+                if (!string.IsNullOrWhiteSpace(r.Text)) mh = Math.Max(mh, r.Height);
+            return mh;
         }
     }
 
@@ -3324,7 +3334,58 @@ internal partial class ImageEngine
         => (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F');
 
     // 解析 MTEXT 原始文本（含格式码）为行/段。styleFont/styleBig 用于 SHX 字宽（换行/定位，与 CAD 一致）。
-    private MTextLayout ParseMText(string raw, double baseHeight, string styleFont, string styleBig)
+    // AutoCAD 把 MTEXT 段落属性（\px...;，如 \pxsm1.5; 行距倍数）存于实体扩展字典的 XRecord 内容缓存串，
+    // 而实体组码 44 常保持 1.0 → 仅读 44 会比 AutoCAD 渲染窄。从缓存串提取每段的 \px 属性：
+    // 只保留 \P（分段）与 \px...;（段属性），其余字符丢弃 → 按 \P 切分即得逐段属性表（与 ParseMText 段号对齐）。
+    private static List<string> MTextCacheParaProps(MText mt)
+    {
+        var props = new List<string>();
+        try
+        {
+            string cache = null;
+            var dict = mt.XDictionary;
+            if (dict != null)
+            {
+                foreach (var obj in dict)
+                {
+                    if (obj is ACadSharp.Objects.XRecord xr)
+                        foreach (var e in xr.Entries)
+                            if (e.Value is string s && s.Contains("\\px"))
+                            {
+                                cache = s; break;
+                            }
+                    if (cache != null) break;
+                }
+            }
+            if (cache == null) return null;
+            var cur = new System.Text.StringBuilder();
+            int i = 0;
+            while (i < cache.Length)
+            {
+                if (cache[i] == '\\' && i + 1 < cache.Length)
+                {
+                    char c = cache[i + 1];
+                    if (c == 'P' || c == 'p' && i + 2 < cache.Length && cache[i + 2] == 'x')
+                    {
+                        if (c == 'P') { props.Add(cur.ToString()); cur.Clear(); i += 2; continue; }
+                        int end = cache.IndexOf(';', i + 2);
+                        if (end < 0) end = cache.Length - 1;
+                        cur.Append(cache, i, end - i + 1);
+                        i = end + 1;
+                        continue;
+                    }
+                    i += 2; // 跳过其它转义
+                    continue;
+                }
+                i++; // 丢弃普通文本
+            }
+            props.Add(cur.ToString());
+            return props;
+        }
+        catch { return null; }
+    }
+
+    private MTextLayout ParseMText(string raw, double baseHeight, string styleFont, string styleBig, List<string> paraProps = null)
     {
         var layout = new MTextLayout();
         MTextLine line = new MTextLine();
@@ -3340,7 +3401,28 @@ internal partial class ImageEngine
         double curOB = 0.0;
         string curFont = null;
         double curT = 1.0; // \T 字距因子（1=正常）
+        double? curParaSpacing = null; // \pxsm<N>; 段落行距倍数（持续到下个 \px）
+        int paraIdx = 0;               // 当前段号（\P 递增）
         var curText = new StringBuilder();
+
+        // 段落起始：应用扩展字典缓存的 \px 属性（组码 44 常保持 1.0，AutoCAD 实际行距在缓存里）
+        void ApplyParaProps()
+        {
+            if (paraProps != null && paraIdx < paraProps.Count)
+            {
+                string spec = paraProps[paraIdx];
+                int smp = spec.LastIndexOf("sm", StringComparison.Ordinal);
+                if (smp >= 0)
+                {
+                    int st = smp + 2, j = st;
+                    while (j < spec.Length && (char.IsDigit(spec[j]) || spec[j] == '-' || spec[j] == '+' || spec[j] == '.')) j++;
+                    if (j > st && double.TryParse(spec.Substring(st, j - st), NumberStyles.Float, Ci, out double smv) && smv > 0)
+                        curParaSpacing = smv;
+                }
+            }
+            line.ParaSpacing = curParaSpacing;
+        }
+        ApplyParaProps();
 
         void Flush()
         {
@@ -3356,6 +3438,8 @@ internal partial class ImageEngine
         {
             Flush();
             line = new MTextLine();
+            paraIdx++;
+            ApplyParaProps();
             layout.Lines.Add(line);
         }
         int SkipCode(int i)
@@ -3474,7 +3558,8 @@ internal partial class ImageEngine
                         case 'o': Flush(); curOV = false; i++; break;  // 上划线关
                         case 'p':
                             {
-                                // \p<段落格式>;  AutoCAD 段落属性码，其中 \pi<值>; = 首行缩进（数据单位）。
+                                // \p<段落格式>;  AutoCAD 段落属性码：\pi<值>; = 首行缩进（数据单位），
+                                // \pxsm<倍数>; = 段落行距倍数（覆盖组码 44，持续到下个 \px）。
                                 // 旧版把 \p 当未知码整段丢弃 → “\pi45.9;测试剧中”等段落全部顶到左边距（对齐不一致）。
                                 int end = SkipCode(i);
                                 string spec = raw.Substring(i + 2, Math.Max(0, end - i - 2));
@@ -3487,6 +3572,17 @@ internal partial class ImageEngine
                                     {
                                         // 仅段落首行（此处紧跟 \P 后的全新行）继承缩进
                                         if (line.Runs.Count == 0) line.FirstIndent = ind;
+                                    }
+                                }
+                                int smp = spec.IndexOf("sm", StringComparison.Ordinal);
+                                if (smp >= 0)
+                                {
+                                    int st = smp + 2, j = st;
+                                    while (j < spec.Length && (char.IsDigit(spec[j]) || spec[j] == '-' || spec[j] == '+' || spec[j] == '.')) j++;
+                                    if (j > st && double.TryParse(spec.Substring(st, j - st), NumberStyles.Float, Ci, out double smv) && smv > 0)
+                                    {
+                                        curParaSpacing = smv;
+                                        line.ParaSpacing = smv;
                                     }
                                 }
                                 i = end;
@@ -3615,51 +3711,66 @@ internal partial class ImageEngine
 
     private static void FinishMTextLayout(MTextLayout layout)
     {
+        // 末尾纯空白行（如内容以大字号空格结尾）AutoCAD 不成行（无墨迹不渲染）→ 移除，避免框高虚增
+        while (layout.Lines.Count > 1)
+        {
+            var last = layout.Lines[layout.Lines.Count - 1];
+            bool allWs = true;
+            foreach (var r in last.Runs)
+                if (!string.IsNullOrWhiteSpace(r.Text)) { allWs = false; break; }
+            if (!allWs) break;
+            layout.Lines.RemoveAt(layout.Lines.Count - 1);
+        }
         layout.MaxLineWidth = 0;
         foreach (var ln in layout.Lines)
             layout.MaxLineWidth = Math.Max(layout.MaxLineWidth, ln.Width);
     }
 
     // 行距（基线到基线）：AutoCAD 默认 1×（单倍）行距 = 字体定义的占位行高。
-    //   用户公式：行距 = 字体占位高 × 字体大小(字高) × 行距倍数 + 固定间隙。
-    //   实测 1.5× 行距 = 1.5×单倍（比值精确 1.5）→ 倍数为整体缩放，固定间隙已含在占位高内（SHX=below、TTF=LineGap）故加项为 0。
-    //   Exact=直接用组码44值；AtLeast=max(44值, 占位行高)；默认=占位行高。
-    private double MTextLineGap(MTextLine prev, MTextLine cur, LineSpacingStyleType style, double factor, double lineRatio)
+    //   用户公式：行距 = 字体占位高 × 字体大小(字高) × 行距倍数 + 固定间隙；实测 1.5×/2.5× 基线距均 = 倍数×单倍
+    //   （比值精确）→ 倍数整体缩放，固定间隙已含在占位高内（SHX=Below、TTF=LineGap），加项为 0。
+    //   factor（组码 44 / \pxsm）是【倍数】：Exact=倍数×占位×基准字高 H（不随行内高字符增长）；
+    //   AtLeast=max(倍数×占位×H, 占位×行内墨迹最大字高)；默认=占位×行内墨迹最大字高。
+    //   行内最大字高只数有墨迹的 run（AutoCAD 实测：行首/行尾大字号空格不改变基线距）。
+    private double MTextLineGap(MTextLine prev, MTextLine cur, LineSpacingStyleType style, double factor, double lineRatio, double baseH)
     {
-        double maxH = Math.Max(Math.Max(prev.MaxHeight, cur.MaxHeight), 0.1);
-        double def = lineRatio * maxH;
+        double maxH = Math.Max(Math.Max(prev.InkMaxHeight(), cur.InkMaxHeight()), 0.1);
+        double f = factor > 0 ? factor : 1.0;
         switch (style)
         {
             case LineSpacingStyleType.Exact:
-                return factor > 0 ? factor : def;
+                return f * lineRatio * baseH;
             case LineSpacingStyleType.AtLeast:
-                return Math.Max(factor > 0 ? factor : 0.0, def);
+                return Math.Max(f * lineRatio * baseH, lineRatio * maxH);
             default:
-                return def;
+                return lineRatio * maxH;
         }
     }
 
     // 字体“自然行高占位”比值（世界单位 gap ÷ 字高 H），即 AutoCAD 默认 1×（单倍）行距所依据的“字体定义占位高度”。
     // 用户公式：行距 = 字体占位高 × 字体大小(字高) × 行距倍数 + 固定间隙。
-    //   TTF 占位高 = (Ascent-Descent+LineGap)/CapHeight（cap=0 时退化为 /UnitsPerEm）——SimSun=1.6686，经实测校准；
-    //     等价 em 口径：(asc-desc)/upem(占位=1em) + LineGap/upem(固定间隙=行间 gap，SimSun 0.1406em)。
+    //   TTF 占位高 = (Ascent-Descent+2×LineGap)/CapHeight（cap=0 时退化为 /UnitsPerEm）
+    //     —— SimSun: (220+36+72)/175 = 328/175 = 1.8743。AutoCAD 参考图实测（sample-mtext.bmp，
+    //     SimSun 块 \pxsm2.5，基线距 35.32 世界 ÷ 2.5 ÷ 7.5 = 1.884，误差 0.5%）；LineGap 计两次
+    //     （行盒一次 + 行间固定占位一次）。✗ 旧 (Asc-Desc+LineGap)/Cap=1.6686 比 AutoCAD 窄 11%。
     //   SHX 占位高 = (Above+2×Below)/Above = (em 盒 Above+Below + 一个下降部 Below 作行间间隙)/Above；
-    //     simplex.shx: (21+14)/21 = 35/21 = 1.6667 —— 实测默认 1× = 1.665×H（误差 0.1%）；
-    //     txt/romans 同为 above:below=3:1 度量 → 1.6667。
+    //     simplex.shx: (21+14)/21 = 35/21 = 1.6667 —— 实测（simplex 块 \pxsm1.5，基线距 18.77 ÷ 1.5 ÷ 7.5
+    //     = 1.668）误差 0.1%；txt/romans 同为 above:below=3:1 度量 → 1.6667。
     //   ✗ 旧公式 (Above+Below)/Above = 28/21 = 1.333 → 比 AutoCAD 窄 ~24%（图#3“间距不一致”根因）。
     //   ✗ SHX LF(shape#10) 下移量（simplex 裸移笔 36、净落 34；21+14=35 才合实测）仅用于 DTEXT 重复换行，非 MTEXT。
-    //   固定间隙项：实测 1.5× 行距 = 1.5×单倍（比值精确 1.5）→ 倍数是整体缩放，无不缩放加项；间隙已含于占位高（below/LineGap），故加项为 0。
+    //   固定间隙项：英文块 1.5×/中文块 2.5× 基线距均 = 倍数×单倍（比值精确）→ 倍数整体缩放、无不缩放加项；
+    //     间隙已含于占位高（Below/LineGap 分量），故加项为 0。
     //   非 Unifont（bigfont/shapes 无有效 above/below 度量）回落文档统一常数 1.66。
     private const double MTextShxSingleSpacing = 1.66;
     private double MTextFontLineRatio(string font, string styleBig)
     {
         if (string.IsNullOrEmpty(font)) return MTextShxSingleSpacing; // 无字体（纯形状）→ 文档统一默认
-        // TTF（含 CJK）：族名→ttf，取 hhea/OS/2 自然行高（SimSun: (220-(-36)+36)/175 = 1.6686）
+        // TTF（含 CJK）：族名→ttf；占位 = (Asc-Desc+2×LineGap)/Cap（SimSun: 328/175 = 1.8743，AutoCAD 实测校准）
         var tf = GetTtfForWidth(font);
         if (tf != null && tf.UnitsPerEm > 0)
         {
             double denom = tf.CapHeight > 0 ? tf.CapHeight : tf.UnitsPerEm;
-            double nat = (tf.Ascent - tf.Descent + tf.LineGap) / denom;
+            double nat = (tf.Ascent - tf.Descent + 2 * tf.LineGap) / denom;
             if (nat > 0.5 && nat < 4.0) return nat;
         }
         // SHX：占位高由字体度量推导 = (Above + 2×Below)/Above
@@ -3734,6 +3845,7 @@ internal partial class ImageEngine
                 {
                     var ln = new MTextLine();
                     ln.FirstIndent = firstSub ? line.FirstIndent : 0.0;
+                    ln.ParaSpacing = line.ParaSpacing; // 换行产生的子行继承段落行距
                     firstSub = false;
                     foreach (var (t, run) in cur)
                     {
@@ -3836,7 +3948,9 @@ internal partial class ImageEngine
             foreach (var r in layout.Lines[i].Runs)
                 if (!string.IsNullOrEmpty(r.Font)) { lineFont = r.Font; break; }
             double ratio = MTextFontLineRatio(lineFont, styleBig);
-            baselines[i] = baselines[i - 1] - MTextLineGap(layout.Lines[i - 1], layout.Lines[i], mt.LineSpacingStyle, mt.LineSpacing, ratio);
+            // 行距倍数：段落 \pxsm（扩展字典缓存/内联）优先，否则实体组码 44
+            double fac = layout.Lines[i].ParaSpacing ?? mt.LineSpacing;
+            baselines[i] = baselines[i - 1] - MTextLineGap(layout.Lines[i - 1], layout.Lines[i], mt.LineSpacingStyle, fac, ratio, mt.Height);
         }
         // 文本框：顶=首行基线 + cap height（字高 H 即 cap：H→大写顶部，见 ShxHeightScale/TtfCapScale）。
         //   H 对应 cap height（非 em），故首行 cap 顶 = baseline + MaxHeight。旧值 0.8×H 使 cap 高出
@@ -3872,7 +3986,7 @@ internal partial class ImageEngine
     {
         string baseCol = ColorOf(EntityAciIndex(mt), layerAci, byBlockAci);
         string styleBig = GetStyleBigFont(mt.Style);
-        var layout = WrapMText(ParseMText(mt.Value ?? "", mt.Height, styleFont, styleBig), mt.RectangleWidth, styleFont, styleBig);
+        var layout = WrapMText(ParseMText(mt.Value ?? "", mt.Height, styleFont, styleBig, MTextCacheParaProps(mt)), mt.RectangleWidth, styleFont, styleBig);
         if (layout.Lines.Count == 0) return;
         var (baselines, anchorX, anchorY) = MTextLocalLayout(layout, mt, styleFont, styleBig);
 

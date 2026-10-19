@@ -579,14 +579,15 @@ internal partial class ImageEngine
                     if (pts.Count >= 2)
                     {
                         double alen = ld.TextHeight > 1e-9 ? ld.TextHeight * scaleMul : Math.Max(w * 6.0, 4.0 * (tr?.Scale ?? 1.0));
-                        // 引线：起点移到箭头底边中心，避免细线穿入实心三角内部
+                        bool arrow = ld.ArrowHeadEnabled; // DXF 组码71：缺省=有箭头，0=无箭头
+                        // 引线：有箭头时起点移到箭头底边中心（避免细线穿入实心三角内部）；无箭头时折线直达尖端 pts[0]
                         var linePts = pts;
-                        if (LeaderArrowBase(pts, alen, out var lbx, out var lby))
+                        if (arrow && LeaderArrowBase(pts, alen, out var lbx, out var lby))
                         {
                             linePts = new List<(double X, double Y)>(pts);
                             linePts[0] = (lbx, lby);
                         }
-                        // 水平着陆线（末段非水平时补画，供关联文字坐落）
+                        // 水平着陆线（末段非水平时补画，供关联文字坐落）——独立于箭头，按 TextWidth/HookLineDirection 判断
                         if (LeaderLandingEndpoint(ld, pts, out var lex, out var ley))
                         {
                             if (ReferenceEquals(linePts, pts)) linePts = new List<(double X, double Y)>(pts);
@@ -596,8 +597,8 @@ internal partial class ImageEngine
                         for (int i = 0; i < linePts.Count; i++)
                             d.Append(F(Sx(linePts[i].X)) + " " + F(Py(linePts[i].Y)) + " " + (i == 0 ? "m" : "l") + " ");
                         PdfStroke(cs, col, w, dash, d + "S");
-                        // 实心箭头三角（AutoCAD LEADER 默认实心；尖端 pts[0] 指向目标端）
-                        if (LeaderArrowWings(ld, pts, alen, out var w1x, out var w1y, out var w2x, out var w2y))
+                        // 实心箭头三角（AutoCAD LEADER 默认实心；尖端 pts[0] 指向目标端）。无箭头(71=0)时不画
+                        if (arrow && LeaderArrowWings(ld, pts, alen, out var w1x, out var w1y, out var w2x, out var w2y))
                             PdfQuadFill(cs, col, new List<(double X, double Y)> { (pts[0].X, pts[0].Y), (w1x, w1y), (w2x, w2y) });
                     }
                 }
@@ -1065,30 +1066,15 @@ internal partial class ImageEngine
         if (gradient)
         {
             var gradSpec = MakeHatchGradSpec(gp);
-            if (gradSpec.Kind == HatchGradKind.Linear)
-            {
-                // 线性渐变：PDF 矢量 shading（Type2 轴向 / Type3 径向 + FunctionType 2 双端线性）可精确表达，
-                // 保持矢量——边缘锐利、文件极小、无锯齿。sh 受【当前裁剪路径】约束（Table 4.27），
-                // 正确工业标准模式(iText/FOP)：q → 构造路径 → W n(设裁剪路径,不填充不描边) → /ShN sh → Q。
-                int slot = _pdfShadingSeq++;
-                if (slot >= MaxPdfShadings)
-                {
-                    CsAscii(cs, HexToRgbPdf(StopHex(gp.Colors[0].Color)) + " rg\n" + d + rule + "\n"); // 超限降级首色
-                    RecordSkip("HATCH(渐变超限)");
-                    return;
-                }
-                _pdfShadings[slot] = MakePdfShading(loops, gp);
-                CsAscii(cs, "q\n" + d + "W n\n/Sh" + slot + " sh\nQ\n");
-            }
-            else
-            {
-                // 非线性渐变（SPHERICAL/HEMISPHERICAL/CYLINDER/CURVED，含 INV 取反）：
-                // FunctionType 2 只能做 C0→C1 双端【线性】插值，无法表达 LUT 钟形/峰谷剖面 → PDF 会画成
-                // 与 PNG/SVG 不同的错误形状（实测 PNG 蓝块 166 色钟形，PDF 矢量线性仅端点近似）。
-                // 改用与 PNG【完全一致】的 RasterCanvas.FillGradientProfile + 33 点 LUT 剖面光栅化，
-                // 嵌入为"路径裁剪的图像 XObject"→ 三引擎渐变像素级一致。线性仍走矢量（见上）。
-                EmitHatchGradientRasterPdf(cs, d, loops, gp, gradSpec);
-            }
+            // 所有渐变（含 LINEAR）统一走光栅化（RasterCanvas.FillGradientProfile + 33 点 LUT 剖面，
+            // 嵌入为"路径裁剪的图像 XObject"），三引擎像素级一致。原因：
+            //  ① 非线性（SPHERICAL/HEMISPHERICAL/CYLINDER/CURVED，含 INV）的 LUT 钟形/峰谷剖面，
+            //     FunctionType 2 只能画双端线性插值，无法表达；
+            //  ② LINEAR 曾走 Type2 矢量 shading（shading 对象定义完全符合规范、Page /Shading 资源引用
+            //     也正确），但 PDFium（Chrome/Edge 内置 PDF 阅读器）对 `W n` 裁剪 + `sh` 的组合渲染
+            //     不可靠——实测 4 个 LINEAR 块在浏览器 PDF 阅读器中完全不显示（用户反馈"pdf 有个
+            //     属性的填充未渲染"）。图像 XObject 是 PDF 最基础特性、所有阅读器兼容，故统一走图像。
+            EmitHatchGradientRasterPdf(cs, d, loops, gp, gradSpec);
         }
         else
         {

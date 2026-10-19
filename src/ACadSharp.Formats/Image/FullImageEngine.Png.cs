@@ -493,16 +493,17 @@ internal partial class ImageEngine
                     if (pts.Count >= 2)
                     {
                         double alen = ld.TextHeight > 1e-9 ? ld.TextHeight * scaleMul : Math.Max(w * 6.0, 4.0 * (tr?.Scale ?? 1.0));
-                        // 引线：起点移到箭头底边中心，避免细线穿入实心三角内部
+                        bool arrow = ld.ArrowHeadEnabled; // DXF 组码71：缺省=有箭头，0=无箭头
+                        // 引线：有箭头时起点移到箭头底边中心（避免细线穿入实心三角内部）；无箭头时折线直达尖端 pts[0]
                         var lp = new List<(double X, double Y)>(pts);
-                        if (LeaderArrowBase(pts, alen, out var lbx, out var lby))
+                        if (arrow && LeaderArrowBase(pts, alen, out var lbx, out var lby))
                             lp[0] = (lbx, lby);
-                        // 水平着陆线（末段非水平时补画，供关联文字坐落）
+                        // 水平着陆线（末段非水平时补画，供关联文字坐落）——独立于箭头，按 TextWidth/HookLineDirection 判断
                         if (LeaderLandingEndpoint(ld, pts, out var lex, out var ley))
                             lp.Add((lex, ley));
                         StrokePts(lp, false, col, w, dash);
-                        // 实心箭头三角（AutoCAD LEADER 默认实心；尖端 pts[0] 指向目标端）
-                        if (LeaderArrowWings(ld, pts, alen, out var w1x, out var w1y, out var w2x, out var w2y))
+                        // 实心箭头三角（AutoCAD LEADER 默认实心；尖端 pts[0] 指向目标端）。无箭头(71=0)时不画
+                        if (arrow && LeaderArrowWings(ld, pts, alen, out var w1x, out var w1y, out var w2x, out var w2y))
                             EmitQuadFillPng(new List<(double X, double Y)> { (pts[0].X, pts[0].Y), (w1x, w1y), (w2x, w2y) }, col);
                     }
                 }

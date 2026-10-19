@@ -726,15 +726,17 @@ internal partial class ImageEngine
                 {
                     // \S<num>/<den> 分数：分子/分母上下分层（不同基线的 BT/ET）+ 中间分数线（与 SVG/PNG 端一致）
                     string col = run.Color.HasValue ? AciColor(run.Color.Value) : baseCol;
-                    double fs = Math.Max(run.Height * scaleMul, 0.2);
-                    int slot = _pdfFonts.GetSlot(ResolveFontFamily(!string.IsNullOrEmpty(run.Font) ? run.Font : styleFont));
+                    string fracFont = !string.IsNullOrEmpty(run.Font) ? run.Font : styleFont;
+                    double fracCap = TtfCapScale(ResolveFontFamily(fracFont));
+                    double fs = Math.Max(run.Height * scaleMul * fracCap, 0.2);
+                    int slot = _pdfFonts.GetSlot(ResolveFontFamily(fracFont));
                     CjkFont font = _pdfFonts.FontAt(slot);
                     int sl = run.Text.IndexOf('/');
                     string num = run.Text.Substring(0, sl);
                     string den = sl + 1 < run.Text.Length ? run.Text.Substring(sl + 1) : "";
                     double wf = run.WidthFactor > 0 ? run.WidthFactor : 1.0;
-                    double numW = EstimateTextWidth(num, run.Height) * wf * scaleMul;
-                    double denW = EstimateTextWidth(den, run.Height) * wf * scaleMul;
+                    double numW = EstimateTextWidth(num, run.Height) * wf * scaleMul * fracCap;
+                    double denW = EstimateTextWidth(den, run.Height) * wf * scaleMul * fracCap;
                     double fracW = Math.Max(numW, denW);
                     // 分数堆叠几何（CAD y 向上，相对主基线；与 SVG/PNG 端同一套 AutoCAD 实测值）
                     double H = run.Height;
@@ -778,22 +780,26 @@ internal partial class ImageEngine
                     }
                     else
                     {
-                        // 回退 TTF（含 CJK 无 bigfont / 内联 TTF / 字形缺失）→ 原 BT/Tj 文本（行为不变）
+                        // 回退 TTF（含 CJK 无 bigfont / 内联 TTF / 字形缺失）→ 原 BT/Tj 文本
                         int slot = _pdfFonts.GetSlot(ResolveFontFamily(effFont));
                         CjkFont font = _pdfFonts.FontAt(slot);
                         byte[] data = font != null ? font.Encode(run.Text) : PdfFallbackTextBytes(run.Text);
                         if (data.Length > 0)
                         {
+                            // TTF cap-height 字号映射（Phase 2）：AutoCAD 把 H 当 cap height，非 em。
+                            // 与单行 TTF（line 504）及宽度估算 TtfMTextWidth 一致——此前 MText TTF 未套
+                            // cap-scale，字形比单行/AutoCAD 小 ~28%（"多行富文本字体不一致"）。SHX 分支不受影响。
+                            double ttfFs = Math.Max(run.Height * scaleMul * TtfCapScale(ResolveFontFamily(effFont)), 0.2);
                             // \T 字距：PDF Tc 的单位是【文本空间单位】(unscaled text space units, PDF 32000 §9.3.2)，
                             // 直接加在每个字形的 advance 上（且跨 BT/ET 持久！）——不是 1/1000 em。
                             // 旧版误按 1/1000 em 发 "−25 Tc" → 每字 advance = w + (−25) 为负 → 整行从右往左倒序散射
                             // （这也是后续不设 Tc 的文字块被泄漏污染而乱序的根因）。
                             // 正确换算：期望额外间距 = (因子−1)×0.1em，1em = fs（文本空间字号）→ Tc = (T−1)×0.1×fs ÷ wf
                             //（÷wf 抵消 Tm 的横向 scale，使字距视觉量不受 \W 影响）。
-                            double tc = (run.Tracking - 1.0) * 0.1 * fs / (wf > 1e-9 ? wf : 1.0);
+                            double tc = (run.Tracking - 1.0) * 0.1 * ttfFs / (wf > 1e-9 ? wf : 1.0);
                             // Tc 是文本状态操作符，只能在 BT..ET 内设置；且跨 BT/ET 持久 → 每块显式写（含 0 Tc 复位）
                             string tcLine = Math.Abs(tc) > 1e-9 ? F(tc) + " Tc\n" : "0 Tc\n";
-                            CsAscii(cs, "BT\n/F" + slot + " " + F(fs) + " Tf\n" + HexToRgbPdf(col) + " rg\n" + tcLine +
+                            CsAscii(cs, "BT\n/F" + slot + " " + F(ttfFs) + " Tf\n" + HexToRgbPdf(col) + " rg\n" + tcLine +
                                        F(ca * wf) + " " + F(sa * wf) + " " + F(ca * tk - sa) + " " + F(sa * tk + ca) + " " + F(Sx(wx)) + " " + F(Py(wy)) + " Tm\n");
                             CsString(cs, data);
                             CsAscii(cs, " Tj\nET\n");

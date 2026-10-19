@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using ACadSharp;
@@ -61,6 +62,22 @@ internal partial class ImageEngine
     private const int MaxSprites = 8000;           // 精灵缓存上限（防内存膨胀）
     private const int MaxSpriteSide = 8192;        // 单精灵边长上限（超此直接渲染不缓存）
     private readonly Dictionary<string, PngSprite> _sprites = new();
+
+    // ===== 性能计时（临时诊断：定位瓶颈阶段 + 各实体类型耗时分布；GDB2CAD_PERF=1 时输出）=====
+    // 渲染为单线程（WritePng 顺序遍历实体/瓦片），字段直接累加无锁。
+    private static readonly bool PerfOn =
+        string.Equals(Environment.GetEnvironmentVariable("GDB2CAD_PERF"), "1", StringComparison.Ordinal);
+    private static readonly bool _perfVerboseTile =
+        string.Equals(Environment.GetEnvironmentVariable("GDB2CAD_PERF_TILE"), "1", StringComparison.Ordinal);
+    private readonly Stopwatch _swExt = new();     // ComputeExtents（含嵌套展开）
+    private readonly Stopwatch _swCull = new();    // BuildCullData（预算世界 AABB）
+    private long _pngSaveUs = 0;                   // PNG 编码写盘耗时累加（微秒，各 SavePng 累加）
+    private readonly Dictionary<string, long> _perfTypeUs = new(StringComparer.Ordinal); // 各实体类型光栅化耗时（微秒）
+    private long _perfRenderCount = 0;             // 实际调用 EmitEntityPng 次数
+    private long _perfTextChars = 0;               // TTF/SHX 文字字符数（估文字成本）
+    private long _perfStartTick;                   // 顶层 EmitEntityPng 起始 TickCount64
+    private string _perfTypeStartType;             // 顶层 EmitEntityPng 实体类型名
+    private int _perfDepth = 0;                    // 递归深度（仅顶层计耗，避免嵌套双计）
 
     private sealed class PngSprite
     {
@@ -270,11 +287,13 @@ internal partial class ImageEngine
 
     public ImageExportResult WritePng(string outPath)
     {
+        if (PerfOn) _swExt.Restart();
         if (!ComputeExtents())
         {
             _log("⚠️  PNG 无可用实体，跳过");
             return new ImageExportResult { Success = false };
         }
+        if (PerfOn) _swExt.Stop();
 
         _scale = 1.0; // 1:1 实际尺寸
         double dataW = _maxX - _minX;
@@ -331,7 +350,10 @@ internal partial class ImageEngine
             EmitEntityPng(ent, null, 1.0, 7, null, null, _ltScale); // 顶层无 INSERT 上下文，ByBlock 兜底白/实线
         LogSkipped("PNG");
 
-        if (!rc.SavePng(outPath))
+        long _saveT0 = Environment.TickCount64;
+        bool _saveOk = rc.SavePng(outPath);
+        _pngSaveUs += Environment.TickCount64 - _saveT0;
+        if (!_saveOk)
         {
             _log($"❌  PNG 写文件失败：{outPath}");
             _rc = null;
@@ -360,7 +382,9 @@ internal partial class ImageEngine
         _skippedCounts.Clear();
         _tiledMode = true; _sprites.Clear(); // 分块模式启用精灵缓存：相同点/文字跨瓦片只渲染一次、其余瓦片整数平移 blit
         _useRealTextWidth = true;
+        if (PerfOn) _swCull.Restart();
         BuildCullData(); // 预计算顶层实体世界 AABB（含线宽/点字形安全外扩），供按瓦片空间剔除
+        if (PerfOn) _swCull.Stop();
 
         var tiles = new List<ImageTile>();
         int seq = 0;
@@ -391,11 +415,15 @@ internal partial class ImageEngine
                 double dy1 = _maxY + _margin - y0 / (double)_pngKy;
                 double dy0 = _maxY + _margin - (y0 + th) / (double)_pngKy;
                 totalPairs += _topEnts != null ? _topEnts.Count : 0;
+                long _tileRenderT0 = Environment.TickCount64;
+                int _tileEnts = 0;
                 foreach (var ent in CulledTopEntities(dx0, dy0, dx1, dy1))
                 {
                     EmitEntityPng(ent, null, 1.0, 7, null, null, _ltScale);
                     renderedPairs++;
+                    _tileEnts++;
                 }
+                long _tileRenderMs = Environment.TickCount64 - _tileRenderT0;
                 _rc = null;
 
                 // OGC WMTS 标准命名：tiles/{z}/{row}/{col}.png（z=0 单层网格，row=cy 自顶向下，col=cx 自左向右）。
@@ -404,7 +432,12 @@ internal partial class ImageEngine
                 string name = $"{cx}{ext}";
                 string fp = Path.Combine(dir, "tiles", z.ToString(), cy.ToString(), name);
                 Directory.CreateDirectory(Path.GetDirectoryName(fp));
-                if (!rc.SavePng(fp))
+                long _tileSaveT0 = Environment.TickCount64;
+                bool _tileSaveOk = rc.SavePng(fp);
+                _pngSaveUs += Environment.TickCount64 - _tileSaveT0;
+                if (_perfVerboseTile)
+                    _log($"   [perf] tile({cx},{cy}) 实体{_tileEnts} 光栅{_tileRenderMs}ms 编码{Environment.TickCount64 - _tileSaveT0}ms");
+                if (!_tileSaveOk)
                 {
                     _log($"❌  PNG 瓦片写文件失败：{fp}");
                     return new ImageExportResult { Success = false };
@@ -463,6 +496,11 @@ internal partial class ImageEngine
     // 发射单个实体（含 Insert 展开）。参数语义与 EmitEntitySvg 完全一致。
     private void EmitEntityPng(Entity ent, Transform2D tr, double scaleMul, short byBlockAci, double[] byBlockDash, LtpPattern byBlockPat, double ltMul, short? byLayerOverride = null)
     {
+        if (PerfOn)
+        {
+            if (_perfDepth == 0) { _perfStartTick = Environment.TickCount64; _perfTypeStartType = ent.GetType().Name; _perfRenderCount++; }
+            _perfDepth++;
+        }
         short layerAci;
         if (byLayerOverride.HasValue) layerAci = byLayerOverride.Value;
         else { layerAci = 7; try { layerAci = LayerAciIndex(ent.Layer); } catch { } }
@@ -890,6 +928,15 @@ internal partial class ImageEngine
             default:
                 RecordSkip(ent.GetType().Name);
                 break;
+        }
+        if (PerfOn)
+        {
+            if (--_perfDepth == 0)
+            {
+                long us = Environment.TickCount64 - _perfStartTick;
+                _perfTypeUs.TryGetValue(_perfTypeStartType, out long acc);
+                _perfTypeUs[_perfTypeStartType] = acc + us;
+            }
         }
     }
 

@@ -2777,10 +2777,29 @@ internal partial class ImageEngine
     // 与已确立的 SHX 约定一致（SHX: s=H/above，above=cap 区）。本 helper 返回字号放大因子
     //   factor = upem/capHeight；capHeight 未知（字体缺失/OS/2<2/CFF 轮廓）→ 返回 1.0（保持旧行为，不劣化）。
     // 调用方：fs = H * scaleMul * bscale * TtfCapScale(family)。
+    //
+    // CJK 字体特判（2026-10-19）：SimSun/SimHei/KaiTi 等 CJK 字体的汉字字形填满 em 盒
+    //   （advance = 1.0em，upem=256 时 advance=256），AutoCAD 渲染 CJK 时 em = H（不乘 capScale）。
+    //   若按拉丁 cap-height 模型放大（SimSun: 256/175=1.463），CJK 字符会被放大多 46%——
+    //   导致 MText 行宽估算过宽→过早换行、渲染间距比 AutoCAD 大。
+    //   因此 CJK 字体返回 cap=1.0（em=H），与 SHX 方格 advance=H 一致。
+    private static bool IsCjkFontFamily(string family)
+    {
+        if (string.IsNullOrEmpty(family)) return false;
+        string f = family.Split(',')[0].Trim().ToLowerInvariant();
+        return f.Contains("simsun") || f.Contains("simhei") || f.Contains("simkai") ||
+               f.Contains("simfang") || f.Contains("microsoft yahei") || f.Contains("msyh") ||
+               f.Contains("dengxian") || f.Contains("fangsong") || f.Contains("kaiti") ||
+               f.Contains("heiti") || f.Contains("songti") || f.Contains("pingfang") ||
+               f.Contains("noto sans cjk") || f.Contains("source han") ||
+               f.Contains("cjk") || f.Contains("gb2312") || f.Contains("gbk");
+    }
+
     private static readonly Dictionary<string, double> _ttfCapScaleCache = new(StringComparer.OrdinalIgnoreCase);
     private static double TtfCapScale(string family)
     {
         if (string.IsNullOrEmpty(family)) return 1.0; // SHX（family=null）→ 不缩放
+        if (IsCjkFontFamily(family)) return 1.0; // CJK 字体：em=H，不乘 capScale
         string first = family.Split(',')[0].Trim();
         if (first.Length == 0) return 1.0;
         if (_ttfCapScaleCache.TryGetValue(first, out double cached)) return cached;
@@ -3198,6 +3217,15 @@ internal partial class ImageEngine
         return nChars * (t - 1.0) * 0.1 * r.Height;
     }
 
+    // MText TTF run 宽度（数据单位，已乘 wf 与 cap-scale）：基线宽×wf×cap + \T 字距×cap。
+    // 与渲染 fs=H·cap 一致——Phase 2 修复：MText TTF 路径此前未套 cap-scale，比单行/AutoCAD 窄 ~28%，
+    // 致本应换行的行不换 → 整块偏矮。SHX 路径不走此函数（advance 已是真实宽）。
+    private static double TtfMTextWidth(string text, double H, double wf, string font, in MTextRun r)
+    {
+        double cap = TtfCapScale(ResolveFontFamily(font));
+        return EstimateTextWidth(text, H) * wf * cap + MTextTrackingAdd(r, text.Length) * cap;
+    }
+
     private double MTextRunWidth(MTextRun r, string styleFont, string styleBig)
     {
         double wf = r.WidthFactor > 0 ? r.WidthFactor : 1.0;
@@ -3216,8 +3244,8 @@ internal partial class ImageEngine
         }
         // SHX 笔迹：advance 已含字形真实宽（不含 \T 字距——simplex.shx 等技术字体极少配 \T，且保持既有渲染不回退）
         if (TryShxRunAdvance(eFont, eBig, r.Text, r.Height, wf, out double w)) return w;
-        // TTF 回退：基线宽×宽度因子 + \T 字距附加
-        return EstimateTextWidth(r.Text, r.Height) * wf + MTextTrackingAdd(r, r.Text.Length);
+        // TTF 回退：基线宽×宽度因子×cap-scale + \T 字距×cap（与渲染 fs=H·cap 一致，见 TtfMTextWidth）。
+        return TtfMTextWidth(r.Text, r.Height, wf, eFont, r);
     }
 
     // 合成斜体倾斜角（度）：AutoCAD 对无真斜体（尤其 CJK）字体按固定倾斜角合成斜体。
@@ -3552,15 +3580,18 @@ internal partial class ImageEngine
     private MTextLayout WrapMText(MTextLayout layout, double refWidth, string styleFont, string styleBig)
     {
         if (refWidth <= 0) return layout;
+        // 换行判定须含首行缩进 \pi：行宽 = 缩进 + 文本宽（AutoCAD 右对正/居中段落同理，缩进挤占可用宽）。
+        // 旧版仅比 line.Width →「测试右对齐」缩进 80.41 + 文本 54.86 = 135.27 > 133.12 本应把「齐」换到次行，
+        // 却因 54.86 < 133.12 被误判整行放下 → 行数偏少、整块偏矮（与 AutoCAD 截图不符）。
         bool needWrap = false;
         foreach (var line in layout.Lines)
-            if (line.Width > refWidth && line.Runs.Count > 0) { needWrap = true; break; }
+            if (line.FirstIndent + line.Width > refWidth && line.Runs.Count > 0) { needWrap = true; break; }
         if (!needWrap) return layout;
 
         var result = new MTextLayout();
         foreach (var line in layout.Lines)
         {
-            if (line.Width <= refWidth || line.Runs.Count == 0)
+            if (line.FirstIndent + line.Width <= refWidth || line.Runs.Count == 0)
             {
                 result.Lines.Add(line);
                 continue;
@@ -3638,7 +3669,7 @@ internal partial class ImageEngine
                 string eBig = string.IsNullOrEmpty(run.Font) ? styleBig : null;
                 double wf = run.WidthFactor > 0 ? run.WidthFactor : 1.0;
                 double fw = TryShxRunAdvance(eFont, eBig, t, run.Height, wf, out double wFull) ? wFull
-                    : EstimateTextWidth(t, run.Height) * wf + MTextTrackingAdd(run, t.Length);
+                    : TtfMTextWidth(t, run.Height, wf, eFont, run);
                 // 换行判定用【去掉尾随空白】的宽：行尾空白 AutoCAD 不渲染、不计入列宽
                 // （否则「multiline text.」恰好 80 单位时会因尾随空格被误判越界而提前断行）。
                 // curW 仍累加整段宽 fw（含尾随空白）作为下一词的分隔。
@@ -3648,7 +3679,7 @@ internal partial class ImageEngine
                 {
                     if (tTrim.Length == 0) fwText = 0;
                     else fwText = TryShxRunAdvance(eFont, eBig, tTrim, run.Height, wf, out double wT) ? wT
-                        : EstimateTextWidth(tTrim, run.Height) * wf + MTextTrackingAdd(run, tTrim.Length);
+                        : TtfMTextWidth(tTrim, run.Height, wf, eFont, run);
                 }
                 if (hasText && curW + fwText > refWidth) FlushCur();
                 if (!string.IsNullOrWhiteSpace(t)) hasText = true;
@@ -3658,6 +3689,28 @@ internal partial class ImageEngine
             FlushCur();
         }
         FinishMTextLayout(result);
+        if (System.Environment.GetEnvironmentVariable("GDB2CAD_WRAP") != null)
+        {
+            try
+            {
+                var sbd = new StringBuilder();
+                sbd.AppendLine("#refWidth=" + refWidth.ToString("F3") + "  styleFont=" + styleFont);
+                for (int i = 0; i < result.Lines.Count; i++)
+                {
+                    var ln = result.Lines[i];
+                    var parts = new List<string>();
+                    foreach (var rr in ln.Runs)
+                    {
+                        string fn = rr.Font ?? styleFont;
+                        string tag = rr.IsFraction ? ",FRAC" : "";
+                        parts.Add("\"" + rr.Text + "\"(H" + rr.Height.ToString("F2") + ",wf" + rr.WidthFactor.ToString("F2") + ",f:" + fn + tag + ")");
+                    }
+                    sbd.AppendLine("[L" + i + "] W=" + ln.Width.ToString("F2") + " indent=" + ln.FirstIndent.ToString("F2") + " | " + string.Join(" | ", parts));
+                }
+                System.IO.File.WriteAllText(@"C:\GDB2CAD_WRAP.txt", sbd.ToString());
+            }
+            catch { }
+        }
         return result;
     }
 
@@ -3729,14 +3782,16 @@ internal partial class ImageEngine
                 {
                     // \S<num>/<den> 分数：分子/分母上下分层 + 中间分数线（横线宽=分数宽）
                     string col = run.Color.HasValue ? AciColor(run.Color.Value) : baseCol;
-                    double fs = Math.Max(run.Height * scaleMul, 0.2);
-                    string cssFont = SvgFontFamily(ResolveFontFamily(!string.IsNullOrEmpty(run.Font) ? run.Font : styleFont));
+                    string fracFont = !string.IsNullOrEmpty(run.Font) ? run.Font : styleFont;
+                    double fracCap = TtfCapScale(ResolveFontFamily(fracFont));
+                    double fs = Math.Max(run.Height * scaleMul * fracCap, 0.2);
+                    string cssFont = SvgFontFamily(ResolveFontFamily(fracFont));
                     int sl = run.Text.IndexOf('/');
                     string num = run.Text.Substring(0, sl);
                     string den = sl + 1 < run.Text.Length ? run.Text.Substring(sl + 1) : "";
                     double wf = run.WidthFactor > 0 ? run.WidthFactor : 1.0;
-                    double numW = EstimateTextWidth(num, run.Height) * wf * scaleMul;
-                    double denW = EstimateTextWidth(den, run.Height) * wf * scaleMul;
+                    double numW = EstimateTextWidth(num, run.Height) * wf * scaleMul * fracCap;
+                    double denW = EstimateTextWidth(den, run.Height) * wf * scaleMul * fracCap;
                     double fracW = Math.Max(numW, denW); // = rw
                     // 分数堆叠几何（CAD y 向上，相对主基线；AutoCAD 实测：分子体全在分数线上方、
                     // 分母体全在线下方，线本身在主基线上方约 0.58×字高。旧版线画在主基线上 →
@@ -3821,8 +3876,12 @@ internal partial class ImageEngine
                     }
                     else
                     {
-                        // 回退 TTF（含 CJK 无 bigfont / 内联 TTF 字体 / 字形缺失）→ 原 <text> 路径（行为不变）
+                        // 回退 TTF（含 CJK 无 bigfont / 内联 TTF 字体 / 字形缺失）→ 原 <text> 路径
                         string cssFont = SvgFontFamily(ResolveFontFamily(effFont));
+                        // TTF cap-height 字号映射（Phase 2）：AutoCAD 把 H 当 cap height，非 em。
+                        // 与单行 TTF（line 2165）及宽度估算 TtfMTextWidth 一致——此前 MText TTF 未套
+                        // cap-scale，字形比单行/AutoCAD 小 ~28%（"多行富文本字体不一致"）。SHX 分支不受影响。
+                        double ttfFs = Math.Max(run.Height * scaleMul * TtfCapScale(ResolveFontFamily(effFont)), 0.2);
                         ToWorld(x, baseLineY, out double wx, out double wy);
                         double sx = Sx(wx), sy = Sy(wy);
                         // 富文本属性：字体族/字号/颜色/加粗/下划线+上划线
@@ -3830,12 +3889,12 @@ internal partial class ImageEngine
                         {
                             $"x=\"0\" y=\"0\"",
                             $"font-family=\"{cssFont}\"",
-                            $"font-size=\"{F(fs)}\"",
+                            $"font-size=\"{F(ttfFs)}\"",
                             $"fill=\"{col}\""
                         };
                         if (run.Bold) attr.Add($"font-weight=\"bold\"");
                         // \T 字距：letter-spacing（文字局部坐标单位；会被后续 scale(wf) 缩放，除以 wf 使最终像素字距独立于 \W，与 MTextRunWidth/PDF Tc 一致）
-                        double trackLocal = (run.Tracking - 1.0) * 0.1 * fs / (wf > 1e-9 ? wf : 1.0);
+                        double trackLocal = (run.Tracking - 1.0) * 0.1 * ttfFs / (wf > 1e-9 ? wf : 1.0);
                         if (Math.Abs(trackLocal) > 1e-6) attr.Add($"letter-spacing=\"{F(trackLocal)}\"");
                         var deco = new List<string>();
                         if (run.Underline) deco.Add("underline");

@@ -26,7 +26,9 @@ public static class FullPngExporter
         }
         catch (Exception ex)
         {
+            // ex.ToString() 含完整堆栈（ex.Message 仅首行，无法定位 NRE 抛出点）。
             options.Notify("❌  PNG 导出异常：" + ex.Message);
+            options.Notify("    堆栈：" + ex.ToString());
             return new ImageExportResult { Success = false };
         }
     }

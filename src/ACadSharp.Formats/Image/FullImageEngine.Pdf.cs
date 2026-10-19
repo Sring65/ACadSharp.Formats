@@ -701,7 +701,7 @@ internal partial class ImageEngine
         string styleBig = GetStyleBigFont(mt.Style);
         var layout = WrapMText(ParseMText(mt.Value ?? "", mt.Height, styleFont, styleBig), mt.RectangleWidth, styleFont, styleBig);
         if (layout.Lines.Count == 0) return;
-        var (baselines, anchorX, anchorY) = MTextLocalLayout(layout, mt);
+        var (baselines, anchorX, anchorY) = MTextLocalLayout(layout, mt, styleFont, styleBig);
 
         double rot = mt.Rotation * 180.0 / Math.PI + (tr?.Rotation ?? 0.0); // fork 弧度（只读，源自 AlignmentPoint）→ 度
         double rad = rot * Math.PI / 180.0;

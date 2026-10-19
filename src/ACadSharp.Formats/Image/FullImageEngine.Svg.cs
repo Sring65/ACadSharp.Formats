@@ -1782,7 +1782,7 @@ internal partial class ImageEngine
             if (n == 0) return (1.0, 1.0, 1.0);
             double maxH = 0.1;
             foreach (var ln in layout.Lines) maxH = Math.Max(maxH, ln.MaxHeight);
-            double gap = 1.5 * maxH;                                       // 与 MTextLocalLayout 一致的基线行距
+            double gap = MTextFontLineRatio(GetStyleFont(mt.Style), GetStyleBigFont(mt.Style)) * maxH; // 与 MTextLocalLayout 一致的字体定义行距
             double top = 0.8 * layout.Lines[0].MaxHeight;                  // 首行 ascender
             double bottom = -((n - 1) * gap + 0.2 * layout.Lines[n - 1].MaxHeight); // 末行 descender
             return RotatedBoxAabb(Math.Max(layout.MaxLineWidth, maxH), top, bottom, mt.Rotation);
@@ -2778,28 +2778,15 @@ internal partial class ImageEngine
     //   factor = upem/capHeight；capHeight 未知（字体缺失/OS/2<2/CFF 轮廓）→ 返回 1.0（保持旧行为，不劣化）。
     // 调用方：fs = H * scaleMul * bscale * TtfCapScale(family)。
     //
-    // CJK 字体特判（2026-10-19）：SimSun/SimHei/KaiTi 等 CJK 字体的汉字字形填满 em 盒
-    //   （advance = 1.0em，upem=256 时 advance=256），AutoCAD 渲染 CJK 时 em = H（不乘 capScale）。
-    //   若按拉丁 cap-height 模型放大（SimSun: 256/175=1.463），CJK 字符会被放大多 46%——
-    //   导致 MText 行宽估算过宽→过早换行、渲染间距比 AutoCAD 大。
-    //   因此 CJK 字体返回 cap=1.0（em=H），与 SHX 方格 advance=H 一致。
-    private static bool IsCjkFontFamily(string family)
-    {
-        if (string.IsNullOrEmpty(family)) return false;
-        string f = family.Split(',')[0].Trim().ToLowerInvariant();
-        return f.Contains("simsun") || f.Contains("simhei") || f.Contains("simkai") ||
-               f.Contains("simfang") || f.Contains("microsoft yahei") || f.Contains("msyh") ||
-               f.Contains("dengxian") || f.Contains("fangsong") || f.Contains("kaiti") ||
-               f.Contains("heiti") || f.Contains("songti") || f.Contains("pingfang") ||
-               f.Contains("noto sans cjk") || f.Contains("source han") ||
-               f.Contains("cjk") || f.Contains("gb2312") || f.Contains("gbk");
-    }
-
+    // TTF cap-height 字号映射（与 SHX cap-height 约定对齐，2026-10-19 修订）。
+    // AutoCAD 把文字高度 H 解释为【大写字母高度 cap height】，而非整 em 盒——该约定对【全部 TTF】
+    // （含 CJK）统一成立：CJK 字体（SimSun 等）的 OS/2 sCapHeight 同样定义（SimSun=175, upem=256 →
+    // capScale≈1.463），其汉字字形 advance=1.0em，故宽=1.0em×fs=1.463H/字、高按 cap 映射到 H，与 AutoCAD 一致。
+    // capHeight 缺失（字体缺失/OS/2<2/CFF 轮廓）→ 以 em(upem) 为基准即不放大。
     private static readonly Dictionary<string, double> _ttfCapScaleCache = new(StringComparer.OrdinalIgnoreCase);
     private static double TtfCapScale(string family)
     {
         if (string.IsNullOrEmpty(family)) return 1.0; // SHX（family=null）→ 不缩放
-        if (IsCjkFontFamily(family)) return 1.0; // CJK 字体：em=H，不乘 capScale
         string first = family.Split(',')[0].Trim();
         if (first.Length == 0) return 1.0;
         if (_ttfCapScaleCache.TryGetValue(first, out double cached)) return cached;
@@ -2810,8 +2797,12 @@ internal partial class ImageEngine
             if (!string.IsNullOrEmpty(path))
             {
                 var tf = TrueTypeFont.LoadFromFile(path!);
-                if (tf != null && tf.UnitsPerEm > 0 && tf.CapHeight > 0)
-                    factor = tf.UnitsPerEm / tf.CapHeight;
+                if (tf != null && tf.UnitsPerEm > 0)
+                {
+                    // 字体定义的 cap height（sCapHeight）；缺失则以 em 为基准（不放大）。
+                    double denom = tf.CapHeight > 0 ? tf.CapHeight : tf.UnitsPerEm;
+                    factor = tf.UnitsPerEm / denom;
+                }
             }
         }
         catch { factor = 1.0; } // 度量失败 → 回退 1.0（不劣化）
@@ -2819,6 +2810,33 @@ internal partial class ImageEngine
         if (factor > 2.5) factor = 2.5;   // 异常值保护（capHeight 异常小）
         _ttfCapScaleCache[first] = factor;
         return factor;
+    }
+
+    // 字体定义宽度占位（advance，来自 hmtx）：返回字符相对 em 的步进宽度（em 占比）。
+    // 替代 EstimateTextWidth 的 0.55/1.0 经验常量——布局读取字体真实 advance，与渲染笔迹一致。
+    private static readonly Dictionary<string, TrueTypeFont> _ttfAdvCache = new(StringComparer.OrdinalIgnoreCase);
+    private static TrueTypeFont GetTtfForWidth(string family)
+    {
+        if (string.IsNullOrEmpty(family)) return null;
+        string first = family.Split(',')[0].Trim();
+        if (first.Length == 0) return null;
+        if (_ttfAdvCache.TryGetValue(first, out var c)) return c;
+        TrueTypeFont tf = null;
+        try { string p = PdfFontManager.FindTtf(first); if (!string.IsNullOrEmpty(p)) tf = TrueTypeFont.LoadFromFile(p!); }
+        catch { tf = null; }
+        _ttfAdvCache[first] = tf;
+        return tf;
+    }
+    private static double TtfCharAdvanceEm(string family, char ch)
+    {
+        var tf = GetTtfForWidth(family);
+        if (tf != null && tf.UnitsPerEm > 0)
+        {
+            float adv = tf.GetAdvanceWidth((int)ch);
+            if (adv > 0) return adv / tf.UnitsPerEm;
+            return IsCjkChar(ch) ? 1.0 : 0.55; // 缺字形回退
+        }
+        return IsCjkChar(ch) ? 1.0 : 0.55;
     }
 
     #endregion
@@ -3222,8 +3240,14 @@ internal partial class ImageEngine
     // 致本应换行的行不换 → 整块偏矮。SHX 路径不走此函数（advance 已是真实宽）。
     private static double TtfMTextWidth(string text, double H, double wf, string font, in MTextRun r)
     {
-        double cap = TtfCapScale(ResolveFontFamily(font));
-        return EstimateTextWidth(text, H) * wf * cap + MTextTrackingAdd(r, text.Length) * cap;
+        string fam = ResolveFontFamily(font);
+        double cap = TtfCapScale(fam);
+        // 逐字读取字体定义 advance（em 占比）× cap 得相对 H 的步进，累加后 ×H×wf 即世界宽（与渲染 fs=H·cap 一致）。
+        double wPerH = 0;
+        foreach (char ch in text) wPerH += TtfCharAdvanceEm(fam, ch) * cap;
+        double w = wPerH * H * wf;
+        w += MTextTrackingAdd(r, text.Length) * cap;
+        return w;
     }
 
     private double MTextRunWidth(MTextRun r, string styleFont, string styleBig)
@@ -3559,12 +3583,13 @@ internal partial class ImageEngine
             layout.MaxLineWidth = Math.Max(layout.MaxLineWidth, ln.Width);
     }
 
-    // 行距（基线到基线）：AutoCAD 默认≈1.5×行高；
-    // Exact=直接用组码44值，AtLeast=max(44值, 1.5×行高)
-    private static double MTextLineGap(MTextLine prev, MTextLine cur, LineSpacingStyleType style, double factor)
+    // 行距（基线到基线）：AutoCAD 默认 1× 行距 = 字体定义的“自然行高占位”（非 1.5× 硬编码、亦非字形墨迹实际高宽）。
+    //   自然行高比值 = 基线到基线距离 ÷ 字高 H；TTF = (Ascent-Descent+LineGap)/CapHeight，SHX = (Above+Below)/Above (=em/cap 区)。
+    //   Exact=直接用组码44值；AtLeast=max(44值, 自然行高)；默认=自然行高。
+    private double MTextLineGap(MTextLine prev, MTextLine cur, LineSpacingStyleType style, double factor, double lineRatio)
     {
         double maxH = Math.Max(Math.Max(prev.MaxHeight, cur.MaxHeight), 0.1);
-        double def = 1.5 * maxH;
+        double def = lineRatio * maxH;
         switch (style)
         {
             case LineSpacingStyleType.Exact:
@@ -3574,6 +3599,30 @@ internal partial class ImageEngine
             default:
                 return def;
         }
+    }
+
+    // 字体“自然行高占位”比值（世界单位 gap ÷ 字高 H），即 AutoCAD 默认 1× 行距所依据的“字体定义占位高度”。
+    // TTF 取 (Ascent-Descent+LineGap)/CapHeight（cap=0 时退化为 /UnitsPerEm）；SHX 取 (Above+Below)/Above（=em/cap 区）。
+    // 【关键】读取字体度量定义里的占位，而非字形渲染墨迹的实际高宽——保证 1× 行距与 AutoCAD 一致。
+    private double MTextFontLineRatio(string font, string styleBig)
+    {
+        if (string.IsNullOrEmpty(font)) return 1.5; // 无字体（纯形状）→ 保守默认
+        // TTF（含 CJK）：族名→ttf，取 hhea/OS/2 自然行高（SimSun: (220-(-36)+36)/175 = 1.6686）
+        var tf = GetTtfForWidth(font);
+        if (tf != null && tf.UnitsPerEm > 0)
+        {
+            double denom = tf.CapHeight > 0 ? tf.CapHeight : tf.UnitsPerEm;
+            double nat = (tf.Ascent - tf.Descent + tf.LineGap) / denom;
+            if (nat > 0.5 && nat < 4.0) return nat;
+        }
+        // SHX：字体文件名→shx，取 above/below 定义占位（simplex.shx: (21+7)/21 = 1.3333）
+        var shx = GetShapeFont(font);
+        if (shx != null && shx.Above > 0)
+        {
+            double nat = (double)(shx.Above + shx.Below) / shx.Above; // em / cap 区
+            if (nat > 0.5 && nat < 4.0) return nat;
+        }
+        return 1.5;
     }
 
     // 按参考列宽（组码41）换行：CJK 逐字可断，拉丁按词（含尾随空格）断
@@ -3715,14 +3764,21 @@ internal partial class ImageEngine
     }
 
     // MTEXT 局部排版：各行基线（第0行=0，y 向上）+ 附着点锚（局部坐标，数据单位）
-    private static (double[] Baselines, double AnchorX, double AnchorY) MTextLocalLayout(MTextLayout layout, MText mt)
+    private (double[] Baselines, double AnchorX, double AnchorY) MTextLocalLayout(MTextLayout layout, MText mt, string styleFont, string styleBig)
     {
         int n = layout.Lines.Count;
         var baselines = new double[n];
         // 局部坐标系 y 向上（与 CAD 一致）：第 0 行基线在 0，其后各行向下（基线 y 递减），
-        // 行距 = 基线到基线距离。旧版误用“+”使基线递增 → 多行上下颠倒、相互重叠。
+        // 行距 = 基线到基线距离 = 字体定义自然行高（1× 行距）。旧版误用“+”使基线递增 → 多行上下颠倒、相互重叠。
         for (int i = 1; i < n; i++)
-            baselines[i] = baselines[i - 1] - MTextLineGap(layout.Lines[i - 1], layout.Lines[i], mt.LineSpacingStyle, mt.LineSpacing);
+        {
+            // 取当前行字体（内联 \f 优先，否则随实体样式）的自然行高比值
+            string lineFont = styleFont;
+            foreach (var r in layout.Lines[i].Runs)
+                if (!string.IsNullOrEmpty(r.Font)) { lineFont = r.Font; break; }
+            double ratio = MTextFontLineRatio(lineFont, styleBig);
+            baselines[i] = baselines[i - 1] - MTextLineGap(layout.Lines[i - 1], layout.Lines[i], mt.LineSpacingStyle, mt.LineSpacing, ratio);
+        }
         // 文本框：顶=首行基线+0.8×行高（上升部），底=末行基线-0.2×行高（下降部）
         double top = 0.8 * layout.Lines[0].MaxHeight;
         double bottom = baselines[n - 1] - 0.2 * layout.Lines[n - 1].MaxHeight;
@@ -3756,7 +3812,7 @@ internal partial class ImageEngine
         string styleBig = GetStyleBigFont(mt.Style);
         var layout = WrapMText(ParseMText(mt.Value ?? "", mt.Height, styleFont, styleBig), mt.RectangleWidth, styleFont, styleBig);
         if (layout.Lines.Count == 0) return;
-        var (baselines, anchorX, anchorY) = MTextLocalLayout(layout, mt);
+        var (baselines, anchorX, anchorY) = MTextLocalLayout(layout, mt, styleFont, styleBig);
 
         double rot = mt.Rotation * 180.0 / Math.PI + (tr?.Rotation ?? 0.0); // fork 弧度 → 度（MText.Rotation 由 AlignmentPoint 推导）
         double rad = rot * Math.PI / 180.0;

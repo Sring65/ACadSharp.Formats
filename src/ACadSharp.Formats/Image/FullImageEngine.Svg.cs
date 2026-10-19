@@ -3209,6 +3209,27 @@ internal partial class ImageEngine
         return gapFont * s * wf;
     }
 
+    // 【首字左侧留白】SHX：字形墨迹左缘到 pen 起点的空位（世界单位）。
+    // AutoCAD 实测：每行以【墨迹左缘】对齐左边界（插入点），而非字形的 advance 占位盒左界 →
+    // 排版须让出该留白，否则整行右偏、尾部墨迹越界提前换行。
+    private double ShxLeadingGapWorld(string text, double H, double wf, string fontName, string bigFontName)
+    {
+        if (string.IsNullOrEmpty(text)) return 0;
+        int first = 0;
+        while (first < text.Length && char.IsWhiteSpace(text[first])) first++;
+        if (first >= text.Length) return 0;
+        char ch = text[first];
+        if (ch >= 0x2E80) return 0; // CJK bigfont → 不计
+        if (!(H > 1e-9)) return 0;
+        if (!(wf > 1e-9)) wf = 1.0;
+        if (!TryResolveShxFaces(fontName, bigFontName, out ShxFont latin, out _)) return 0;
+        if (latin == null) return 0;
+        if (!latin.TryGetInkLeft(ch, out float inkL)) return 0;
+        if (inkL <= 0) return 0; // 墨迹左伸/贴边 → 无留白可让
+        double s = ShxHeightScale(latin, H);
+        return inkL * s * wf;
+    }
+
     #endregion
 
     #region ===== MTEXT 多行文字 =====
@@ -3239,6 +3260,7 @@ internal partial class ImageEngine
         public double Width;
         public double FirstIndent; // \pi 段落首行缩进（数据单位；仅段落首行生效，续行为 0）
         public double? ParaSpacing; // \pxsm<N>; 段落行距倍数（扩展字典缓存/内联 \px）；null=用实体组码 44
+        public double InkLeft;      // 首字左侧留白（世界单位）：墨迹左缘到 pen 起点的空位，见 Eng.MTextLeadingGap
         public void Recalc(ImageEngine eng, string styleFont, string styleBig)
         {
             MaxHeight = 0; Width = 0;
@@ -3247,6 +3269,7 @@ internal partial class ImageEngine
                 MaxHeight = Math.Max(MaxHeight, r.Height);
                 Width += eng.MTextRunWidth(r, styleFont, styleBig);
             }
+            InkLeft = eng.MTextLeadingGap(this, styleFont, styleBig);
         }
         // 行内【有墨迹】run 的最大字高：空白 run（任意字号的空格）AutoCAD 不渲染、不参与行距
         // （参考图实测：行首/行尾大字号空格均不改变基线距）。
@@ -3295,6 +3318,40 @@ internal partial class ImageEngine
         double cap = TtfCapScale(font);
         double scale = (cap * H * wf) / tf.UnitsPerEm; // 世界单位/字体单位（与 TtfMTextWidth 一致）
         return tf.GetGlyphTrailingGap(text[last]) * scale;
+    }
+
+    // 【首字左侧留白】TTF：glyf xMin（世界单位）。语义同 ShxLeadingGapWorld：
+    // 行以墨迹左缘对齐边界，该留白需让出（见此处）。
+    private static double TtfLeadingGapWorld(string text, double H, double wf, string font)
+    {
+        if (string.IsNullOrEmpty(text)) return 0;
+        int first = 0;
+        while (first < text.Length && char.IsWhiteSpace(text[first])) first++;
+        if (first >= text.Length) return 0;
+        var tf = GetTtfForWidth(font);
+        if (tf == null || tf.UnitsPerEm <= 0) return 0;
+        double cap = TtfCapScale(font);
+        double scale = (cap * H * wf) / tf.UnitsPerEm;
+        return tf.GetGlyphLeadingGap(text[first]) * scale;
+    }
+
+    // 行级首字左侧留白（世界单位）：该行第一个【有墨迹】字符的左侧留白。
+    // 用于 WrapMText 的可用宽度（+lead）与各引擎行起点（−lead，使墨迹左缘落在参考边界）。
+    private double MTextLeadingGap(MTextLine ln, string styleFont, string styleBig)
+    {
+        foreach (var r in ln.Runs)
+        {
+            if (string.IsNullOrEmpty(r.Text)) continue;
+            if (string.IsNullOrWhiteSpace(r.Text)) continue; // 纯空白不产生墨迹
+            string eFont = !string.IsNullOrEmpty(r.Font) ? r.Font : styleFont;
+            string eBig = string.IsNullOrEmpty(r.Font) ? styleBig : null;
+            double wf = r.WidthFactor > 0 ? r.WidthFactor : 1.0;
+            double lead = TryShxRunAdvance(eFont, eBig, r.Text, r.Height, wf, out _)
+                ? ShxLeadingGapWorld(r.Text, r.Height, wf, eFont, eBig)
+                : TtfLeadingGapWorld(r.Text, r.Height, wf, eFont);
+            return lead > 0 ? lead : 0;
+        }
+        return 0;
     }
 
     private double MTextRunWidth(MTextRun r, string styleFont, string styleBig)
@@ -3837,6 +3894,7 @@ internal partial class ImageEngine
             // 贪心填充
             var cur = new List<(string Text, MTextRun Run)>();
             double curW = line.FirstIndent; // 首行可用宽 = refWidth − 首行缩进
+            double curLead = 0;             // 当前行首字左侧留白（换行时可让出的宽度）
             bool hasText = false;
             bool firstSub = true;           // 拆行后仅第一条子行继承段落首行缩进
             void FlushCur()
@@ -3871,7 +3929,7 @@ internal partial class ImageEngine
                     ln.Recalc(this, styleFont, styleBig);
                     result.Lines.Add(ln);
                 }
-                cur.Clear(); curW = 0; hasText = false;
+                cur.Clear(); curW = 0; hasText = false; curLead = 0;
             }
             foreach (var (t, run) in frags)
             {
@@ -3901,7 +3959,13 @@ internal partial class ImageEngine
                     : TtfTrailingGapWorld(inkSrc, run.Height, wf, eFont);
                 double inkExtent = fwText - trailing;
                 if (inkExtent < 0) inkExtent = 0;
-                if (hasText && curW + inkExtent > refWidth) FlushCur();
+                // 行首留白：该 frag 若为当前行首个有墨迹片段，其首字左侧留白不计入占位
+                // （AutoCAD 以墨迹左缘对齐左边界 → 左侧留白可让给右侧，见 ShxLeadingGapWorld 注释）。
+                if (cur.Count == 0 && !hasText)
+                    curLead = shxOK
+                        ? ShxLeadingGapWorld(t, run.Height, wf, eFont, eBig)
+                        : TtfLeadingGapWorld(t, run.Height, wf, eFont);
+                if (hasText && curW + inkExtent - curLead > refWidth) FlushCur();
                 if (!string.IsNullOrWhiteSpace(t)) hasText = true;
                 cur.Add((t, run));
                 curW += fw;
@@ -4006,7 +4070,14 @@ internal partial class ImageEngine
 
         for (int li = 0; li < layout.Lines.Count; li++)
         {
-            double x = layout.Lines[li].FirstIndent * scaleMul; // 段落首行缩进（\pi）
+            // 行起点 = 段落首行缩进 − 首字左侧留白：AutoCAD 以【墨迹左缘】对齐左边界（插入点），
+            // 而非字形 advance 占位盒左界（参考图实测：每行墨迹左缘距插入点≈0，我们旧版右偏 0.44 单位）。
+            // 仅左对齐生效：居中/右对齐仍按 advance 盒宽排布，避免各行留白不同造成的参差不齐。
+            bool leftAligned = layout.Lines[li].InkLeft > 0 &&
+                (mt.AttachmentPoint == AttachmentPointType.TopLeft
+                 || mt.AttachmentPoint == AttachmentPointType.MiddleLeft
+                 || mt.AttachmentPoint == AttachmentPointType.BottomLeft);
+            double x = (layout.Lines[li].FirstIndent - (leftAligned ? layout.Lines[li].InkLeft : 0.0)) * scaleMul;
             foreach (var run in layout.Lines[li].Runs)
             {
                 double rw = MTextRunWidth(run, styleFont, styleBig) * scaleMul;

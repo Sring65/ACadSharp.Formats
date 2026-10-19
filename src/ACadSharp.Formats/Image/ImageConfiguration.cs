@@ -25,9 +25,24 @@ public class ImageConfiguration
 
 	/// <summary>
 	/// 输出放大倍数：内部画板 1:1（1 绘图单位 = 1 像素），最终画布整体放大该倍数
-	/// （SVG width/height、PDF CTM+MediaBox）。默认 10（2026-09-23 用户要求）。
+	/// （SVG width/height、PDF CTM+MediaBox、PNG 每数据单位像素数）。默认 10（2026-09-23 用户要求）。
+	/// 可经 GDB2CAD 的 appsettings.json（ImageZoom）或 CLI（--zoom）覆盖，优先级：CLI &gt; 配置 &gt; 默认 10。
 	/// </summary>
 	public double OutputZoom { get; set; } = 10.0d;
+
+	/// <summary>
+	/// PNG 是否「合并为一张图」（仅 PNG 光栅端生效；SVG/PDF 忽略）。
+	/// true  = 当整幅 1:1×OutputZoom 画布超出位图像素上限时，流式把各瓦片缩放合并为 1 张 PNG（等比缩小到上限内）；
+	/// false（默认）= 超出上限时按 <see cref="PngTileSize"/> 切分为多个 PNG 文件分块输出（每张 ≤ 单侧/总像素上限，不缩小、不丢清晰度）。
+	/// </summary>
+	public bool PngMergeToSingle { get; set; } = false;
+
+	/// <summary>
+	/// PNG 分块瓦片像素边长上限（仅 PNG 光栅端、且 PngMergeToSingle=false 时生效）。
+	/// 每个瓦片画布边长不超过该值（同时受单侧 16384 / 总像素 3200 万上限约束），
+	/// 整幅画布按该网格切分为 N×M 个瓦片文件。默认 4096。
+	/// </summary>
+	public int PngTileSize { get; set; } = 4096;
 
 	/// <summary>
 	/// 日志回调（进度/告警）。

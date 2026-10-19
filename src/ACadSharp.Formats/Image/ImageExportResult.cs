@@ -31,4 +31,16 @@ public sealed class ImageExportResult
 
     /// <summary>画布上边界对应的数据坐标。</summary>
     public double DataY1 { get; init; }
+
+    /// <summary>
+    /// PNG 分块（瓦片）列表：仅当 PNG 整幅画布超出位图像素上限且 PngMergeToSingle=false 时填充
+    /// （多张 PNG，每张对应一个 <see cref="ImageTile"/>）。单图输出（未超限、或已合并）时为空。
+    /// 注意：本对象的 CanvasPixelsW/H 与 DataX0/X1/Y0/Y1 始终是「整幅画布」的值（合并图即整幅缩小，
+    /// 分块时为各瓦片共同的全局画布），各瓦片的子区域由 <see cref="ImageTile"/> 描述。
+    /// </summary>
+    public System.Collections.Generic.IReadOnlyList<ImageTile> Tiles { get; init; } =
+        System.Array.Empty<ImageTile>();
+
+    /// <summary>PNG 是否因超像素上限被流式合并为单图（PngMergeToSingle=true 且超限时为 true）。</summary>
+    public bool MergedToSingle { get; init; }
 }

@@ -2909,13 +2909,16 @@ internal partial class ImageEngine
         string text = t.Value ?? "";
         if (text.Length == 0) return null;
         if (!TryGetShxTextFaces(t, out ShxFont latin, out ShxFont cjk)) return null;
-        System.Text.Encoding gbk = null; bool hasCjk = false;
-        foreach (var ch in text) if (ch >= 0x2E80) { hasCjk = true; break; }
-        if (hasCjk)
+        // 触发 GBK 的判据须与下方逐字循环的 else 分支一致（ch>=0x80），而非仅 ch>=0x2E80：
+        // 否则含 °(U+00B0)/±/′/″ 等非 ASCII 符号但无真 CJK 的 SHX 文字（分幅图常见角度/坐标标注）
+        // 会在 else 分支解引用未初始化的 gbk 抛 NullReferenceException（2026-10-20 分幅图合图1008 崩溃根因）。
+        System.Text.Encoding gbk = null; bool needBig = false, needCjk = false;
+        foreach (var ch in text) { if (ch >= 0x80) needBig = true; if (ch >= 0x2E80) needCjk = true; }
+        if (needCjk && cjk == null) return null;   // 含真 CJK 但无 bigfont → 回退 TTF（避免缺字/错字）
+        if (needBig)
         {
-            if (cjk == null) return null; // 含 CJK 但无 bigfont → 无法定位字形 → 回退 TTF（避免缺字/错字）
-            gbk = ShxGbkEncoding();
-            if (gbk == null) return null;  // GBK 不可用 → 回退 TTF
+            gbk = ShxGbkEncoding();                 // 可能为 null（CodePages 不可用）
+            if (needCjk && gbk == null) return null; // 含真 CJK 且 GBK 不可用 → 回退 TTF
         }
 
         double H = t.Height * scaleMul;                 // 字高（数据单位，em 盒高）
@@ -2931,11 +2934,18 @@ internal partial class ImageEngine
         {
             ShxFont face; int code;
             if (ch < 0x80) { face = latin; code = ch; }
-            else
+            else if (ch >= 0x2E80)
             {
+                // 真 CJK：GBK 双字节 → bigfont。此处 gbk 必非 null（needCjk 且 gbk==null 已在上方 return）。
                 byte[] gb = gbk.GetBytes(new char[] { ch });
                 if (gb.Length != 2) continue;
                 face = cjk; code = (gb[0] << 8) | gb[1];
+            }
+            else
+            {
+                // 非 CJK 符号（0x80<=ch<0x2E80，如 °/±/′/″）：unifont(latin) 面低 8 位 best-effort，
+                // 不走 GBK/bigfont（GBK 双字节序列对非 CJK 无意义）；缺字形时 TryGetGlyph 失败仅留 advance 间隙。
+                face = latin; code = ch & 0xFF;
             }
             int em = face.UnitsPerEm > 0 ? face.UnitsPerEm : 1;
             double s = ShxHeightScale(face, H);         // 数据单位 / 该面字体单位（cap height 映射 H，见 ShxHeightScale）

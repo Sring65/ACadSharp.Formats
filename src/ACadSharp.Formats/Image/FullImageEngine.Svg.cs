@@ -2789,6 +2789,7 @@ internal partial class ImageEngine
         if (string.IsNullOrEmpty(family)) return 1.0; // SHX（family=null）→ 不缩放
         string first = family.Split(',')[0].Trim();
         if (first.Length == 0) return 1.0;
+        first = ResolveFontFamily(first) ?? first; // 归一化（simsun/宋体→SimSun）保 CJK 判定与缓存稳定
         if (_ttfCapScaleCache.TryGetValue(first, out double cached)) return cached;
         double factor = 1.0;
         try
@@ -2801,6 +2802,16 @@ internal partial class ImageEngine
                 {
                     // 字体定义的 cap height（sCapHeight）；缺失则以 em 为基准（不放大）。
                     double denom = tf.CapHeight > 0 ? tf.CapHeight : tf.UnitsPerEm;
+                    // AutoCAD 对 CJK 全宽字体的等效 cap ≈ sCapHeight×(181/175)（+3.5%，实测校准）：
+                    // ① 每汉字 advance=H×upem/cap：sCapHeight=175 → 10.97，比 AutoCAD 实测 10.62
+                    //    宽 3.3% → 每行少放一字（我们 6 字 vs AutoCAD 7 字，refWidth=74.688 恰放 7）；
+                    //    实测依据：sample-mtext.dxf 首框，像素每字中心距 17.917px × (126px/74.688
+                    //    世界) = 10.62。
+                    // ② SimSun 汉字墨迹 yMax=205（远超 sCapHeight=175）→ 205/175×H=8.79 高出
+                    //    cap 线 17%（"字偏高"根因）；cap→181: adv=10.61/字（7 字墨迹 73.85<
+                    //    74.688 恰放、8 字 84.8 不放）、墨迹顶 8.48。
+                    // 拉丁字体（arial cap=1467，GT 实测 72.16 vs 71.995 已精确校准）不适用、不修正。
+                    if (PdfFontManager.IsCjkFont(first)) denom *= 181.0 / 175.0;
                     factor = tf.UnitsPerEm / denom;
                 }
             }
@@ -3810,7 +3821,11 @@ internal partial class ImageEngine
             case LineSpacingStyleType.AtLeast:
                 return Math.Max(f * lineRatio * baseH, lineRatio * maxH);
             default:
-                return lineRatio * maxH;
+                // None(0)：DXF 组码 73 缺省（ACadSharp 读不到即 None）——AutoCAD/DXF 惯例
+                // 缺省按 AtLeast 语义，\pxsm 倍数必须生效。否则 SimSun \pxsm2.5 基线距退化为
+                // 1×（9.94 世界 vs AutoCAD 实测 35.32，行距明显偏挤）。不含 maxH 下限
+                // （None=高字符不覆盖 → 行距即倍数×占位×基准H）。
+                return f * lineRatio * baseH;
         }
     }
 

@@ -1403,7 +1403,9 @@ internal partial class ImageEngine
     {
         string baseCol = ColorOf(EntityAciIndex(mt), layerAci, byBlockAci);
         string styleBig = GetStyleBigFont(mt.Style);
-        var layout = WrapMText(ParseMText(mt.Value ?? "", mt.Height, styleFont, styleBig), mt.RectangleWidth, styleFont, styleBig);
+        // \pxsm 段落行距倍数同样走扩展字典缓存提取（与 SVG 端一致；组码 44 常保持 1.0）：
+        // 此前 PDF/PNG 未传 paraProps → 多倍行距丢失、整块偏矮（AutoCAD 图明显行距更大）。
+        var layout = WrapMText(ParseMText(mt.Value ?? "", mt.Height, styleFont, styleBig, MTextCacheParaProps(mt)), mt.RectangleWidth, styleFont, styleBig);
         if (layout.Lines.Count == 0) return;
         var (baselines, anchorX, anchorY) = MTextLocalLayout(layout, mt, styleFont, styleBig);
 

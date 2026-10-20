@@ -122,4 +122,23 @@ internal sealed class PdfFontManager
         }
         return CjkFont.FindFontFile(candidates);
     }
+
+    // CJK 字体族判定（CanonicalTtfFamily 归一化后的标准名 / 中文名兜底）。
+    // AutoCAD 对全宽中文的等效 cap height 比 OS/2 sCapHeight 高 ~3.5%（SimSun 175→181 实测），
+    // ImageEngine.TtfCapScale 据此对 CJK 字体修正 advance/字顶映射（拉丁字体不修正）。
+    private static readonly HashSet<string> CjkFamilies = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "SimHei", "SimSun", "DengXian", "KaiTi", "FangSong", "SimLi", "Microsoft YaHei"
+    };
+    public static bool IsCjkFont(string family)
+    {
+        if (string.IsNullOrWhiteSpace(family)) return false;
+        string first = family.Split(',')[0].Trim();
+        if (first.Length == 0) return false;
+        if (CjkFamilies.Contains(first)) return true;
+        string l = first.ToLowerInvariant();
+        return l.Contains("simsun") || l.Contains("simhei") || l.Contains("msyh")
+            || l.Contains("宋体") || l.Contains("黑体") || l.Contains("雅黑")
+            || l.Contains("楷体") || l.Contains("仿宋") || l.Contains("等线") || l.Contains("隶书");
+    }
 }

@@ -3991,6 +3991,12 @@ internal partial class ImageEngine
                         ? ShxLeadingGapWorld(t, run.Height, wf, eFont, eBig)
                         : TtfLeadingGapWorld(t, run.Height, wf, eFont);
                 if (hasText && curW + inkExtent - curLead > refWidth) FlushCur();
+                // 行首空白丢弃（AutoCAD 行首空白不渲染、不占宽）：上一行换行时，尾随大字号
+                // 空格（{\H1.83x; } 等）掉到下一行行首——本 frag 处理中才触发 FlushCur，
+                // 故 skip 必须在 flush 之后判（在循环开头判会因上一行仍在 cur 中而漏过）。
+                // 旧版留在行首 → 该行文字被推后一个空格宽（实测 12.36 世界）、Width/居中/
+                // 右对正基准被带偏；AutoCAD 参考图中该行紧贴左缘。
+                if (cur.Count == 0 && !hasText && string.IsNullOrWhiteSpace(t)) continue;
                 if (!string.IsNullOrWhiteSpace(t)) hasText = true;
                 cur.Add((t, run));
                 curW += fw;
@@ -4016,7 +4022,7 @@ internal partial class ImageEngine
                     }
                     sbd.AppendLine("[L" + i + "] W=" + ln.Width.ToString("F2") + " indent=" + ln.FirstIndent.ToString("F2") + " | " + string.Join(" | ", parts));
                 }
-                System.IO.File.WriteAllText(@"C:\GDB2CAD_WRAP.txt", sbd.ToString());
+                System.IO.File.AppendAllText(@"C:\GDB2CAD_WRAP.txt", sbd.ToString() + "\r\n");
             }
             catch { }
         }

@@ -88,7 +88,7 @@ internal partial class ImageEngine
     // —— 复杂线型 WalkPatternPx 内部分支细分（定位 13s 走查瓶颈）——
     // StrokePolyline 分流累计（顶层实体收尾时从当前 _rc 增量读取清零，跨瓦片/离屏累积）
     private long _sdfCount, _sdfMs, _scanCount, _scanMs;
-    private long _sdfSingleCount, _sdfMultiCount, _sdfPixelIters, _sdfBlendCount, _sdfBboxArea;
+    private long _sdfSingleCount, _sdfMultiCount, _sdfSingleMs, _sdfMultiMs, _sdfPixelIters, _sdfBlendCount, _sdfBboxArea;
     private long _lwWalkMs = 0;        // WalkPatternPx 走查总耗时
     private long _lwWalkIters = 0;     // 走查 while 循环总迭代次数（=dash+gap+shape+text 段总数）
     private long _lwDashCnt = 0;       // dash 段数（走 AppendSpanPb，全量遍历 pts 的 O(n)）
@@ -121,7 +121,8 @@ internal partial class ImageEngine
         _log($"[perf]     · 文字 DrawTextPng：{_lwDrawTextMs,6:F0} ms");
         _log($"[perf] -- StrokePolyline 分流（全部实体）--");
         _log($"[perf]   SDF 描边（逐像素距离）：{_sdfCount,9:F0} 次 / {_sdfMs,8:F0} ms");
-        _log($"[perf]     · 单段快速路径 {_sdfSingleCount:F0} 次 / 多段 {_sdfMultiCount:F0} 次；内层像素迭代 {_sdfPixelIters:F0} 次 / 实际 Blend {_sdfBlendCount:F0} 次 / bbox 面积和 {_sdfBboxArea:F0} px²");
+        _log($"[perf]     · 单段快速路径 {_sdfSingleCount:F0} 次 / {_sdfSingleMs,6:F0} ms · 多段 {_sdfMultiCount:F0} 次 / {_sdfMultiMs,6:F0} ms");
+        _log($"[perf]     · 内层像素迭代 {_sdfPixelIters:F0} 次 / 实际 Blend {_sdfBlendCount:F0} 次 / bbox 面积和 {_sdfBboxArea:F0} px²");
         _log($"[perf]   ScanFill 描边（多边形外扩+扫描填充）：{_scanCount,3:F0} 次 / {_scanMs,8:F0} ms");
         _log($"[perf]   采样 LwPolylineSamplePoints：{_lwSampleMs,8:F0} ms（总点数 {_lwSamplePts}，单实体最大 {_lwMaxSegs} 点）");
         _log($"[perf]   变宽 EmitTaperedPng：{_lwTaperMs,8:F0} ms（{_lwTaperCnt} 条）");
@@ -365,12 +366,18 @@ internal partial class ImageEngine
         if (fullH < 1) fullH = 1;
         bool overLimit = fullW > PngMaxSide || fullH > PngMaxSide || (long)fullW * fullH > PngMaxPixels;
 
-        // ① 未超限：单图 1:1×zoom 原尺寸（行为与旧版一致，不缩小）
-        if (!overLimit)
+        // WMTS 缩放级别 z：多级导出时由宿主传 0-based 级别索引（WmtsZ）；单级导出回退 OutputZoom 四舍五入（旧行为）。
+        int zLevel = _opt.WmtsZ ?? Math.Max(0, (int)Math.Round(zoom));
+        // 多级导出（WmtsZ 非 null）且强制网格：即使未超限也输出 tiles/{z}/0/0.png（1×1 网格），
+        //   使各级别（单图/分块）统一落入同一 tiles 树，便于下游按 WMTS 协议取图（2026-10-21 用户）。
+        bool forceTiles = _opt.WmtsZ != null && _opt.PngForceTiles;
+
+        // ① 未超限且无需强制网格：单图 1:1×zoom 原尺寸（行为与旧版一致，不缩小）
+        if (!overLimit && !forceTiles)
             return WritePngSingle(outPath, fullW, fullH, false);
 
-        // ② 超限 + 合并（PngMergeToSingle=true）：等比缩小到上限内，流式合并为 1 张
-        if (_opt.PngMergeToSingle)
+        // ② 超限 + 合并（PngMergeToSingle=true）且未强制网格：等比缩小到上限内，流式合并为 1 张
+        if (overLimit && _opt.PngMergeToSingle && !forceTiles)
         {
             double f = Math.Min(PngMaxSide / (double)fullW, PngMaxSide / (double)fullH);
             if ((long)fullW * fullH > PngMaxPixels)
@@ -381,8 +388,8 @@ internal partial class ImageEngine
             return WritePngSingle(outPath, W, H, true);
         }
 
-        // ③ 超限 + 默认不合并：按网格分块，流式输出多张 PNG（每张 ≤ 单侧/总像素上限，不缩小、不丢清晰度）
-        return WritePngTiled(outPath, fullW, fullH, zoom);
+        // ③ 超限分块 / 强制网格（单图也按 1×1 瓦片）：按网格流式输出（每张 ≤ 单侧/总像素上限，不缩小、不丢清晰度）
+        return WritePngTiled(outPath, fullW, fullH, zoom, zLevel);
     }
 
     // 单图渲染（未超限原尺寸 / 超限合并缩小 共用）：建画布→清背景→逐实体光栅化→存盘。
@@ -420,7 +427,7 @@ internal partial class ImageEngine
     // 分块（瓦片）渲染：整幅 1:1×zoom 画布按 cols×rows 网格切分，每个瓦片建独立小画布，
     // 把整幅场景画进该瓦片画布（PngSx/PngSy 按瓦片 _pngKx/_pngKy 映射，越界像素由 RasterCanvas.Blend 自动裁剪），
     // 流式各存一个 PNG。瓦片间像素无缝（同一全局像素网格对齐），合并起来即完整画布。
-    private ImageExportResult WritePngTiled(string outPath, int fullW, int fullH, double zoom)
+    private ImageExportResult WritePngTiled(string outPath, int fullW, int fullH, double zoom, int zLevel)
     {
         // 瓦片边长：min(PngTileSize, 单侧上限)，再保证方形瓦片 tile×tile ≤ 总像素上限
         int tile = _opt.PngTileSize > 0 ? _opt.PngTileSize : 4096;
@@ -479,11 +486,10 @@ internal partial class ImageEngine
                 long _tileRenderMs = Environment.TickCount64 - _tileRenderT0;
                 _rc = null;
 
-                // OGC WMTS 标准命名：tiles/{z}/{row}/{col}.png（z=缩放级别，取渲染放大倍数四舍五入；
-                // 2026-10-21 用户：原固定 z=0 无信息量，改为 tiles/{缩放级别}/{row}/{col}.png，
-                // row=cy 自顶向下，col=cx 自左向右）。
-                // 叶子文件名即 col（同一 (z,row) 目录下 col 唯一，无碰撞），与 ImageTile.RelPath 一致。
-                int z = Math.Max(0, (int)Math.Round(zoom));
+                // OGC WMTS 标准命名：tiles/{z}/{row}/{col}.png。
+                //   z = 缩放级别：单级导出取 OutputZoom 四舍五入；多级导出取宿主传入的 0-based 级别索引（zLevel）。
+                //   row=cy 自顶向下，col=cx 自左向右；叶子文件名即 col（同一 (z,row) 目录下 col 唯一，无碰撞），与 ImageTile.RelPath 一致。
+                int z = zLevel;
                 string name = $"{cx}{ext}";
                 string fp = Path.Combine(dir, "tiles", z.ToString(), cy.ToString(), name);
                 Directory.CreateDirectory(Path.GetDirectoryName(fp));
@@ -515,7 +521,7 @@ internal partial class ImageEngine
 
         LogSkipped("PNG");
         double skipPct = totalPairs > 0 ? 100.0 * (1 - (double)renderedPairs / totalPairs) : 0;
-        _log($"✅  PNG 分块输出：{seq} 张瓦片（{cols} 列 × {rows} 行，单瓦片 ≤ {tile}×{tile}px，整幅 {fullW}×{fullH} @1:1×{F(zoom)}，OGC WMTS 命名 tiles/{Math.Max(0, (int)Math.Round(zoom))}/{{row}}/{{col}}.png{(_transparentBg ? "，透明背景" : "")}）");
+        _log($"✅  PNG 分块输出：{seq} 张瓦片（{cols} 列 × {rows} 行，单瓦片 ≤ {tile}×{tile}px，整幅 {fullW}×{fullH} @1:1×{F(zoom)}，OGC WMTS 命名 tiles/{zLevel}/{{row}}/{{col}}.png{(_transparentBg ? "，透明背景" : "")}）");
         _log($"   空间剔除：{seq} 瓦片共需 {totalPairs} 次实体渲染，实际 {renderedPairs} 次（剔除 {skipPct:F0}%）");
         LogPerfSummary();
         return PngResult(fullW, fullH, false, tiles);
@@ -1023,9 +1029,10 @@ internal partial class ImageEngine
                     _sdfCount += _rc.SdfCount; _sdfMs += _rc.SdfMs; _rc.SdfCount = 0; _rc.SdfMs = 0;
                     _scanCount += _rc.ScanCount; _scanMs += _rc.ScanMs; _rc.ScanCount = 0; _rc.ScanMs = 0;
                     _sdfSingleCount += _rc.SdfSingleCount; _sdfMultiCount += _rc.SdfMultiCount;
+                    _sdfSingleMs += _rc.SdfSingleMs; _sdfMultiMs += _rc.SdfMultiMs;
                     _sdfPixelIters += _rc.SdfPixelIters; _sdfBlendCount += _rc.SdfBlendCount;
                     _sdfBboxArea += _rc.SdfBboxArea;
-                    _rc.SdfSingleCount = _rc.SdfMultiCount = _rc.SdfPixelIters = _rc.SdfBlendCount = _rc.SdfBboxArea = 0;
+                    _rc.SdfSingleCount = _rc.SdfMultiCount = _rc.SdfSingleMs = _rc.SdfMultiMs = _rc.SdfPixelIters = _rc.SdfBlendCount = _rc.SdfBboxArea = 0;
                 }
             }
         }

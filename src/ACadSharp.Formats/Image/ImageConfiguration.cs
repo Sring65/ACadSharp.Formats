@@ -31,6 +31,22 @@ public class ImageConfiguration
 	public double OutputZoom { get; set; } = 10.0d;
 
 	/// <summary>
+	/// WMTS 缩放级别 z（仅 PNG 分块输出端生效；SVG/PDF 忽略）。
+	/// 多级缩放导出时由宿主程序逐级设置为【0-based 级别索引】（第 1 级→0、第 2 级→1…），
+	/// 使各级别瓦片落入统一 tiles/{z}/{row}/{col}.png 树，而非按 OutputZoom 四舍五入的缩放倍数。
+	/// null（默认）= 单级导出，z 回退为 OutputZoom 四舍五入（与旧行为一致）。
+	/// </summary>
+	public int? WmtsZ { get; set; }
+
+	/// <summary>
+	/// 强制单图也按 WMTS 网格输出（仅 PNG 端、且 WmtsZ 非 null 时生效）。
+	/// true = 整幅画布未超像素上限时，仍输出为 tiles/{z}/0/0.png（1×1 网格），
+	///   保证多级导出各级别（无论单图还是分块）都落入统一的 tiles 树，便于下游按 WMTS 协议统一取图。
+	/// false（默认）= 未超限时直接输出单张 PNG 文件（原路径，行为与单级导出一致）。
+	/// </summary>
+	public bool PngForceTiles { get; set; } = false;
+
+	/// <summary>
 	/// PNG 是否「合并为一张图」（仅 PNG 光栅端生效；SVG/PDF 忽略）。
 	/// true  = 当整幅 1:1×OutputZoom 画布超出位图像素上限时，流式把各瓦片缩放合并为 1 张 PNG（等比缩小到上限内）；
 	/// false（默认）= 超出上限时按 <see cref="PngTileSize"/> 切分为多个 PNG 文件分块输出（每张 ≤ 单侧/总像素上限，不缩小、不丢清晰度）。

@@ -40,9 +40,23 @@ internal sealed class RasterCanvas
     public long SdfCount, SdfMs, ScanCount, ScanMs;
     // 2026-10-21 性能诊断：单段/多段分布 + 内层像素迭代量，定位 SDF 真正耗时来源
     public long SdfSingleCount, SdfMultiCount;
+    public long SdfSingleMs, SdfMultiMs; // 单段/多段分支独立耗时（定位固定开销来源）
     public long SdfPixelIters;   // 内层像素迭代总次数（px 循环体执行次数）
     public long SdfBlendCount;   // 实际 Blend 调用次数（cov>0）
     public long SdfBboxArea;     // 各次调用 bbox 面积之和
+    // 多段路径复用缓冲（2026-10-21 性能）：替代每次调用 9×ArrayPool.Rent/Return，
+    //   高频短折线（SHX 字形子路径）场景下池操作本身成为固定开销，改成员数组按需扩展、常驻复用。
+    private float[] _sdfAx, _sdfAy, _sdfBx, _sdfBy, _sdfSy0, _sdfSy1, _sdfSx0, _sdfSx1;
+    private int[] _sdfRowSegs;
+    private void EnsureSdfBuf(int len)
+    {
+        if (_sdfAx == null || _sdfAx.Length < len)
+        {
+            _sdfAx = new float[len]; _sdfAy = new float[len]; _sdfBx = new float[len]; _sdfBy = new float[len];
+            _sdfSy0 = new float[len]; _sdfSy1 = new float[len]; _sdfSx0 = new float[len]; _sdfSx1 = new float[len];
+            _sdfRowSegs = new int[len];
+        }
+    }
 
     public RasterCanvas(int w, int h)
     {
@@ -330,6 +344,7 @@ internal sealed class RasterCanvas
         if (segCount == 1)
         {
             SdfSingleCount++;
+            long _ts1 = System.Environment.TickCount64;
             var pa = pts[0]; var pb = pts[1];
             float ax = pa.X, ay = pa.Y, bx = pb.X, by = pb.Y;
             float dx = bx - ax, dy = by - ay;
@@ -370,98 +385,81 @@ internal sealed class RasterCanvas
                     }
                 }
             }
+            SdfSingleMs += System.Environment.TickCount64 - _ts1;
             return;
         }
         SdfMultiCount++;
+        long _ts2 = System.Environment.TickCount64;
 
-        // 多段：预拷贝段端点 + y/x 走廊区间（行走廊裁剪用），ArrayPool 复用消除每次调用
-        //   的堆分配（旧版 new 8×float[]+1×int[]，多段轮廓叠加调用 → GC 压力）。
-        float[] axA = ArrayPool<float>.Shared.Rent(segCount);
-        float[] ayA = ArrayPool<float>.Shared.Rent(segCount);
-        float[] bxA = ArrayPool<float>.Shared.Rent(segCount);
-        float[] byA = ArrayPool<float>.Shared.Rent(segCount);
-        float[] sy0A = ArrayPool<float>.Shared.Rent(segCount);
-        float[] sy1A = ArrayPool<float>.Shared.Rent(segCount);
-        float[] sx0A = ArrayPool<float>.Shared.Rent(segCount);
-        float[] sx1A = ArrayPool<float>.Shared.Rent(segCount);
-        int[] rowSegs = ArrayPool<int>.Shared.Rent(segCount);
-        try
+        // 多段：预拷贝段端点 + y/x 走廊区间（行走廊裁剪用）。复用成员缓冲 _sdf*（按需扩展、常驻），
+        //   替代每次调用 9×ArrayPool.Rent/Return——高频短折线场景池操作本身成为固定开销。
+        EnsureSdfBuf(segCount);
+        float[] axA = _sdfAx, ayA = _sdfAy, bxA = _sdfBx, byA = _sdfBy;
+        float[] sy0A = _sdfSy0, sy1A = _sdfSy1, sx0A = _sdfSx0, sx1A = _sdfSx1;
+        int[] rowSegs = _sdfRowSegs;
+        for (int i = 0; i < segCount; i++)
         {
+            var p0 = pts[i]; var p1 = pts[(i + 1) % n];
+            axA[i] = p0.X; ayA[i] = p0.Y; bxA[i] = p1.X; byA[i] = p1.Y;
+            if (ayA[i] < byA[i]) { sy0A[i] = ayA[i]; sy1A[i] = byA[i]; }
+            else { sy0A[i] = byA[i]; sy1A[i] = ayA[i]; }
+            if (axA[i] < bxA[i]) { sx0A[i] = axA[i] - reach; sx1A[i] = bxA[i] + reach; }
+            else { sx0A[i] = bxA[i] - reach; sx1A[i] = axA[i] + reach; }
+        }
+        // 行走廊遍历（性能核心）：每行先收集与该 py 走廊相交的段（m 个），
+        //   x 方向收窄到这些段走廊并集 [px0,px1]，内层只对这些相交段求距离。
+        //   成本 O(折线走廊面积)，同行多段取 max 合成（语义不变）。
+        for (int py = y0; py <= y1; py++)
+        {
+            float fy = py + 0.5f;
+            int m = 0;
+            float rowX0 = float.MaxValue, rowX1 = float.MinValue;
             for (int i = 0; i < segCount; i++)
             {
-                var p0 = pts[i]; var p1 = pts[(i + 1) % n];
-                axA[i] = p0.X; ayA[i] = p0.Y; bxA[i] = p1.X; byA[i] = p1.Y;
-                if (ayA[i] < byA[i]) { sy0A[i] = ayA[i]; sy1A[i] = byA[i]; }
-                else { sy0A[i] = byA[i]; sy1A[i] = ayA[i]; }
-                if (axA[i] < bxA[i]) { sx0A[i] = axA[i] - reach; sx1A[i] = bxA[i] + reach; }
-                else { sx0A[i] = bxA[i] - reach; sx1A[i] = axA[i] + reach; }
+                if (fy < sy0A[i] - reach || fy > sy1A[i] + reach) continue;
+                rowSegs[m++] = i;
+                if (sx0A[i] < rowX0) rowX0 = sx0A[i];
+                if (sx1A[i] > rowX1) rowX1 = sx1A[i];
             }
-            // 行走廊遍历（性能核心）：每行先收集与该 py 走廊相交的段（m 个），
-            //   x 方向收窄到这些段走廊并集 [px0,px1]，内层只对这些相交段求距离。
-            //   成本 O(折线走廊面积)，同行多段取 max 合成（语义不变）。
-            for (int py = y0; py <= y1; py++)
+            if (m == 0) continue;
+            int px0 = Math.Max(x0, (int)Math.Floor(rowX0));
+            int px1 = Math.Min(x1, (int)Math.Ceiling(rowX1));
+            for (int px = px0; px <= px1; px++)
             {
-                float fy = py + 0.5f;
-                int m = 0;
-                float rowX0 = float.MaxValue, rowX1 = float.MinValue;
-                for (int i = 0; i < segCount; i++)
+                SdfPixelIters++;
+                float fx = px + 0.5f;
+                float cov = 0f;
+                for (int k = 0; k < m; k++)
                 {
-                    if (fy < sy0A[i] - reach || fy > sy1A[i] + reach) continue;
-                    rowSegs[m++] = i;
-                    if (sx0A[i] < rowX0) rowX0 = sx0A[i];
-                    if (sx1A[i] > rowX1) rowX1 = sx1A[i];
+                    int i = rowSegs[k];
+                    float dx = bxA[i] - axA[i], dy = byA[i] - ayA[i];
+                    float d2 = dx * dx + dy * dy;
+                    float d;
+                    if (d2 < 1e-12f)
+                    {
+                        // 退化段：按端点圆盘处理
+                        float ex = fx - axA[i], ey = fy - ayA[i];
+                        d = (float)Math.Sqrt(ex * ex + ey * ey);
+                    }
+                    else
+                    {
+                        float t = ((fx - axA[i]) * dx + (fy - ayA[i]) * dy) / d2;
+                        if (t < 0f) t = 0f; else if (t > 1f) t = 1f;
+                        float ex = fx - (axA[i] + t * dx), ey = fy - (ayA[i] + t * dy);
+                        d = (float)Math.Sqrt(ex * ex + ey * ey);
+                    }
+                    float c = reach - d; // = clamp(h+0.5-d, 0,1)（负值不影响 max）
+                    if (c > cov) cov = c;
                 }
-                if (m == 0) continue;
-                int px0 = Math.Max(x0, (int)Math.Floor(rowX0));
-                int px1 = Math.Min(x1, (int)Math.Ceiling(rowX1));
-                for (int px = px0; px <= px1; px++)
+                if (cov > 0f)
                 {
-                    SdfPixelIters++;
-                    float fx = px + 0.5f;
-                    float cov = 0f;
-                    for (int k = 0; k < m; k++)
-                    {
-                        int i = rowSegs[k];
-                        float dx = bxA[i] - axA[i], dy = byA[i] - ayA[i];
-                        float d2 = dx * dx + dy * dy;
-                        float d;
-                        if (d2 < 1e-12f)
-                        {
-                            // 退化段：按端点圆盘处理
-                            float ex = fx - axA[i], ey = fy - ayA[i];
-                            d = (float)Math.Sqrt(ex * ex + ey * ey);
-                        }
-                        else
-                        {
-                            float t = ((fx - axA[i]) * dx + (fy - ayA[i]) * dy) / d2;
-                            if (t < 0f) t = 0f; else if (t > 1f) t = 1f;
-                            float ex = fx - (axA[i] + t * dx), ey = fy - (ayA[i] + t * dy);
-                            d = (float)Math.Sqrt(ex * ex + ey * ey);
-                        }
-                        float c = reach - d; // = clamp(h+0.5-d, 0,1)（负值不影响 max）
-                        if (c > cov) cov = c;
-                    }
-                    if (cov > 0f)
-                    {
-                        if (cov > 1f) cov = 1f;
-                        SdfBlendCount++;
-                        Blend(px, py, color.R, color.G, color.B, cov);
-                    }
+                    if (cov > 1f) cov = 1f;
+                    SdfBlendCount++;
+                    Blend(px, py, color.R, color.G, color.B, cov);
                 }
             }
         }
-        finally
-        {
-            ArrayPool<float>.Shared.Return(axA);
-            ArrayPool<float>.Shared.Return(ayA);
-            ArrayPool<float>.Shared.Return(bxA);
-            ArrayPool<float>.Shared.Return(byA);
-            ArrayPool<float>.Shared.Return(sy0A);
-            ArrayPool<float>.Shared.Return(sy1A);
-            ArrayPool<float>.Shared.Return(sx0A);
-            ArrayPool<float>.Shared.Return(sx1A);
-            ArrayPool<int>.Shared.Return(rowSegs);
-        }
+        SdfMultiMs += System.Environment.TickCount64 - _ts2;
     }
 
     /// <summary>实心圆盘填充（点标记、halo 等）。</summary>

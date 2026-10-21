@@ -63,6 +63,14 @@ internal partial class ImageEngine
     private const int MaxSpriteSide = 8192;        // 单精灵边长上限（超此直接渲染不缓存）
     private readonly Dictionary<string, PngSprite> _sprites = new();
 
+    // 字形精灵缓存（单图 + 分块均启用）：同 SHX 字形 + 同缩放 + 同角度(量化) + 同线宽 + 同颜色
+    // 光栅化一次、重复整数平移 blit。治本 SDF 多段路径——85K 字形原本展开成 ~130 万碎段各自走 SDF，
+    // 精灵化后仅 (字形,缩放,角度,线宽,颜色) 变体首次光栅化，其余命中 blit（O(精灵面积) 像素拷贝，远快于 SDF）。
+    // 与 _sprites（点/文字，分块跨瓦片去重）独立：字形在单图内也大量重复，单图模式同样受益。
+    private readonly Dictionary<string, PngSprite> _glyphSprites = new();
+    private const int MaxGlyphSprites = 12000;     // 字形精灵上限（变体数受角度量化约束，通常远小于此）
+    private long _glyphHit = 0, _glyphMiss = 0;    // perf：命中次数 / 未命中(=新增变体数)
+
     // ===== 性能计时（临时诊断：定位瓶颈阶段 + 各实体类型耗时分布；GDB2CAD_PERF=1 时输出）=====
     // 渲染为单线程（WritePng 顺序遍历实体/瓦片），字段直接累加无锁。
     private static readonly bool PerfOn =
@@ -116,7 +124,7 @@ internal partial class ImageEngine
         _log($"[perf]   复杂线型 TryEmitComplexPng：{_lwComplexMs,8:F0} ms（命中 {_lwComplexCnt} 条）");
         _log($"[perf]     · 走查 WalkPatternPx：{_lwWalkMs,8:F0} ms（迭代 {_lwWalkIters} 次；dash {_lwDashCnt} / shape {_lwShapeCnt} / text {_lwTextCnt}）");
         _log($"[perf]         · dash 分支 AppendSpanPb：{_lwDashMs,7:F0} ms（{_lwDashCnt} 段）");
-        _log($"[perf]         · shape 分支 EmitShapeGlyphPb：{_lwShapeMs,6:F0} ms（{_lwShapeCnt} 段）");
+        _log($"[perf]         · shape 分支 EmitShapeGlyphPb：{_lwShapeMs,6:F0} ms（{_lwShapeCnt} 段；精灵命中 {_glyphHit} / 新增变体 {_glyphMiss} / 缓存表 {_glyphSprites.Count}）");
         _log($"[perf]     · 走查后描边 StrokePolyline：{_lwStrokeAfterWalkMs,4:F0} ms");
         _log($"[perf]     · 文字 DrawTextPng：{_lwDrawTextMs,6:F0} ms");
         _log($"[perf] -- StrokePolyline 分流（全部实体）--");
@@ -396,7 +404,8 @@ internal partial class ImageEngine
     private ImageExportResult WritePngSingle(string outPath, int W, int H, bool merged)
     {
         _skippedCounts.Clear();
-        _tiledMode = false; _sprites.Clear(); // 单图：无跨瓦片重复，关闭精灵缓存（省离屏开销）
+        _tiledMode = false; _sprites.Clear(); // 单图：无跨瓦片重复，关闭点/文字精灵缓存（省离屏开销）
+        _glyphSprites.Clear(); _glyphHit = 0; _glyphMiss = 0; // 字形精灵缓存：单图内 SHX 字形大量重复，单图同样受益
         _useRealTextWidth = true; // PNG 端：文字对齐锚点用真实字体度量（修正居中/右对正漂移）
         var rc = new RasterCanvas(W, H);
         ClearPngBg(rc);
@@ -440,7 +449,8 @@ internal partial class ImageEngine
         string ext = string.IsNullOrEmpty(Path.GetExtension(outPath)) ? ".png" : Path.GetExtension(outPath);
 
         _skippedCounts.Clear();
-        _tiledMode = true; _sprites.Clear(); // 分块模式启用精灵缓存：相同点/文字跨瓦片只渲染一次、其余瓦片整数平移 blit
+        _tiledMode = true; _sprites.Clear(); // 分块模式启用点/文字精灵缓存：相同点/文字跨瓦片只渲染一次、其余瓦片整数平移 blit
+        _glyphSprites.Clear(); _glyphHit = 0; _glyphMiss = 0; // 字形精灵缓存跨瓦片复用
         _useRealTextWidth = true;
         if (PerfOn) _swCull.Restart();
         BuildCullData(); // 预计算顶层实体世界 AABB（含线宽/点字形安全外扩），供按瓦片空间剔除
@@ -1368,16 +1378,18 @@ internal partial class ImageEngine
         if (cum[cum.Length - 1] <= 1e-9) return false;
         var pb = new PolyBuilder();
         var texts = new List<LtpTextPlace>();
+        var colRgb = HexToRgb(col);
+        float widthPx = (float)Math.Max(1.0, w * PngK);
+        int shapeEmitted = 0;
         if (PerfOn)
         {
             long _tw0 = Environment.TickCount64;
-            WalkPatternPx(pb, pts, cum, pat, texts);
+            WalkPatternPx(pb, pts, cum, pat, texts, colRgb, widthPx, ref shapeEmitted);
             _lwWalkMs += Environment.TickCount64 - _tw0;
         }
-        else WalkPatternPx(pb, pts, cum, pat, texts);
-        if (pb.IsEmpty && texts.Count == 0) return false;
-        var colRgb = HexToRgb(col);
-        float widthPx = (float)Math.Max(1.0, w * PngK);
+        else WalkPatternPx(pb, pts, cum, pat, texts, colRgb, widthPx, ref shapeEmitted);
+        // SHX 字形段已在走查内经「字形精灵缓存」直接光栅化到 _rc（不再进 pb），故字形也算"已渲染"。
+        if (pb.IsEmpty && texts.Count == 0 && shapeEmitted == 0) return false;
         if (PerfOn)
         {
             long _ts0 = Environment.TickCount64;
@@ -1400,8 +1412,10 @@ internal partial class ImageEngine
         return true;
     }
 
-    // 沿路径走查模式（WalkPattern 的位图版）：dash→线子路径；gap→留空；shape→段中点真实 SHX 字形（沿切向）。
-    private void WalkPatternPx(PolyBuilder pb, List<(double X, double Y)> pts, double[] cum, LtpPattern pat, List<LtpTextPlace> textOut = null)
+    // 沿路径走查模式（WalkPattern 的位图版）：dash→线子路径；gap→留空；shape→段中点真实 SHX 字形（沿切向，走精灵缓存）。
+    // colRgb/widthPx 透传给字形精灵（同线宽+同颜色变体才可缓存）；shapeEmitted 累加已 blit 的字形段数。
+    private void WalkPatternPx(PolyBuilder pb, List<(double X, double Y)> pts, double[] cum, LtpPattern pat,
+        List<LtpTextPlace> textOut, RasterCanvas.Rgb colRgb, float widthPx, ref int shapeEmitted)
     {
         double L = cum[cum.Length - 1];
         var segs = pat.Segs;
@@ -1425,7 +1439,8 @@ internal partial class ImageEngine
                 if (perf) { _lwShapeCnt++; _b0 = Environment.TickCount64; }
                 double at = pos + seg.CenterOffset;
                 PathPointAt(pts, cum, at, out double px, out double py, out double tx, out double ty);
-                EmitShapeGlyphPb(pb, at, px, py, tx, ty, seg);
+                EmitShapeGlyphPng(px, py, tx, ty, seg, colRgb, widthPx);
+                shapeEmitted++;
                 if (perf) _lwShapeMs += Environment.TickCount64 - _b0;
             }
             else if (seg.Kind == LtpSeg.Text && textOut != null && !string.IsNullOrEmpty(seg.TextContent))
@@ -1462,8 +1477,12 @@ internal partial class ImageEngine
         pb.LineTo((float)PngSx(bx), (float)PngSy(by));
     }
 
-    // 在路径点绘制真实 SHX 字形（追加到同一描边路径；EmitShapeGlyph 的位图版）。
-    private void EmitShapeGlyphPb(PolyBuilder pb, double at, double px, double py, double tx, double ty, LtpSeg seg)
+    // 在路径点绘制真实 SHX 字形（位图版，走「字形精灵缓存」——同变体离屏光栅化一次、重复整数平移 blit）。
+    // 治本 SDF 多段路径：原 85K 字形展开成 ~130 万碎段各自走 SDF（多段 12.17s），现仅 (字形,缩放,角度,线宽,颜色)
+    // 变体首次光栅化到小离屏精灵，其余命中 blit（O(精灵面积) 像素拷贝，远快于 SDF）。
+    // 角度按 1° 量化（rotType=0/2 角度恒定无损；rotType=1 随切向连续→量化保命中，亚 0.5° 旋转误差对细线字形不可见）。
+    // anchor = 字形原点(0,0)的世界系坐标（= 路径点 + offset），与 SVG/PDF 的 EmitShapeGlyph 原点锚定语义一致。
+    private void EmitShapeGlyphPng(double px, double py, double tx, double ty, LtpSeg seg, RasterCanvas.Rgb colRgb, float widthPx)
     {
         GlyphRec? rec = null;
         if (!string.IsNullOrEmpty(seg.ShapeFile))
@@ -1472,18 +1491,20 @@ internal partial class ImageEngine
             if (font != null && font.TryGetShapeNumber(seg.ShapeName, out int num))
                 rec = GetGlyph(font, seg.ShapeFile, num);
         }
-        if (rec == null)
+        if (rec == null || rec.Empty)
         {
-            // SHX 库/形状不可用 → 回退"点"（沿切向居中的短实线），保持图案节奏
+            // SHX 库/形状不可用 → 回退"点"（沿切向居中的短实线），保持图案节奏（直接渲染，不走缓存）
             double dd = seg.Len > 1e-9 ? Math.Min(seg.ShapeScale * 4.0, 0.9 * seg.Len) : 0.1;
             if (dd < 0.05) dd = 0.05;
-            pb.MoveTo((float)PngSx(px - tx * dd / 2), (float)PngSy(py - ty * dd / 2));
-            pb.LineTo((float)PngSx(px + tx * dd / 2), (float)PngSy(py + ty * dd / 2));
+            _rc.StrokePolyline(new List<RasterCanvas.P>
+            {
+                new RasterCanvas.P((float)PngSx(px - tx * dd / 2), (float)PngSy(py - ty * dd / 2)),
+                new RasterCanvas.P((float)PngSx(px + tx * dd / 2), (float)PngSy(py + ty * dd / 2))
+            }, false, widthPx, colRgb);
             return;
         }
-        // shape 缩放 = 组码46 标称缩放（已含 $LTSCALE 全局线型缩放，见 GetActiveLineType→pat.Scaled）。
-        // 不额外硬编码 0.5——该缩放由图纸 header $LTSCALE 决定，链路已正确应用。
-        double S = seg.ShapeScale > 1e-9 ? seg.ShapeScale : 1.0;
+        // shape 缩放 = 组码46 标称缩放（已含 $LTSCALE 全局线型缩放）。3 位量化防浮点噪声，亚像素级差异不影响命中。
+        double S = Math.Round((seg.ShapeScale > 1e-9 ? seg.ShapeScale : 1.0) * 1000.0) / 1000.0;
         double ang;
         switch (seg.RotType)
         {
@@ -1493,48 +1514,105 @@ internal partial class ImageEngine
             case 2: ang = seg.ShapeRot * Math.PI / 180.0; break; // absolute（74 bit0=1）
             default: ang = 0; break;                   // upright
         }
-        double ca = Math.Cos(ang), sa = Math.Sin(ang);
+        // 角度量化到 1°（key 与渲染同用量化值，保证同 key 同像素）。
+        double angQ = Math.Round(ang * 180.0 / Math.PI) * Math.PI / 180.0;
+        double ca = Math.Cos(angQ), sa = Math.Sin(angQ);
         // offset（DXF 44/45）：字形局部 +X 与路径行进方向相反 → 切向分量取负，法向分量取 OY。
+        // anchor=路径点+offset：字形原点的精确世界位置（OX/OY 只影响 anchor 位置，不影响精灵内容，故不入 key）。
         double oxw = -seg.OX * tx - seg.OY * ty;
         double oyw = -seg.OX * ty + seg.OY * tx;
-        // 【关键】按字形原点(0,0)锚定到"路径点+offset"（DXF 线型 shape 插入点语义），非包围盒中心。
-        // 与 SVG/PDF 的 EmitShapeGlyph 保持一致（BATTING 实测：原点锚定使 0°/180° 两弧分居基线两侧→
-        // 螺旋弹簧/环内对角弦；按包围盒中心锚定则弧心落基线→同心圆相切，错误）。
-        void Xf(float gx, float gy, out double mx, out double my)
+        double anchorX = px + oxw, anchorY = py + oyw;
+
+        // 精灵内字形相对 anchor 的旋转包围盒（4 角点旋转取极值）→ left/right/top/bottom（数据单位）。
+        double cx0 = rec.MinX * S, cx1 = rec.MaxX * S, cy0 = rec.MinY * S, cy1 = rec.MaxY * S;
+        double mnx = double.MaxValue, mxx = double.MinValue, mny = double.MaxValue, mxy = double.MinValue;
+        double[] ccx = { cx0, cx1, cx1, cx0 }, ccy = { cy0, cy0, cy1, cy1 };
+        for (int j = 0; j < 4; j++)
         {
-            double lx = gx * S;   // 原点锚定
-            double ly = gy * S;
-            double wx = px + oxw + lx * ca - ly * sa;
-            double wy = py + oyw + lx * sa + ly * ca;
-            mx = wx; my = wy;
+            double rx = ccx[j] * ca - ccy[j] * sa;
+            double ry = ccx[j] * sa + ccy[j] * ca;
+            if (rx < mnx) mnx = rx; if (rx > mxx) mxx = rx;
+            if (ry < mny) mny = ry; if (ry > mxy) mxy = ry;
         }
+        double left = -mnx, right = mxx, top = mxy, bottom = -mny;
+
+        string key = seg.ShapeFile + "|" + seg.ShapeName + "|" + S.ToString("R", System.Globalization.CultureInfo.InvariantCulture)
+            + "|" + (int)Math.Round(ang * 180.0 / Math.PI)
+            + "|" + Math.Round(widthPx * 100.0) / 100.0
+            + "|" + (int)colRgb.R + "," + (int)colRgb.G + "," + (int)colRgb.B;
+        TryEmitGlyphSprite(rec, anchorX, anchorY, ca, sa, S, widthPx, colRgb, left, right, top, bottom, key);
+    }
+
+    // 字形精灵缓存：命中→blit；未命中→离屏光栅化一次（临时重定位使 anchor→(Bx,By)，与 TryEmitSprite 同机制）后 blit。
+    // 单图/分块通用（BlitSprite 含 _tileOx/_tileOy 还原，整数平移不改变亚像素 AA 覆盖→与逐次重绘一致）。
+    private void TryEmitGlyphSprite(GlyphRec rec, double anchorX, double anchorY,
+        double ca, double sa, double S, float widthPx, RasterCanvas.Rgb colRgb,
+        double left, double right, double top, double bottom, string key)
+    {
+        if (_glyphSprites.TryGetValue(key, out var hit))
+        {
+            if (PerfOn) _glyphHit++;
+            BlitSprite(hit, anchorX, anchorY);
+            return;
+        }
+        if (PerfOn) _glyphMiss++;
+
+        double k = PngK;
+        int pad = 2;
+        int Bx = (int)Math.Ceiling(Math.Max(left, 0) * k) + pad;     // anchor 在精灵内的 x
+        int By = (int)Math.Ceiling(Math.Max(top, 0) * k) + pad;       // anchor 在精灵内的 y（上=small y）
+        int sw = (int)Math.Ceiling((Math.Max(left, 0) + Math.Max(right, 0)) * k) + Bx + pad;
+        int sh = (int)Math.Ceiling((Math.Max(top, 0) + Math.Max(bottom, 0)) * k) + By + pad;
+        if (sw < 1) sw = 1; if (sh < 1) sh = 1;
+        if (sw > MaxSpriteSide || sh > MaxSpriteSide || _glyphSprites.Count >= MaxGlyphSprites)
+        {
+            StrokeGlyphDirect(rec, anchorX, anchorY, ca, sa, S, widthPx, colRgb); // 过大/缓存满：直接渲染
+            return;
+        }
+        var sprite = new RasterCanvas(sw, sh);
+        sprite.Clear(0, 0, 0, 0);
+        // 临时重定位：使 PngSx(anchor)=Bx、PngSy(anchor)=By（与 TryEmitSprite 同），离屏精灵与任意瓦片像素坐标仅整数平移之差。
+        double prevOx = _tileOx, prevOy = _tileOy; var prevRc = _rc;
+        _rc = sprite;
+        _tileOx = PngSx(anchorX) + _tileOx - Bx;
+        _tileOy = PngSy(anchorY) + _tileOy - By;
+        try { StrokeGlyphDirect(rec, anchorX, anchorY, ca, sa, S, widthPx, colRgb); }
+        finally { _rc = prevRc; _tileOx = prevOx; _tileOy = prevOy; }
+        var sp = new PngSprite { Rgba = sprite.ToRgbaBuffer(), W = sw, H = sh, Bx = Bx, By = By };
+        _glyphSprites[key] = sp;
+        BlitSprite(sp, anchorX, anchorY);
+    }
+
+    // 把字形笔迹光栅化到当前 _rc（离屏精灵或主画布）：局部点 (gx,gy) → 世界 (anchor + (gx*S,gy*S) 旋转) → PngSx/PngSy → 折线描边。
+    // anchor=字形原点世界坐标。曲线（Q/C）经 PolyBuilder.ToPolylines 展平为折线后走 SDF 描边（小精灵内仅变体首次调用）。
+    private void StrokeGlyphDirect(GlyphRec rec, double anchorX, double anchorY, double ca, double sa, double S, float widthPx, RasterCanvas.Rgb colRgb)
+    {
+        var pb = new PolyBuilder();
         for (int k = 0; k < rec.Type.Count; k++)
         {
             var p = rec.Pts[k];
+            void Xf(float gx, float gy, out double mx, out double my)
+            {
+                double lx = gx * S, ly = gy * S;
+                mx = anchorX + lx * ca - ly * sa;
+                my = anchorY + lx * sa + ly * ca;
+            }
             switch (rec.Type[k])
             {
-                case 0:
-                    Xf(p[0], p[1], out double mx, out double my);
-                    pb.MoveTo((float)PngSx(mx), (float)PngSy(my));
-                    break;
-                case 1:
-                    Xf(p[0], p[1], out double lx, out double ly);
-                    pb.LineTo((float)PngSx(lx), (float)PngSy(ly));
-                    break;
+                case 0: Xf(p[0], p[1], out double mx, out double my); pb.MoveTo((float)PngSx(mx), (float)PngSy(my)); break;
+                case 1: Xf(p[0], p[1], out double lx, out double ly); pb.LineTo((float)PngSx(lx), (float)PngSy(ly)); break;
                 case 2:
-                    Xf(p[0], p[1], out double qx, out double qy);
-                    Xf(p[2], p[3], out double ex, out double ey);
-                    pb.QuadTo((float)PngSx(qx), (float)PngSy(qy), (float)PngSx(ex), (float)PngSy(ey));
-                    break;
+                    Xf(p[0], p[1], out double qx, out double qy); Xf(p[2], p[3], out double ex, out double ey);
+                    pb.QuadTo((float)PngSx(qx), (float)PngSy(qy), (float)PngSx(ex), (float)PngSy(ey)); break;
                 case 3:
-                    Xf(p[0], p[1], out double c1x, out double c1y);
-                    Xf(p[2], p[3], out double c2x, out double c2y);
+                    Xf(p[0], p[1], out double c1x, out double c1y); Xf(p[2], p[3], out double c2x, out double c2y);
                     Xf(p[4], p[5], out double ex2, out double ey2);
                     pb.CubicTo((float)PngSx(c1x), (float)PngSy(c1y), (float)PngSx(c2x), (float)PngSy(c2y),
-                        (float)PngSx(ex2), (float)PngSy(ey2));
-                    break;
+                        (float)PngSx(ex2), (float)PngSy(ey2)); break;
             }
         }
+        foreach (var pl in pb.ToPolylines(false))
+            if (pl.Count >= 2) _rc.StrokePolyline(pl, false, widthPx, colRgb);
     }
 
     #endregion

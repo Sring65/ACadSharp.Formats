@@ -1135,6 +1135,24 @@ internal partial class ImageEngine
     private void EmitInsertPng(Insert ins, Transform2D parent, short byBlockAci, double[] byBlockDash, LtpPattern byBlockPat, double ltMul)
     {
         if (ins?.Block == null) return;
+        // 环防护（与 SVG 端同款，双保险）：自引用/循环块截断该层展开，防爆栈。
+        if (!_insertAncestors.Add(ins.Block))
+        {
+            _log($"⚠️  块引用环，截断展开：{ins.Block.Name}");
+            return;
+        }
+        try
+        {
+            EmitInsertPngCore(ins, parent, byBlockAci, byBlockDash, byBlockPat, ltMul);
+        }
+        finally
+        {
+            _insertAncestors.Remove(ins.Block);
+        }
+    }
+
+    private void EmitInsertPngCore(Insert ins, Transform2D parent, short byBlockAci, double[] byBlockDash, LtpPattern byBlockPat, double ltMul)
+    {
         var tr = Transform2D.Compose(ins, parent);
         short insAci = EffectiveAci(ins, byBlockAci);
         double[] insDash = ResolveDash(ins, byBlockDash, ltMul);

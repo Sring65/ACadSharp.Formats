@@ -20,6 +20,10 @@ internal partial class ImageEngine
     private readonly CadDocument _doc;
     private readonly ImageConfiguration _opt;
     private readonly Action<string> _log;
+    // INSERT 展开的祖先块集合（环防护，双保险）：数据带自引用/循环块（如 *Txx 匿名块被错连
+    // ModelSpace）时截断该层展开，防渲染无限递归爆栈；正常嵌套块随展开入栈、返回出栈。
+    // partial 类单处声明（SVG/PDF/PNG 三端共用）。
+    private readonly HashSet<BlockRecord> _insertAncestors = new();
     private readonly bool _whiteBg;
     private readonly bool _transparentBg; // 仅 PNG 光栅端使用：true=画布不画底色（全透明 alpha）
     private bool _useRealTextWidth;       // PNG 光栅端置 true：文字对齐锚点用真实字体度量算宽（修正居中/右对正漂移）
@@ -2497,6 +2501,25 @@ internal partial class ImageEngine
     private void EmitInsertSvg(StringBuilder sb, Insert ins, Transform2D parent, short byBlockAci, double[] byBlockDash, LtpPattern byBlockPat, double ltMul)
     {
         if (ins?.Block == null) return;
+        // 环防护（双保险）：同一块在祖先链上重复出现（INSERT 自引用/循环嵌套）→ 截断该层。
+        // 正常嵌套块随展开入栈、返回出栈，不受影响。
+        if (!_insertAncestors.Add(ins.Block))
+        {
+            _log($"⚠️  块引用环，截断展开：{ins.Block.Name}");
+            return;
+        }
+        try
+        {
+            EmitInsertSvgCore(sb, ins, parent, byBlockAci, byBlockDash, byBlockPat, ltMul);
+        }
+        finally
+        {
+            _insertAncestors.Remove(ins.Block);
+        }
+    }
+
+    private void EmitInsertSvgCore(StringBuilder sb, Insert ins, Transform2D parent, short byBlockAci, double[] byBlockDash, LtpPattern byBlockPat, double ltMul)
+    {
         var tr = Transform2D.Compose(ins, parent);
         // 块内容的"随块"颜色/线型 = 该 INSERT 的有效值（独立 > 图层；嵌套 ByBlock 继承上层）
         short insAci = EffectiveAci(ins, byBlockAci);

@@ -79,6 +79,58 @@ internal partial class ImageEngine
     private string _perfTypeStartType;             // 顶层 EmitEntityPng 实体类型名
     private int _perfDepth = 0;                    // 递归深度（仅顶层计耗，避免嵌套双计）
 
+    // —— LwPolyline 子路径细分计时（定位 16s 瓶颈在哪个分支）—— 单位 ms（TickCount64 差值）
+    private long _lwComplexMs = 0, _lwComplexCnt = 0;  // 复杂线型 TryEmitComplexPng 命中
+    private long _lwSampleMs = 0, _lwSamplePts = 0;    // LwPolylineSamplePoints 采样耗时/总采样点数
+    private long _lwTaperMs = 0, _lwTaperCnt = 0;      // 变宽 EmitTaperedPng
+    private long _lwStrokeMs = 0, _lwStrokeCnt = 0;    // 普通描边 StrokePts
+    private long _lwMaxSegs = 0;                        // 单实体最大采样点数
+    // —— 复杂线型 WalkPatternPx 内部分支细分（定位 13s 走查瓶颈）——
+    // StrokePolyline 分流累计（顶层实体收尾时从当前 _rc 增量读取清零，跨瓦片/离屏累积）
+    private long _sdfCount, _sdfMs, _scanCount, _scanMs;
+    private long _sdfSingleCount, _sdfMultiCount, _sdfPixelIters, _sdfBlendCount, _sdfBboxArea;
+    private long _lwWalkMs = 0;        // WalkPatternPx 走查总耗时
+    private long _lwWalkIters = 0;     // 走查 while 循环总迭代次数（=dash+gap+shape+text 段总数）
+    private long _lwDashCnt = 0;       // dash 段数（走 AppendSpanPb，全量遍历 pts 的 O(n)）
+    private long _lwShapeCnt = 0;      // shape 段数（走 EmitShapeGlyphPb）
+    private long _lwTextCnt = 0;       // text 段数（收集后走 DrawTextPng）
+    private long _lwDashMs = 0;        // dash 分支累加耗时
+    private long _lwShapeMs = 0;       // shape 分支累加耗时
+    private long _lwStrokeAfterWalkMs = 0; // ToPolylines + StrokePolyline 耗时
+    private long _lwDrawTextMs = 0;      // DrawTextPng 循环耗时
+
+    // 渲染收尾：打印各阶段 + 各实体类型耗时汇总（仅 GDB2CAD_PERF=1 时输出）。
+    // 用于定位 PNG 光栅化瓶颈（实体类型分布 / 包围盒 / 剔除 / 编码写盘 各占多少）。
+    private void LogPerfSummary()
+    {
+        if (!PerfOn) return;
+        // 注意：_perfTypeUs/_pngSaveUs 存的是 TickCount64 差值 = 毫秒（字段名 us 为历史误名）。
+        double typeMs = _perfTypeUs.Values.Sum(v => v);
+        _log($"[perf] ===== PNG 耗时汇总 =====");
+        _log($"[perf] 包围盒 ComputeExtents：{_swExt.Elapsed.TotalMilliseconds:F0} ms");
+        _log($"[perf] 剔除 BuildCullData：{_swCull.Elapsed.TotalMilliseconds:F0} ms（瓦片路径）");
+        _log($"[perf] 光栅化 EmitEntityPng：{typeMs:F0} ms（{_perfRenderCount} 次顶层实体调用）");
+        _log($"[perf] 编码写盘 SavePng：{_pngSaveUs:F0} ms");
+        _log($"[perf] 文字字符数（估文字成本）：{_perfTextChars}");
+        _log($"[perf] -- LwPolyline 子路径细分 --");
+        _log($"[perf]   复杂线型 TryEmitComplexPng：{_lwComplexMs,8:F0} ms（命中 {_lwComplexCnt} 条）");
+        _log($"[perf]     · 走查 WalkPatternPx：{_lwWalkMs,8:F0} ms（迭代 {_lwWalkIters} 次；dash {_lwDashCnt} / shape {_lwShapeCnt} / text {_lwTextCnt}）");
+        _log($"[perf]         · dash 分支 AppendSpanPb：{_lwDashMs,7:F0} ms（{_lwDashCnt} 段）");
+        _log($"[perf]         · shape 分支 EmitShapeGlyphPb：{_lwShapeMs,6:F0} ms（{_lwShapeCnt} 段）");
+        _log($"[perf]     · 走查后描边 StrokePolyline：{_lwStrokeAfterWalkMs,4:F0} ms");
+        _log($"[perf]     · 文字 DrawTextPng：{_lwDrawTextMs,6:F0} ms");
+        _log($"[perf] -- StrokePolyline 分流（全部实体）--");
+        _log($"[perf]   SDF 描边（逐像素距离）：{_sdfCount,9:F0} 次 / {_sdfMs,8:F0} ms");
+        _log($"[perf]     · 单段快速路径 {_sdfSingleCount:F0} 次 / 多段 {_sdfMultiCount:F0} 次；内层像素迭代 {_sdfPixelIters:F0} 次 / 实际 Blend {_sdfBlendCount:F0} 次 / bbox 面积和 {_sdfBboxArea:F0} px²");
+        _log($"[perf]   ScanFill 描边（多边形外扩+扫描填充）：{_scanCount,3:F0} 次 / {_scanMs,8:F0} ms");
+        _log($"[perf]   采样 LwPolylineSamplePoints：{_lwSampleMs,8:F0} ms（总点数 {_lwSamplePts}，单实体最大 {_lwMaxSegs} 点）");
+        _log($"[perf]   变宽 EmitTaperedPng：{_lwTaperMs,8:F0} ms（{_lwTaperCnt} 条）");
+        _log($"[perf]   描边 StrokePts：{_lwStrokeMs,8:F0} ms（{_lwStrokeCnt} 条）");
+        foreach (var kv in _perfTypeUs.OrderByDescending(p => p.Value))
+            _log($"[perf]   {kv.Key,-14} {kv.Value,9:F0} ms");
+        _log($"[perf] ============================");
+    }
+
     private sealed class PngSprite
     {
         public byte[] Rgba;   // 精灵透明 RGBA 像素
@@ -361,6 +413,7 @@ internal partial class ImageEngine
         }
         _rc = null;
         _log($"✅  PNG 已生成{(merged ? "（合并单图）" : "")}：{outPath}（画板 {W}×{H}，1:1 内容放大 {F(_pngKx)}×{F(_pngKy)} 倍{(_transparentBg ? "，透明背景" : "")}）");
+        LogPerfSummary();
         return PngResult(W, H, merged, System.Array.Empty<ImageTile>());
     }
 
@@ -464,6 +517,7 @@ internal partial class ImageEngine
         double skipPct = totalPairs > 0 ? 100.0 * (1 - (double)renderedPairs / totalPairs) : 0;
         _log($"✅  PNG 分块输出：{seq} 张瓦片（{cols} 列 × {rows} 行，单瓦片 ≤ {tile}×{tile}px，整幅 {fullW}×{fullH} @1:1×{F(zoom)}，OGC WMTS 命名 tiles/{Math.Max(0, (int)Math.Round(zoom))}/{{row}}/{{col}}.png{(_transparentBg ? "，透明背景" : "")}）");
         _log($"   空间剔除：{seq} 瓦片共需 {totalPairs} 次实体渲染，实际 {renderedPairs} 次（剔除 {skipPct:F0}%）");
+        LogPerfSummary();
         return PngResult(fullW, fullH, false, tiles);
     }
 
@@ -529,9 +583,22 @@ internal partial class ImageEngine
             case LwPolyline pl:
                 {
                     string col = ColorOf(EntityAciIndex(ent), layerAci, byBlockAci);
-                    if (TryEmitComplexPng(ent, tr, pat, col, StrokeWidth(ent, scaleMul))) break;
+                    if (PerfOn)
+                    {
+                        long _t0 = Environment.TickCount64;
+                        if (TryEmitComplexPng(ent, tr, pat, col, StrokeWidth(ent, scaleMul))) { _lwComplexMs += Environment.TickCount64 - _t0; _lwComplexCnt++; break; }
+                        _lwComplexMs += Environment.TickCount64 - _t0;
+                    }
+                    else if (TryEmitComplexPng(ent, tr, pat, col, StrokeWidth(ent, scaleMul))) break;
                     // 普通描边路径采样世界折线点（含 bulge 弧段）；变宽路径走 EmitTaperedPng（自有 bulge 逻辑）
+                    long _s0 = PerfOn ? Environment.TickCount64 : 0;
                     var pts = LwPolylineSamplePoints(pl, tr);
+                    if (PerfOn)
+                    {
+                        _lwSampleMs += Environment.TickCount64 - _s0;
+                        _lwSamplePts += pts.Count;
+                        if (pts.Count > _lwMaxSegs) _lwMaxSegs = pts.Count;
+                    }
                     // 变宽判断看**任意**顶点 StartWidth(40) 或 ConstantWidth(43)（首顶点窄端 sw=0 的纺锤形不能漏判）；
                     // EndWidth(41) 不单独触发（闭合圆环全 sw=0/ew=常数 应走描边+bulge 弧，否则变宽路径退化成 0 宽消失）。
                     // 常数宽(43)：全顶点等宽归一形式 → 物化为逐顶点
@@ -542,10 +609,22 @@ internal partial class ImageEngine
                     bool hasTaper = pl.Vertices.Any(v => v.StartWidth > 0 || v.EndWidth > 0) || pl.ConstantWidth > 0;
                     if (hasTaper && pts.Count >= 2)
                     {
-                        EmitTaperedPng(pl, tr, col, scaleMul);
+                        if (PerfOn)
+                        {
+                            long _t1 = Environment.TickCount64;
+                            EmitTaperedPng(pl, tr, col, scaleMul);
+                            _lwTaperMs += Environment.TickCount64 - _t1; _lwTaperCnt++;
+                        }
+                        else EmitTaperedPng(pl, tr, col, scaleMul);
                         break;
                     }
-                    StrokePts(pts, pl.IsClosed, col, StrokeWidth(ent, scaleMul), dash);
+                    if (PerfOn)
+                    {
+                        long _t2 = Environment.TickCount64;
+                        StrokePts(pts, pl.IsClosed, col, StrokeWidth(ent, scaleMul), dash);
+                        _lwStrokeMs += Environment.TickCount64 - _t2; _lwStrokeCnt++;
+                    }
+                    else StrokePts(pts, pl.IsClosed, col, StrokeWidth(ent, scaleMul), dash);
                 }
                 break;
 
@@ -938,6 +1017,16 @@ internal partial class ImageEngine
                 long us = Environment.TickCount64 - _perfStartTick;
                 _perfTypeUs.TryGetValue(_perfTypeStartType, out long acc);
                 _perfTypeUs[_perfTypeStartType] = acc + us;
+                // 从当前 _rc 增量读取 SDF/ScanFill 分流计数并清零（跨瓦片/离屏 _rc 切换时安全）
+                if (_rc != null)
+                {
+                    _sdfCount += _rc.SdfCount; _sdfMs += _rc.SdfMs; _rc.SdfCount = 0; _rc.SdfMs = 0;
+                    _scanCount += _rc.ScanCount; _scanMs += _rc.ScanMs; _rc.ScanCount = 0; _rc.ScanMs = 0;
+                    _sdfSingleCount += _rc.SdfSingleCount; _sdfMultiCount += _rc.SdfMultiCount;
+                    _sdfPixelIters += _rc.SdfPixelIters; _sdfBlendCount += _rc.SdfBlendCount;
+                    _sdfBboxArea += _rc.SdfBboxArea;
+                    _rc.SdfSingleCount = _rc.SdfMultiCount = _rc.SdfPixelIters = _rc.SdfBlendCount = _rc.SdfBboxArea = 0;
+                }
             }
         }
     }
@@ -1272,15 +1361,35 @@ internal partial class ImageEngine
         if (cum[cum.Length - 1] <= 1e-9) return false;
         var pb = new PolyBuilder();
         var texts = new List<LtpTextPlace>();
-        WalkPatternPx(pb, pts, cum, pat, texts);
+        if (PerfOn)
+        {
+            long _tw0 = Environment.TickCount64;
+            WalkPatternPx(pb, pts, cum, pat, texts);
+            _lwWalkMs += Environment.TickCount64 - _tw0;
+        }
+        else WalkPatternPx(pb, pts, cum, pat, texts);
         if (pb.IsEmpty && texts.Count == 0) return false;
         var colRgb = HexToRgb(col);
         float widthPx = (float)Math.Max(1.0, w * PngK);
-        foreach (var pl in pb.ToPolylines(false))
-            if (pl.Count >= 2) _rc.StrokePolyline(pl, false, widthPx, colRgb);
-        // 文字段：用 TTF 实心字形渲染（rotCanvas 传 -数据系角）
-        foreach (var p in texts)
-            DrawTextPng(p.X, p.Y, p.Text, p.Height, col, -p.RotDeg, ResolveFontFamily(p.Font), p.WidthFactor);
+        if (PerfOn)
+        {
+            long _ts0 = Environment.TickCount64;
+            foreach (var pl in pb.ToPolylines(false))
+                if (pl.Count >= 2) _rc.StrokePolyline(pl, false, widthPx, colRgb);
+            _lwStrokeAfterWalkMs += Environment.TickCount64 - _ts0;
+            long _td0 = Environment.TickCount64;
+            foreach (var p in texts)
+                DrawTextPng(p.X, p.Y, p.Text, p.Height, col, -p.RotDeg, ResolveFontFamily(p.Font), p.WidthFactor);
+            _lwDrawTextMs += Environment.TickCount64 - _td0;
+        }
+        else
+        {
+            foreach (var pl in pb.ToPolylines(false))
+                if (pl.Count >= 2) _rc.StrokePolyline(pl, false, widthPx, colRgb);
+            // 文字段：用 TTF 实心字形渲染（rotCanvas 传 -数据系角）
+            foreach (var p in texts)
+                DrawTextPng(p.X, p.Y, p.Text, p.Height, col, -p.RotDeg, ResolveFontFamily(p.Font), p.WidthFactor);
+        }
         return true;
     }
 
@@ -1293,26 +1402,33 @@ internal partial class ImageEngine
         if (L <= 1e-9 || n == 0) return;
         double pos = 0;
         int i = 0, guard = 0;
+        bool perf = PerfOn;
         while (pos < L - 1e-9 && guard++ < 50000000)
         {
             var seg = segs[i % n];
             double span = seg.Len;
             if (seg.Kind == LtpSeg.Dash)
             {
-                AppendSpanPb(pb, pts, cum, pos, Math.Min(pos + span, L));
+                if (perf) { _lwDashCnt++; long _a0 = Environment.TickCount64; AppendSpanPb(pb, pts, cum, pos, Math.Min(pos + span, L)); _lwDashMs += Environment.TickCount64 - _a0; }
+                else AppendSpanPb(pb, pts, cum, pos, Math.Min(pos + span, L));
             }
             else if (seg.Kind == LtpSeg.Shape)
             {
+                long _b0 = 0;
+                if (perf) { _lwShapeCnt++; _b0 = Environment.TickCount64; }
                 double at = pos + seg.CenterOffset;
                 PathPointAt(pts, cum, at, out double px, out double py, out double tx, out double ty);
                 EmitShapeGlyphPb(pb, at, px, py, tx, ty, seg);
+                if (perf) _lwShapeMs += Environment.TickCount64 - _b0;
             }
             else if (seg.Kind == LtpSeg.Text && textOut != null && !string.IsNullOrEmpty(seg.TextContent))
             {
+                if (perf) _lwTextCnt++;
                 double at = pos + seg.CenterOffset;
                 PathPointAt(pts, cum, at, out double cx, out double cy, out double tx, out double ty);
                 textOut.Add(BuildTextPlace(cx, cy, tx, ty, seg));
             }
+            if (perf) _lwWalkIters++;
             pos += span;
             i++;
         }

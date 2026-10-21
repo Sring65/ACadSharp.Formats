@@ -1941,6 +1941,9 @@ internal partial class ImageEngine
             sb.AppendLine("  </defs>");
         }
         sb.AppendLine("</svg>");
+        var svgDir = Path.GetDirectoryName(Path.GetFullPath(outPath));
+        if (!string.IsNullOrEmpty(svgDir) && !Directory.Exists(svgDir))
+            Directory.CreateDirectory(svgDir);
         File.WriteAllText(outPath, sb.ToString(), Encoding.UTF8);
         _log($"✅  SVG 已生成：{outPath}（画板 {F(_w * _opt.OutputZoom)}×{F(_h * _opt.OutputZoom)}，1:1 内容放大 {F(_opt.OutputZoom)} 倍）");
         LogSkipped("SVG");

@@ -226,6 +226,9 @@ internal partial class ImageEngine
             }
             PutAscii("trailer\n<< /Size " + size + " /Root 1 0 R >>\nstartxref\n" + xrefPos + "\n%%EOF\n");
 
+            var pdfDir = Path.GetDirectoryName(Path.GetFullPath(outPath));
+            if (!string.IsNullOrEmpty(pdfDir) && !Directory.Exists(pdfDir))
+                Directory.CreateDirectory(pdfDir);
             File.WriteAllBytes(outPath, file.ToArray());
             string fontNote = _pdfFonts.HasFont
                 ? "已内嵌 " + _pdfFonts.Count + " 个中文字体（" + string.Join(", ", _pdfFonts.UsedFontNames()) + "）"

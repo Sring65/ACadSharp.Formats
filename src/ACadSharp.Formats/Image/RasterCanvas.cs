@@ -506,6 +506,9 @@ internal sealed class RasterCanvas
     {
         try
         {
+            var dir = Path.GetDirectoryName(Path.GetFullPath(path));
+            if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+                Directory.CreateDirectory(dir);
             using var fs = File.Create(path);
             fs.Write(_pngSig, 0, _pngSig.Length);
 

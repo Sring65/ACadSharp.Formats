@@ -240,8 +240,25 @@ internal sealed class RasterCanvas
     public void StrokePolyline(List<P> pts, bool closed, float width, Rgb color)
     {
         if (pts == null || pts.Count < 2 || width <= 0) return;
-        var polys = new List<List<P>>(pts.Count);
         float h = width / 2;
+
+        // 2026-10-21 修复"文字曲线/转弯处像素断续"：下方扫描填充按单行采样（y=py+0.5），
+        // y 跨度落在两个像素中心之间的亚像素薄段（SHX 字形弧线展平后的短小段尤甚）会被
+        // 整段漏采 → 曲线处出现周期性白色断点。中小路径改走解析式 SDF 描边
+        // （逐像素中心到线段距离，覆盖 = clamp(h+0.5-d)），点到线段距离 clamp 到端点
+        // 天然给出圆头 cap/join，无采样漏洞且 AA 平滑。
+        // 超大路径（全幅长管线：盒面积×min(段数,8) 超限）保留扫描填充——长段无漏采问题，成本可控。
+        float minx = pts[0].X, miny = pts[0].Y, maxx = minx, maxy = miny;
+        for (int i = 1; i < pts.Count; i++)
+        {
+            var p = pts[i];
+            if (p.X < minx) minx = p.X; else if (p.X > maxx) maxx = p.X;
+            if (p.Y < miny) miny = p.Y; else if (p.Y > maxy) maxy = p.Y;
+        }
+        long cost = (long)((double)(maxx - minx) * (maxy - miny)) * Math.Min(pts.Count, 8);
+        if (cost <= 8_000_000) { StrokePolylineExact(pts, closed, h, color, minx, miny, maxx, maxy); return; }
+
+        var polys = new List<List<P>>(pts.Count);
         int n = pts.Count;
         int segCount = closed ? n : n - 1;
         for (int i = 0; i < segCount; i++)
@@ -263,6 +280,71 @@ internal sealed class RasterCanvas
         for (int i = 0; i < n; i++)
             polys.Add(Disc(pts[i].X, pts[i].Y, h, 14));
         ScanFill(polys, false, (_, _) => color);
+    }
+
+    /// <summary>解析式折线描边（SDF）：遍历折线包围盒内像素中心，按到各线段的距离计算
+    /// AA 覆盖（=clamp(h+0.5-d,0,1)），同行多段取 max 合成后单次 Blend（重叠处不加深）。
+    /// 像素中心到线段距离 clamp 到端点 ⇒ 圆头 cap/join 天然成立（无需顶点圆盘）；
+    /// 无扫描行采样 ⇒ 亚像素薄段不再漏画。</summary>
+    private void StrokePolylineExact(List<P> pts, bool closed, float h, Rgb color,
+        float minx, float miny, float maxx, float maxy)
+    {
+        float pad = h + 1f;
+        int x0 = Math.Max(0, (int)Math.Floor(minx - pad));
+        int x1 = Math.Min(Width - 1, (int)Math.Ceiling(maxx + pad));
+        int y0 = Math.Max(0, (int)Math.Floor(miny - pad));
+        int y1 = Math.Min(Height - 1, (int)Math.Ceiling(maxy + pad));
+        if (x0 > x1 || y0 > y1) return;
+        int n = pts.Count;
+        int segCount = closed ? n : n - 1;
+        // 预拷贝段端点与 y 区间（行内 y 快筛，跳过与当前行不相交的段）
+        var ax = new float[segCount]; var ay = new float[segCount];
+        var bx = new float[segCount]; var by = new float[segCount];
+        var sy0 = new float[segCount]; var sy1 = new float[segCount];
+        for (int i = 0; i < segCount; i++)
+        {
+            var p0 = pts[i]; var p1 = pts[(i + 1) % n];
+            ax[i] = p0.X; ay[i] = p0.Y; bx[i] = p1.X; by[i] = p1.Y;
+            if (ay[i] < by[i]) { sy0[i] = ay[i]; sy1[i] = by[i]; }
+            else { sy0[i] = by[i]; sy1[i] = ay[i]; }
+        }
+        float reach = h + 0.5f; // 覆盖半径 = 半宽 + 半像素（盒滤波）
+        for (int py = y0; py <= y1; py++)
+        {
+            float fy = py + 0.5f;
+            for (int px = x0; px <= x1; px++)
+            {
+                float fx = px + 0.5f;
+                float cov = 0f;
+                for (int i = 0; i < segCount; i++)
+                {
+                    if (fy < sy0[i] - reach || fy > sy1[i] + reach) continue;
+                    float dx = bx[i] - ax[i], dy = by[i] - ay[i];
+                    float d2 = dx * dx + dy * dy;
+                    float d;
+                    if (d2 < 1e-12f)
+                    {
+                        // 退化段：按端点圆盘处理
+                        float ex = fx - ax[i], ey = fy - ay[i];
+                        d = (float)Math.Sqrt(ex * ex + ey * ey);
+                    }
+                    else
+                    {
+                        float t = ((fx - ax[i]) * dx + (fy - ay[i]) * dy) / d2;
+                        if (t < 0f) t = 0f; else if (t > 1f) t = 1f;
+                        float ex = fx - (ax[i] + t * dx), ey = fy - (ay[i] + t * dy);
+                        d = (float)Math.Sqrt(ex * ex + ey * ey);
+                    }
+                    float c = reach - d; // = clamp(h+0.5-d, 0,1)（负值不影响 max）
+                    if (c > cov) cov = c;
+                }
+                if (cov > 0f)
+                {
+                    if (cov > 1f) cov = 1f;
+                    Blend(px, py, color.R, color.G, color.B, cov);
+                }
+            }
+        }
     }
 
     /// <summary>实心圆盘填充（点标记、halo 等）。</summary>

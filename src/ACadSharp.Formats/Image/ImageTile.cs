@@ -10,7 +10,8 @@ namespace ACadSharp.Formats.Image;
 /// 整幅画布包围盒（ImageExportResult.DataX0/X1/Y0/Y1）线性反算。
 ///
 /// OGC WMTS 命名：瓦片按标准 WMTS 斜切图（slippy/quadkey 风格）三层地址 {z}/{row}/{col}.png 存放，
-/// z=缩放层级（本工具单层网格，默认 z=0）、row=自顶向下的行号、col=自左向右的列号。
+/// z=缩放级别（= 渲染放大倍数 OutputZoom 四舍五入，2026-10-21 用户：原固定 0 无信息量，改为实际缩放级别）、
+/// row=自顶向下的行号、col=自左向右的列号。
 /// 文件路径 = {输出目录}/tiles/{z}/{row}/{col}.png（见 <see cref="RelPath"/>）。
 /// </summary>
 public sealed class ImageTile
@@ -33,7 +34,7 @@ public sealed class ImageTile
     /// <summary>瓦片左上角在整幅画布中的像素 Y 偏移。</summary>
     public int Py0 { get; init; }
 
-    /// <summary>OGC WMTS 缩放层级 z（单层网格默认 0）。</summary>
+    /// <summary>OGC WMTS 缩放级别 z（= 渲染放大倍数 OutputZoom 四舍五入）。</summary>
     public int Z { get; init; }
 
     /// <summary>OGC WMTS 列号 col（自左向右，0 起）。</summary>

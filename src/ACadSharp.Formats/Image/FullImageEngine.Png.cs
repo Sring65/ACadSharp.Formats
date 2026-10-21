@@ -426,9 +426,11 @@ internal partial class ImageEngine
                 long _tileRenderMs = Environment.TickCount64 - _tileRenderT0;
                 _rc = null;
 
-                // OGC WMTS 标准命名：tiles/{z}/{row}/{col}.png（z=0 单层网格，row=cy 自顶向下，col=cx 自左向右）。
+                // OGC WMTS 标准命名：tiles/{z}/{row}/{col}.png（z=缩放级别，取渲染放大倍数四舍五入；
+                // 2026-10-21 用户：原固定 z=0 无信息量，改为 tiles/{缩放级别}/{row}/{col}.png，
+                // row=cy 自顶向下，col=cx 自左向右）。
                 // 叶子文件名即 col（同一 (z,row) 目录下 col 唯一，无碰撞），与 ImageTile.RelPath 一致。
-                const int z = 0;
+                int z = Math.Max(0, (int)Math.Round(zoom));
                 string name = $"{cx}{ext}";
                 string fp = Path.Combine(dir, "tiles", z.ToString(), cy.ToString(), name);
                 Directory.CreateDirectory(Path.GetDirectoryName(fp));
@@ -460,7 +462,7 @@ internal partial class ImageEngine
 
         LogSkipped("PNG");
         double skipPct = totalPairs > 0 ? 100.0 * (1 - (double)renderedPairs / totalPairs) : 0;
-        _log($"✅  PNG 分块输出：{seq} 张瓦片（{cols} 列 × {rows} 行，单瓦片 ≤ {tile}×{tile}px，整幅 {fullW}×{fullH} @1:1×{F(zoom)}，OGC WMTS 命名 tiles/0/{{row}}/{{col}}.png{(_transparentBg ? "，透明背景" : "")}）");
+        _log($"✅  PNG 分块输出：{seq} 张瓦片（{cols} 列 × {rows} 行，单瓦片 ≤ {tile}×{tile}px，整幅 {fullW}×{fullH} @1:1×{F(zoom)}，OGC WMTS 命名 tiles/{Math.Max(0, (int)Math.Round(zoom))}/{{row}}/{{col}}.png{(_transparentBg ? "，透明背景" : "")}）");
         _log($"   空间剔除：{seq} 瓦片共需 {totalPairs} 次实体渲染，实际 {renderedPairs} 次（剔除 {skipPct:F0}%）");
         return PngResult(fullW, fullH, false, tiles);
     }

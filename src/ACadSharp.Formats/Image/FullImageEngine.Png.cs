@@ -87,6 +87,38 @@ internal partial class ImageEngine
     private string _perfTypeStartType;             // 顶层 EmitEntityPng 实体类型名
     private int _perfDepth = 0;                    // 递归深度（仅顶层计耗，避免嵌套双计）
 
+    // Insert 内容签名精灵缓存（单图 + 分块均启用）：顶层 Insert 按【内容签名（不含落点）】缓存——
+    // 同一 (块, 旋转/缩放, 颜色, 线型, 线宽, 层) 组合渲染出的像素内容完全相同，仅落点(插入点)平移不同。
+    // 命中→整数平移 blit；未命中→离屏光栅化一次（临时重定位使插入点→(Bx,By)，与 TryEmitSprite 同机制）后 blit。
+    // 治 Insert 60s 瓶颈：真实负载顶层 Insert ~174 万次，distinct 内容签名仅 ~5k（重复率 99.7%，Top1 ×110 万），
+    // 精灵化后仅 distinct 内容各光栅化 1 次，其余命中 blit（O(精灵面积) 像素拷贝，远快于逐次展开块子实体走 SDF）。
+    // 与 _sprites（点，分块）/_glyphSprites（字形）独立：Insert 内容跨【不同实体】重复（非仅跨瓦片重绘），单图同样受益。
+    private readonly Dictionary<string, PngSprite> _insertSprites = new();
+    private const int MaxInsertSprites = 20000;   // Insert 精灵上限（distinct 内容签名数，防内存膨胀）
+    private const long MaxInsertSpriteMemBytes = 150L * 1024 * 1024; // Insert 精灵像素总内存预算 150MB（超则新签名直渲，防 OOM）
+    private long _insSpriteHit = 0, _insSpriteMiss = 0, _insSpriteDirect = 0;  // 命中 / 新增变体 / 过大直渲
+    private long _insSpriteMemBytes = 0;          // 已缓存精灵像素字节和（内存实测）
+    // —— 临时诊断：Insert 内容签名【实际最大边像素】分布（决定精灵化策略）——
+    private readonly long[] _insSideHist = new long[8]; // 桶：<256 <1024 <4096 <8192 <16384 <32768 <65536 >=65536（按 distinct 签名计）
+    private long _insSigDirect = 0;                   // 走直渲的 distinct 签名数
+    private long _insSigCached = 0;                   // 成功入缓存的 distinct 签名数
+    private long _insDirectCallWeight = 0;            // 直渲签名对应的调用总次数（估可省时间）
+    private readonly Dictionary<string, long> _insSigCalls = new(StringComparer.Ordinal); // 签名→调用次数（估权重）
+    // —— 临时诊断：空 AABB 直渲（InsertContentExtents 返回 false）的根因定位 ——
+    private long _insTopCalls = 0;                    // 顶层 Insert 总调用（parent==null）
+    private long _insAttribGeoHit = 0;                // 有属性 Insert：几何精灵命中（blit + 属性直渲）
+    private long _insAttribGeoMiss = 0;               // 有属性 Insert：几何新增变体
+    private long _insAttribGeoDirect = 0;             // 有属性 Insert：几何空AABB/过大直渲
+    private long _insEmptyAabbCalls = 0;              // 空 AABB 直渲调用次数
+    private readonly Dictionary<string, long> _insEmptyAabbTypes = new(StringComparer.Ordinal); // 空 AABB 块【直接子实体类型】分布（按调用）
+    private readonly Dictionary<string, long> _insEmptyAabbCounts = new(StringComparer.Ordinal); // 空 AABB 块【直接子实体数量】分布（按调用）
+    private long _insDrawContentMs = 0;               // DrawInsertContent 总耗时（直渲+离屏各算一次）
+    private long _insDrawContentCalls = 0;            // DrawInsertContent 调用次数
+    private long _insDirectDrawMs = 0;                // 空 AABB 直渲路径（DrawInsertContent 含）总耗时
+    // —— 临时诊断：采样【空 AABB 建筑块】的子实体结构，定位 EntityLocalPoints 为何取不到点 ——
+    private int _insEmptyDiagBudget = 120;
+    private readonly HashSet<string> _insEmptyDiagDumped = new(StringComparer.Ordinal);
+
     // —— LwPolyline 子路径细分计时（定位 16s 瓶颈在哪个分支）—— 单位 ms（TickCount64 差值）
     private long _lwComplexMs = 0, _lwComplexCnt = 0;  // 复杂线型 TryEmitComplexPng 命中
     private long _lwSampleMs = 0, _lwSamplePts = 0;    // LwPolylineSamplePoints 采样耗时/总采样点数
@@ -135,6 +167,31 @@ internal partial class ImageEngine
         _log($"[perf]   采样 LwPolylineSamplePoints：{_lwSampleMs,8:F0} ms（总点数 {_lwSamplePts}，单实体最大 {_lwMaxSegs} 点）");
         _log($"[perf]   变宽 EmitTaperedPng：{_lwTaperMs,8:F0} ms（{_lwTaperCnt} 条）");
         _log($"[perf]   描边 StrokePts：{_lwStrokeMs,8:F0} ms（{_lwStrokeCnt} 条）");
+        _log($"[perf] -- Insert 内容签名精灵缓存 -- 命中 {_insSpriteHit} / 新增变体 {_insSpriteMiss} / 过大直渲 {_insSpriteDirect} / 缓存表 {_insertSprites.Count} / 像素内存 {_insSpriteMemBytes / 1024 / 1024} MB");
+        if (PerfOn)
+        {
+            string[] bn = { "<256", "<1024", "<4096", "<8192", "<16384", "<32768", "<65536", ">=65536" };
+            var parts = new List<string>();
+            for (int b = 0; b < 8; b++) if (_insSideHist[b] > 0) parts.Add($"{bn[b]}:{_insSideHist[b]}");
+            long sigTotal = _insSideHist.Sum();
+            _log($"[perf]   · 顶层 Insert 调用 {_insTopCalls}");
+            _log($"[perf]   · 有属性 Insert 几何缓存：命中 {_insAttribGeoHit} / 新增 {_insAttribGeoMiss} / 空AABB直渲 {_insAttribGeoDirect}");
+            _log($"[perf]   · 内容签名实际最大边像素分布(distinct {sigTotal}个): {string.Join("  ", parts)}");
+            _log($"[perf]   · 入缓存签名 {_insSigCached} / 直渲签名 {_insSigDirect} / 直渲签名覆盖调用总次数(可省权重) {_insDirectCallWeight}");
+            _log($"[perf]   · 空AABB直渲调用 {_insEmptyAabbCalls}（耗时 {_insDirectDrawMs:F0} ms）");
+            if (_insEmptyAabbTypes.Count > 0)
+            {
+                var topTypes = _insEmptyAabbTypes.OrderByDescending(kv => kv.Value).Take(8)
+                    .Select(kv => $"{kv.Key}:{kv.Value}").ToList();
+                _log($"[perf]     空AABB块直接子实体类型分布(top8): {string.Join("  ", topTypes)}");
+            }
+            if (_insEmptyAabbCounts.Count > 0)
+            {
+                var topCnt = _insEmptyAabbCounts.OrderByDescending(kv => kv.Value).Take(8)
+                    .Select(kv => $"子实体数{kv.Key}:{kv.Value}").ToList();
+                _log($"[perf]     空AABB块直接子实体数量分布(top8): {string.Join("  ", topCnt)}");
+            }
+        }
         foreach (var kv in _perfTypeUs.OrderByDescending(p => p.Value))
             _log($"[perf]   {kv.Key,-14} {kv.Value,9:F0} ms");
         _log($"[perf] ============================");
@@ -404,8 +461,9 @@ internal partial class ImageEngine
     private ImageExportResult WritePngSingle(string outPath, int W, int H, bool merged)
     {
         _skippedCounts.Clear();
-        _tiledMode = false; _sprites.Clear(); // 单图：无跨瓦片重复，关闭点/文字精灵缓存（省离屏开销）
+        _tiledMode = false; _sprites.Clear(); // 单图：无跨瓦片重复，关闭点精灵缓存（省离屏开销）
         _glyphSprites.Clear(); _glyphHit = 0; _glyphMiss = 0; // 字形精灵缓存：单图内 SHX 字形大量重复，单图同样受益
+        _insertSprites.Clear(); _insSpriteHit = 0; _insSpriteMiss = 0; _insSpriteDirect = 0; _insSpriteMemBytes = 0; // Insert 内容签名精灵：单图内大量重复，单图同样受益
         _useRealTextWidth = true; // PNG 端：文字对齐锚点用真实字体度量（修正居中/右对正漂移）
         var rc = new RasterCanvas(W, H);
         ClearPngBg(rc);
@@ -449,8 +507,9 @@ internal partial class ImageEngine
         string ext = string.IsNullOrEmpty(Path.GetExtension(outPath)) ? ".png" : Path.GetExtension(outPath);
 
         _skippedCounts.Clear();
-        _tiledMode = true; _sprites.Clear(); // 分块模式启用点/文字精灵缓存：相同点/文字跨瓦片只渲染一次、其余瓦片整数平移 blit
+        _tiledMode = true; _sprites.Clear(); // 分块模式启用点精灵缓存：相同点符号跨瓦片只渲染一次、其余瓦片整数平移 blit
         _glyphSprites.Clear(); _glyphHit = 0; _glyphMiss = 0; // 字形精灵缓存跨瓦片复用
+        _insertSprites.Clear(); _insSpriteHit = 0; _insSpriteMiss = 0; _insSpriteDirect = 0; _insSpriteMemBytes = 0; // Insert 内容签名精灵跨瓦片复用
         _useRealTextWidth = true;
         if (PerfOn) _swCull.Restart();
         BuildCullData(); // 预计算顶层实体世界 AABB（含线宽/点字形安全外扩），供按瓦片空间剔除
@@ -1268,20 +1327,251 @@ internal partial class ImageEngine
         short insLayerAci = 7;
         try { insLayerAci = LayerAciIndex(ins.Layer); } catch { }
         double childLtMul = ltMul * BlockScaleOf(ins);
-        // 块内实体。ATTDEF（属性定义/模板，默认值）不在此画——它只是属性模板；
-        // 实际显示用 INSERT 跟随的 ATTRIB（ins.Attributes，本次插入的真实属性值，如 "17"）。
-        // 否则块定义里的默认值（如 "1"）会被当成文字画出来，覆盖真实属性值。
+        bool hasAttribs = ins.Attributes != null && ins.Attributes.Count > 0;
+
+        // 顶层 Insert：内容签名精灵缓存（位置作 blit 锚点，不入 key）。
+        // 同一 (块, 旋转/缩放, 颜色, 线型, 线宽, 层) 渲染出的像素内容完全相同，仅落点平移不同 →
+        // 命中整数平移 blit；未命中离屏光栅化一次后缓存。治真实负载 Insert 60s 瓶颈（distinct 内容仅 ~5k）。
+        // 有属性 Insert 拆两部分：【几何】(跳过 ATTDEF) 位置无关 → 进缓存(|geo)；【属性文字】值随插入不同 → 单独直渲。
+        if (parent == null)
+        {
+            if (hasAttribs)
+            {
+                // 有属性 Insert：【几何】（块子实体，跳过 ATTDEF）位置无关 → 按内容签名缓存 blit；
+                // 【属性文字】(ins.Attributes，世界坐标、值随插入不同) 单独直渲。
+                // 治真实负载主瓶颈：1,175,040 个有属性 Insert 原全走 DrawInsertContent 直渲（~62s）。
+                if (PerfOn) _insTopCalls++;
+                string geoSig = InsertSig(ins, tr, insAci, insDash, insPat, ltMul, insLayerAci, true);
+                if (PerfOn) _insSigCalls[geoSig] = _insSigCalls.TryGetValue(geoSig, out var _ac) ? _ac + 1 : 1;
+                if (_insertSprites.TryGetValue(geoSig, out var geoHit))
+                {
+                    if (PerfOn) _insAttribGeoHit++;
+                    BlitSprite(geoHit, ins.InsertPoint.X, ins.InsertPoint.Y);
+                    DrawInsertAttribs(ins, tr, insAci, insDash, insPat, childLtMul, insLayerAci);
+                    return;
+                }
+                if (InsertContentExtents(ins, out double gl, out double gr, out double gt, out double gb))
+                {
+                    if (PerfOn) _insAttribGeoMiss++;
+                    TryEmitInsertSprite(geoSig, ins.InsertPoint.X, ins.InsertPoint.Y, gl, gr, gt, gb,
+                        () => DrawInsertGeometry(ins, tr, insAci, insDash, insPat, childLtMul, insLayerAci));
+                    DrawInsertAttribs(ins, tr, insAci, insDash, insPat, childLtMul, insLayerAci);
+                    return;
+                }
+                // 空 AABB（几何无定界）：几何直渲 + 属性直渲
+                if (PerfOn) { _insEmptyAabbCalls++; _insAttribGeoDirect++; DiagEmptyAabbBlock(ins); }
+                DrawInsertGeometry(ins, tr, insAci, insDash, insPat, childLtMul, insLayerAci);
+                DrawInsertAttribs(ins, tr, insAci, insDash, insPat, childLtMul, insLayerAci);
+                return;
+            }
+            if (PerfOn) _insTopCalls++;
+            string sig = InsertSig(ins, tr, insAci, insDash, insPat, ltMul, insLayerAci, false);
+            if (PerfOn) _insSigCalls[sig] = _insSigCalls.TryGetValue(sig, out var _cc) ? _cc + 1 : 1;
+            if (_insertSprites.TryGetValue(sig, out var hit))
+            {
+                if (PerfOn) _insSpriteHit++;
+                BlitSprite(hit, ins.InsertPoint.X, ins.InsertPoint.Y);
+                return;
+            }
+            if (InsertContentExtents(ins, out double left, out double right, out double top, out double bottom))
+            {
+                if (PerfOn) _insSpriteMiss++;
+                TryEmitInsertSprite(sig, ins.InsertPoint.X, ins.InsertPoint.Y,
+                    left, right, top, bottom,
+                    () => DrawInsertGeometry(ins, tr, insAci, insDash, insPat, childLtMul, insLayerAci));
+                return;
+            }
+            // 空 AABB 直渲：记录块直接子实体类型/数量分布（定位为何 ExpandInsert 取不到点）
+            if (PerfOn)
+            {
+                _insEmptyAabbCalls++;
+                var ents = ins.Block?.Entities;
+                int cnt = ents == null ? 0 : ents.Count;
+                _insEmptyAabbCounts[cnt.ToString()] = _insEmptyAabbCounts.TryGetValue(cnt.ToString(), out var cc2) ? cc2 + 1 : 1;
+                if (ents != null)
+                    foreach (var be in ents)
+                    {
+                        string t = be.GetType().Name;
+                        _insEmptyAabbTypes[t] = _insEmptyAabbTypes.TryGetValue(t, out var tt) ? tt + 1 : 1;
+                    }
+            }
+            if (PerfOn) _insSpriteDirect++;
+            long t0 = Stopwatch.GetTimestamp();
+            DrawInsertGeometry(ins, tr, insAci, insDash, insPat, childLtMul, insLayerAci); // 空内容/无法定界：几何直渲（无属性，等价全内容）
+            if (PerfOn) _insDirectDrawMs += (Stopwatch.GetTimestamp() - t0) * 1000 / Stopwatch.Frequency;
+            return;
+        }
+
+        // 嵌套 Insert（parent != null）：走完整展开（含属性值，随父变换），不进精灵缓存。
+        DrawInsertContent(ins, tr, parent, insAci, insDash, insPat, childLtMul, insLayerAci);
+    }
+
+    // Insert 内容签名（不含落点）：块名 + 旋转/缩放(不含平移) + 颜色 + 线型 dash + 复杂线型 + 线型比例 + 层 + 内容模式。
+    // 顶层 Insert 的父上下文固定（byBlockAci=7/byBlockDash=null/byBlockPat=null），故签名完整覆盖影响像素的全部因素。
+    // geometryOnly：true=有属性 Insert 的【几何】（跳过 ATTDEF）；false=无属性 Insert 的【全内容】（含 ATTDEF 模板默认值）。
+    //   两者像素不同（有属性版不画 ATTDEF，改画真实属性值），必须用不同 key，否则缓存串味。
+    private static string InsertSig(Insert ins, Transform2D tr, short insAci, double[] insDash, LtpPattern insPat, double ltMul, short insLayerAci, bool geometryOnly)
+    {
+        string dash = insDash == null ? "n" : string.Join(",", insDash.Select(v => Math.Round(v, 4).ToString("R", System.Globalization.CultureInfo.InvariantCulture)));
+        return ins.Block.Name + "|"
+            + Math.Round(tr.Ca * 1e6) + "," + Math.Round(tr.Sa * 1e6) + ","
+            + Math.Round(tr.Sx * 1e6) + "," + Math.Round(tr.Sy * 1e6) + "|"
+            + insAci + "|" + dash + "|"
+            + (insPat == null ? "n" : insPat.Segs.Count) + "|" + Math.Round(ltMul * 1e4) + "|" + insLayerAci
+            + (geometryOnly ? "|geo" : "|full");
+    }
+
+    // 顶层 Insert 内容包围盒（相对插入点的世界轴对齐 AABB，含安全外扩）。
+    // EntityWorldAabb(Insert) 经 ExpandInsert 用 Insert 自身变换（顶层=世界）展开块子实体 → 已覆盖块内全部几何（含 ATTDEF 文字盒）。
+    // 外扩须 ≥ 实际绘制像素超出 AABB 的量：
+    //   · 线型实体：MaxHalfStroke（线宽半宽）。
+    //   · 点实体：EntityWorldAabb 只记【中心】(不含字形)，故仅当块内【确有 Point】时才加 2*PointGlyphRadius（+/X 臂伸出 2r）。
+    //     ⚠️ 不能无条件加 PointGlyphRadius：zoom10 下它 ≈95 数据单位 ≈950px，会把 ~7000px 的建筑符号 inflate 到 >8192px
+    //        全部误判"过大直渲"（首测 547200 次过大、Insert 60s 无改善的根因）。建筑块几乎不含 Point，条件外扩后绝大多数可进精灵。
+    //   · 1.0/PngK = 1px AA 余量（数据单位）。
+    // 外扩保证精灵盒 ⊇ 实际绘制像素（不裁剪内容，最多略大）。返回 false = 空内容（无可绘制几何）。
+    private bool InsertContentExtents(Insert ins, out double left, out double right, out double top, out double bottom)
+    {
+        left = right = top = bottom = 0;
+        if (!EntityWorldAabb(ins, out double mnx, out double mny, out double mxx, out double mxy))
+            return false;
+        double half = MaxHalfStroke(ins, 1.0) + 1.0 / PngK;
+        if (BlockContainsPoint(ins.Block))
+            half += 2.0 * PointGlyphRadius(); // 仅块内含点：加字形半径（+ / X 臂伸出 2r）
+        mnx -= half; mny -= half; mxx += half; mxy += half;
+        double ax = ins.InsertPoint.X, ay = ins.InsertPoint.Y;
+        left = Math.Max(0, ax - mnx);
+        right = Math.Max(0, mxx - ax);
+        top = Math.Max(0, mxy - ay);
+        bottom = Math.Max(0, ay - mny);
+        return true;
+    }
+
+    // 块内（含嵌套 Insert 递归）是否含 Point 实体——决定 Insert 精灵包围盒是否需外扩点字形半径。
+    private static bool BlockContainsPoint(ACadSharp.Tables.BlockRecord br)
+    {
+        if (br == null) return false;
+        foreach (var e in br.Entities)
+        {
+            if (e is Point) return true;
+            if (e is Insert ni && ni.Block != null && BlockContainsPoint(ni.Block)) return true;
+        }
+        return false;
+    }
+
+    // 临时诊断：采样空 AABB 建筑块子实体结构，定位 EntityLocalPoints 为何取不到点。
+    // 按块名去重，预算内逐块打印：块名/子实体数/各子类型/首个子实体坐标与顶点数。
+    private void DiagEmptyAabbBlock(Insert ins)
+    {
+        if (_insEmptyDiagBudget-- <= 0) return;
+        var br = ins.Block;
+        if (br == null || !_insEmptyDiagDumped.Add(br.Name)) return;
+        bool aabbOk = EntityWorldAabb(ins, out double ax0, out double ay0, out double ax1, out double ay1);
+        var ents = br.Entities;
+        int n = ents?.Count ?? 0;
+        var sbd = new System.Text.StringBuilder();
+        sbd.Append($"[diag] 空AABB块 {br.Name}: 子实体数={n} EntityWorldAabb(ins)={aabbOk}");
+        if (aabbOk) sbd.Append($" [{ax0:F1},{ay0:F1}]~[{ax1:F1},{ay1:F1}]");
+        int shown = 0;
+        if (ents != null)
+            foreach (var e in ents)
+            {
+                if (shown++ >= 6) { sbd.Append(" …"); break; }
+                string first = (e is Point) ? "Point" : (e is Line) ? "Line" : (e is LwPolyline) ? "LwPolyline"
+                    : (e is Polyline3D) ? "Polyline3D" : (e is Polyline2D) ? "Polyline2D" : (e is MLine) ? "MLine"
+                    : (e is Mesh) ? "Mesh" : (e is PolyfaceMesh) ? "PolyfaceMesh" : (e is PolygonMesh) ? "PolygonMesh"
+                    : (e is Wipeout) ? "Wipeout" : (e is Face3D) ? "Face3D" : (e is RasterImage) ? "RasterImage"
+                    : (e is Circle) ? "Circle" : (e is Arc) ? "Arc" : (e is Ellipse) ? "Ellipse"
+                    : (e is TextEntity) ? "TextEntity" : (e is MText) ? "MText" : (e is Solid) ? "Solid"
+                    : (e is Spline) ? "Spline" : (e is Hatch) ? "Hatch" : "???";
+                var pts = EntityLocalPoints(e).ToList();
+                sbd.Append($" | {e.GetType().FullName} firstMatch={first} 点{pts.Count}");
+            }
+        _log(sbd.ToString());
+    }
+
+    // 仅画【几何】（块子实体）：无属性 → 含 ATTDEF 模板默认值（全内容，|full 签名）；
+    // 有属性 → 跳过 ATTDEF 模板默认值（改由 DrawInsertAttribs 画真实值，|geo 签名）。
+    // 几何位置无关（相对插入点固定）→ 可进内容签名精灵缓存。
+    private void DrawInsertGeometry(Insert ins, Transform2D tr, short insAci, double[] insDash, LtpPattern insPat, double childLtMul, short insLayerAci)
+    {
+        bool hasAttribs = ins.Attributes != null && ins.Attributes.Count > 0;
+        foreach (var e in ins.Block.Entities)
+        {
+            if (hasAttribs && e is AttributeDefinition) continue;
+            EmitEntityPng(e, tr, tr.Scale, insAci, insDash, insPat, childLtMul, insLayerAci);
+        }
+    }
+
+    // 仅画【属性文字】（ins.Attributes，世界坐标，值随插入不同）：受父累积变换 parent（顶层=null），不套本 tr。
+    // 位置与值均随每个插入变化 → 不进缓存，逐次直渲。
+    private void DrawInsertAttribs(Insert ins, Transform2D tr, short insAci, double[] insDash, LtpPattern insPat, double childLtMul, short insLayerAci)
+    {
+        if (ins.Attributes == null) return;
+        foreach (var att in ins.Attributes)
+            EmitEntityPng(att, null, tr.Scale, insAci, insDash, insPat, childLtMul, insLayerAci);
+    }
+
+    // 展开 Insert 块子实体（原 Core 主体）。ATTDEF 只在【无】实际属性值时画（模板默认值）；
+    // 有 ATTRIB 时跳过模板默认值、改画 ins.Attributes 的真实值（其 InsertPoint 已是世界坐标，只受父层累积变换 parent，不再套本 tr）。
+    private void DrawInsertContent(Insert ins, Transform2D tr, Transform2D parent, short insAci, double[] insDash, LtpPattern insPat, double childLtMul, short insLayerAci)
+    {
         bool hasAttribs = ins.Attributes != null && ins.Attributes.Count > 0;
         foreach (var e in ins.Block.Entities)
         {
             if (hasAttribs && e is AttributeDefinition) continue; // 有实际属性值 → 跳过模板默认值
             EmitEntityPng(e, tr, tr.Scale, insAci, insDash, insPat, childLtMul, insLayerAci);
         }
-        // 属性实际值（ATTRIB）：DXF 中其 InsertPoint 已是世界坐标（= INSERT 插入点 + 块变换），
-        // 故只受父层累积变换（parent），不再套本 INSERT 的 tr（否则平移/缩放会叠加两次）；字高仍随块缩放（tr.Scale）。
         if (hasAttribs)
             foreach (var att in ins.Attributes)
                 EmitEntityPng(att, parent, tr.Scale, insAci, insDash, insPat, childLtMul, insLayerAci);
+    }
+
+    // Insert 内容签名精灵渲染：命中→blit；未命中→离屏光栅化一次（临时重定位使插入点→(Bx,By)，与 TryEmitSprite 同机制）后 blit。
+    // 独立缓存 _insertSprites（区别于点/字形）：Insert 内容跨【不同实体】重复，单图+分块均受益。
+    // 内存预算守卫：内容包围盒可能很大（MaxHalfStroke 外扩），按像素字节设上限，超限走直接渲染（防内存膨胀）。
+    private void TryEmitInsertSprite(string key, double anchorX, double anchorY,
+        double left, double right, double top, double bottom, Action draw)
+    {
+        double k = PngK;
+        int pad = 2;
+        int Bx = (int)Math.Ceiling(Math.Max(left, 0) * k) + pad;
+        int By = (int)Math.Ceiling(Math.Max(top, 0) * k) + pad;
+        int sw = (int)Math.Ceiling((Math.Max(left, 0) + Math.Max(right, 0)) * k) + Bx + pad;
+        int sh = (int)Math.Ceiling((Math.Max(top, 0) + Math.Max(bottom, 0)) * k) + By + pad;
+        if (sw < 1) sw = 1; if (sh < 1) sh = 1;
+        long memBytes = (long)sw * sh * 4;
+        bool tooBig = sw > MaxSpriteSide || sh > MaxSpriteSide;
+        bool overBudget = _insertSprites.Count >= MaxInsertSprites || (_insSpriteMemBytes + memBytes) > MaxInsertSpriteMemBytes;
+        if (PerfOn)
+        {
+            // 临时诊断：按 distinct 签名记录实际最大边像素分布 + 调用权重
+            int side = Math.Max(sw, sh);
+            int b = side < 256 ? 0 : side < 1024 ? 1 : side < 4096 ? 2 : side < 8192 ? 3
+                : side < 16384 ? 4 : side < 32768 ? 5 : side < 65536 ? 6 : 7;
+            _insSideHist[b]++;
+            if (_insSigCalls.TryGetValue(key, out var cc)) _insDirectCallWeight += (tooBig || overBudget) ? cc : 0;
+            if (tooBig || overBudget) _insSigDirect++; else _insSigCached++;
+        }
+        if (tooBig || overBudget)
+        {
+            if (PerfOn) _insSpriteDirect++;
+            draw(); // 过大/超预算：直接渲染（仍受剔除保护）
+            return;
+        }
+        var sprite = new RasterCanvas(sw, sh);
+        sprite.Clear(0, 0, 0, 0);
+        // 临时重定位：让插入点映射到精灵内 (Bx,By)。PngSx_global(a)=PngSx(当前)(a)+_tileOx；
+        // 设 _tileOx = PngSx_global(a) - Bx ⇒ PngSx(精灵)(a)=Bx（与 TryEmitSprite 同）。
+        double prevOx = _tileOx, prevOy = _tileOy; var prevRc = _rc;
+        _rc = sprite;
+        _tileOx = PngSx(anchorX) + _tileOx - Bx;
+        _tileOy = PngSy(anchorY) + _tileOy - By;
+        try { draw(); } finally { _rc = prevRc; _tileOx = prevOx; _tileOy = prevOy; }
+        var sp = new PngSprite { Rgba = sprite.ToRgbaBuffer(), W = sw, H = sh, Bx = Bx, By = By };
+        _insertSprites[key] = sp;
+        _insSpriteMemBytes += memBytes;
+        BlitSprite(sp, anchorX, anchorY);
     }
 
     #endregion

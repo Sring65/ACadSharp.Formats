@@ -1879,6 +1879,28 @@ internal partial class ImageEngine
         else if (e is Line ln) { yield return new XY(ln.StartPoint.X, ln.StartPoint.Y); yield return new XY(ln.EndPoint.X, ln.EndPoint.Y); }
         else if (e is LwPolyline p2) foreach (var v in p2.Vertices) yield return new XY(v.Location.X, v.Location.Y);
         else if (e is Polyline3D p3) foreach (var v in p3.Vertices) if (IsDisplayVertex(v)) yield return new XY(v.Location.X, v.Location.Y);
+        // ⚠️ 以下类型此前遗漏 → ExpandInsert 取不到点 → Insert 内容 AABB 为空 → 走直渲（Insert 60s 瓶颈真根因）。
+        // 建筑平面图块大量用闭合 Polyline2D（带宽度）/MLine/面域，须与 EntityWorldAabb 覆盖一致（含其 IsDisplayVertex 守卫）。
+        // 循环变量名须唯一（if-else 链内 pattern var 与 foreach var 共享作用域，重名触发 CS0136）。
+        else if (e is Polyline2D p2d) foreach (var vp2d in p2d.Vertices) if (IsDisplayVertex(vp2d)) yield return new XY(vp2d.Location.X, vp2d.Location.Y);
+        else if (e is MLine ml) foreach (var mli in MLineElements(ml, null)) foreach (var mlp in mli.Center) yield return new XY(mlp.X, mlp.Y);
+        else if (e is Mesh me) if (me.Vertices != null) foreach (var vmesh in me.Vertices) yield return new XY(vmesh.X, vmesh.Y);
+        else if (e is PolyfaceMesh pf) if (pf.Vertices != null) foreach (var vpf in pf.Vertices) yield return new XY(vpf.Location.X, vpf.Location.Y);
+        else if (e is PolygonMesh pm) if (pm.Vertices != null) foreach (var vpm in pm.Vertices) yield return new XY(vpm.Location.X, vpm.Location.Y);
+        else if (e is Wipeout wo) foreach (var wop in WipeoutWorldPoly(wo, null)) yield return new XY(wop.X, wop.Y);
+        else if (e is Face3D f3d)
+        {
+            yield return new XY(f3d.FirstCorner.X, f3d.FirstCorner.Y);
+            yield return new XY(f3d.SecondCorner.X, f3d.SecondCorner.Y);
+            yield return new XY(f3d.ThirdCorner.X, f3d.ThirdCorner.Y);
+            yield return new XY(f3d.FourthCorner.X, f3d.FourthCorner.Y);
+        }
+        else if (e is RasterImage ri)
+        {
+            yield return new XY(ri.InsertPoint.X, ri.InsertPoint.Y);
+            yield return new XY(ri.InsertPoint.X + ri.UVector.X * ri.Size.X, ri.InsertPoint.Y + ri.UVector.Y * ri.Size.Y);
+            yield return new XY(ri.InsertPoint.X + ri.VVector.X * ri.Size.Y, ri.InsertPoint.Y + ri.VVector.Y * ri.Size.Y);
+        }
         else if (e is Circle c) { yield return new XY(c.Center.X - c.Radius, c.Center.Y - c.Radius); yield return new XY(c.Center.X + c.Radius, c.Center.Y + c.Radius); }
         else if (e is Arc a) { yield return new XY(a.Center.X - a.Radius, a.Center.Y - a.Radius); yield return new XY(a.Center.X + a.Radius, a.Center.Y + a.Radius); }
         else if (e is Ellipse el) { double r = Math.Max(el.MajorAxis, el.MinorAxis); yield return new XY(el.Center.X - r, el.Center.Y - r); yield return new XY(el.Center.X + r, el.Center.Y + r); }

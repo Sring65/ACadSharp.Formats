@@ -4,6 +4,8 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
 using ACadSharp;
 using ACadSharp.Entities;
 using ACadSharp.Formats.Pdf;
@@ -493,6 +495,52 @@ internal partial class ImageEngine
 
     // 分块（瓦片）渲染：整幅 1:1×zoom 画布按 cols×rows 网格切分，每个瓦片建独立小画布，
     // 把整幅场景画进该瓦片画布（PngSx/PngSy 按瓦片 _pngKx/_pngKy 映射，越界像素由 RasterCanvas.Blend 自动裁剪），
+    // ===== PNG 编码并行化（2026-10-22 性能优化）=====
+    // GDB2CAD_PERF=1 实测（XCTG-2000，110 张 4096² 瓦片）：编码写盘 SavePng 13.1s 占总耗时 25%，
+    // 与光栅化 21.5s 串行执行。每瓦片独立 new RasterCanvas（像素缓冲不复用，渲染完 _rc=null 即解绑，
+    // SavePng 后 rc 不再被触碰）→ 可零拷贝交后台并行「编码+写盘」，与后续瓦片光栅化重叠。
+    // 背压：未完成编码任务数达上限时渲染线程等待，防 64MB/张 的像素缓冲堆积（峰值≈上限×64MB）。
+    // 失败语义：任一瓦片编码/写盘失败 → FlushPngSaves 返回 false → 整次导出失败（与原同步一致）。
+    private const int PngSaveBacklog = 8;   // 未完成编码任务上限（≈512MB 像素内存峰值）
+    private readonly List<Task> _pngSaveTasks = new();
+    private int _pngSaveFailed = 0;
+    private readonly System.Collections.Concurrent.ConcurrentBag<string> _pngSaveFailedPaths = new();
+
+    /// <summary>异步保存 PNG：编码+写盘在后台线程执行，渲染线程立即返回继续渲染下一瓦片。</summary>
+    private void SavePngAsync(RasterCanvas rc, string path)
+    {
+        // 背压：清理已完成任务；仍达上限则等最慢者完成（渲染线程短暂阻塞，内存有界）
+        if (_pngSaveTasks.Count >= PngSaveBacklog)
+        {
+            _pngSaveTasks.RemoveAll(t => t.IsCompleted);
+            while (_pngSaveTasks.Count >= PngSaveBacklog)
+                Task.WaitAny(_pngSaveTasks.ToArray());
+        }
+        long t0 = Environment.TickCount64;
+        _pngSaveTasks.Add(Task.Run(() =>
+        {
+            bool ok = rc.SavePng(path);
+            if (!ok)
+            {
+                Interlocked.Exchange(ref _pngSaveFailed, 1);
+                _pngSaveFailedPaths.Add(path);
+            }
+            Interlocked.Add(ref _pngSaveUs, Environment.TickCount64 - t0);
+        }));
+    }
+
+    /// <summary>等待全部后台编码写盘完成（瓦片循环结束后调用）。返回 false = 任一失败。</summary>
+    private bool FlushPngSaves()
+    {
+        Task.WaitAll(_pngSaveTasks.ToArray());
+        _pngSaveTasks.Clear();
+        bool ok = Interlocked.CompareExchange(ref _pngSaveFailed, 0, 0) == 0;
+        if (!ok)
+            foreach (var p in _pngSaveFailedPaths)
+                _log($"❌  PNG 瓦片写文件失败：{p}");
+        return ok;
+    }
+
     // 流式各存一个 PNG。瓦片间像素无缝（同一全局像素网格对齐），合并起来即完整画布。
     private ImageExportResult WritePngTiled(string outPath, int fullW, int fullH, double zoom, int zLevel)
     {
@@ -562,16 +610,9 @@ internal partial class ImageEngine
                 string name = $"{cx}{ext}";
                 string fp = Path.Combine(dir, "tiles", z.ToString(), cy.ToString(), name);
                 Directory.CreateDirectory(Path.GetDirectoryName(fp));
-                long _tileSaveT0 = Environment.TickCount64;
-                bool _tileSaveOk = rc.SavePng(fp);
-                _pngSaveUs += Environment.TickCount64 - _tileSaveT0;
+                SavePngAsync(rc, fp); // 编码写盘交后台并行（与后续瓦片光栅化重叠，失败在 FlushPngSaves 统一上报）
                 if (_perfVerboseTile)
-                    _log($"   [perf] tile({cx},{cy}) 实体{_tileEnts} 光栅{_tileRenderMs}ms 编码{Environment.TickCount64 - _tileSaveT0}ms");
-                if (!_tileSaveOk)
-                {
-                    _log($"❌  PNG 瓦片写文件失败：{fp}");
-                    return new ImageExportResult { Success = false };
-                }
+                    _log($"   [perf] tile({cx},{cy}) 实体{_tileEnts} 光栅{_tileRenderMs}ms（编码后台并行）");
                 tiles.Add(new ImageTile
                 {
                     FileName = name,
@@ -589,9 +630,12 @@ internal partial class ImageEngine
         }
 
         LogSkipped("PNG");
+        // 等待全部后台编码写盘完成；任一失败 → 整次导出失败（保持原同步失败语义）
+        if (!FlushPngSaves())
+            return new ImageExportResult { Success = false };
         double skipPct = totalPairs > 0 ? 100.0 * (1 - (double)renderedPairs / totalPairs) : 0;
         _log($"✅  PNG 分块输出：{seq} 张瓦片（{cols} 列 × {rows} 行，单瓦片 ≤ {tile}×{tile}px，整幅 {fullW}×{fullH} @1:1×{F(zoom)}，OGC WMTS 命名 tiles/{zLevel}/{{row}}/{{col}}.png{(_transparentBg ? "，透明背景" : "")}）");
-        _log($"   空间剔除：{seq} 瓦片共需 {totalPairs} 次实体渲染，实际 {renderedPairs} 次（剔除 {skipPct:F0}%）");
+        _log($"   空间剔除：{seq} 瓦片共需 {totalPairs} 次实体渲染，实际 {renderedPairs} 次（剔除 {skipPct:F0}%；编码写盘已后台并行）");
         LogPerfSummary();
         return PngResult(fullW, fullH, false, tiles);
     }

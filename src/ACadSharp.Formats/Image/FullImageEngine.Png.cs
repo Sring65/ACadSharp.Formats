@@ -31,8 +31,8 @@ internal partial class ImageEngine
 
     // PNG 输出上下文（WritePng 设置；单线程导出，非并发）
     private RasterCanvas _rc;
-    private double _pngKx; // 画布 X：每数据单位像素数（整幅画布全局比例 = fullW/_w，分块时各瓦片一致）
-    private double _pngKy; // 画布 Y：每数据单位像素数（整幅画布全局比例 = fullH/_h，分块时各瓦片一致）
+    private double _pngKx; // 画布 X：每数据单位像素数（整幅统一比例，等比 kx==ky = OutputZoom 或其缩小系数，与 SVG/PDF 一致，分块时各瓦片一致）
+    private double _pngKy; // 画布 Y：每数据单位像素数（同 _pngKx；不再从整数画布反算，避免 ≤1px 各向异性漂移）
     private double _tileOx; // 瓦片左上角在整幅画布的像素 X 偏移（单图=0；分块=x0）
     private double _tileOy; // 瓦片左上角在整幅画布的像素 Y 偏移（单图=0；分块=y0）
 
@@ -427,6 +427,10 @@ internal partial class ImageEngine
         BuildLinetypeDash();
 
         double zoom = _opt.OutputZoom > 0 ? _opt.OutputZoom : 1.0;
+        // ===== 统一比例语义（2026-10-22 修复：SVG/PDF/PNG 缩放不一致）=====
+        // PNG 以恰好 zoom px/数据单位 为统一比例（kx==ky），与 SVG/PDF 的「1:1 内容放大 zoom 倍」严格一致；
+        // 整数画布 = 理想画布(_w·zoom × _h·zoom) 向上取整，亚像素余量(<1px)留在右/下缘为空白边，不拉伸铺满。
+        // 旧实现从整数画布反算比例（fullW/_w、fullH/_h）→ 各向异性漂移（如 10.0024×10.0027，与矢量端 10×10 不一致）。
         int fullW = (int)Math.Ceiling(_w * zoom);
         int fullH = (int)Math.Ceiling(_h * zoom);
         if (fullW < 1) fullW = 1;
@@ -439,20 +443,23 @@ internal partial class ImageEngine
         //   使各级别（单图/分块）统一落入同一 tiles 树，便于下游按 WMTS 协议取图（2026-10-21 用户）。
         bool forceTiles = _opt.WmtsZ != null && _opt.PngForceTiles;
 
-        // ① 未超限且无需强制网格：单图 1:1×zoom 原尺寸（行为与旧版一致，不缩小）
+        // ① 未超限且无需强制网格：单图 1:1×zoom 原尺寸（统一比例 = zoom）
         if (!overLimit && !forceTiles)
-            return WritePngSingle(outPath, fullW, fullH, false);
+            return WritePngSingle(outPath, fullW, fullH, zoom, false);
 
         // ② 超限 + 合并（PngMergeToSingle=true）且未强制网格：等比缩小到上限内，流式合并为 1 张
         if (overLimit && _opt.PngMergeToSingle && !forceTiles)
         {
-            double f = Math.Min(PngMaxSide / (double)fullW, PngMaxSide / (double)fullH);
-            if ((long)fullW * fullH > PngMaxPixels)
-                f = Math.Min(f, Math.Sqrt(PngMaxPixels / ((double)fullW * fullH)));
-            int W = Math.Max(1, (int)(fullW * f));
-            int H = Math.Max(1, (int)(fullH * f));
-            _log($"⚠️  PNG 画布超出位图上限（初始 1:1×{F(zoom)} = {fullW}×{fullH}），已开启合并 → 等比缩小合并为 1 张 {W}×{H}");
-            return WritePngSingle(outPath, W, H, true);
+            // 从理想（未取整）画布反解缩小系数，再以统一比例 k=zoom·f 缩小；画布向下取整保证 ≤ 上限
+            double idealW = _w * zoom, idealH = _h * zoom;
+            double f = Math.Min(PngMaxSide / idealW, PngMaxSide / idealH);
+            if (idealW * idealH > PngMaxPixels)
+                f = Math.Min(f, Math.Sqrt(PngMaxPixels / (idealW * idealH)));
+            double k = zoom * f;
+            int W = Math.Max(1, (int)Math.Floor(idealW * f));
+            int H = Math.Max(1, (int)Math.Floor(idealH * f));
+            _log($"⚠️  PNG 画布超出位图上限（初始 1:1×{F(zoom)} = {fullW}×{fullH}），已开启合并 → 统一比例缩小合并为 1 张 {W}×{H} @ {F(k)}×");
+            return WritePngSingle(outPath, W, H, k, true);
         }
 
         // ③ 超限分块 / 强制网格（单图也按 1×1 瓦片）：按网格流式输出（每张 ≤ 单侧/总像素上限，不缩小、不丢清晰度）
@@ -460,7 +467,8 @@ internal partial class ImageEngine
     }
 
     // 单图渲染（未超限原尺寸 / 超限合并缩小 共用）：建画布→清背景→逐实体光栅化→存盘。
-    private ImageExportResult WritePngSingle(string outPath, int W, int H, bool merged)
+    // k = 统一比例（px/数据单位，kx==ky）：正常单图 = OutputZoom；合并图 = OutputZoom×缩小系数（与 SVG/PDF 同义）。
+    private ImageExportResult WritePngSingle(string outPath, int W, int H, double k, bool merged)
     {
         _skippedCounts.Clear();
         _tiledMode = false; _sprites.Clear(); // 单图：无跨瓦片重复，关闭点精灵缓存（省离屏开销）
@@ -470,8 +478,10 @@ internal partial class ImageEngine
         var rc = new RasterCanvas(W, H);
         ClearPngBg(rc);
         _rc = rc;
-        _pngKx = (double)W / _w;
-        _pngKy = (double)H / _h;
+        // 统一比例（kx==ky）：与 SVG/PDF 严格一致；不再从整数画布反算（那会引入 ≤1px 的
+        // 各向异性漂移，导致 PNG 与矢量端缩放不一致）。内容锚定左上角，右/下缘余量(<1px)为空白边。
+        _pngKx = k;
+        _pngKy = k;
         _tileOx = 0; _tileOy = 0; // 单图：无瓦片偏移，整幅画布从像素原点起
 
         foreach (var ent in AllEntities())
@@ -488,9 +498,9 @@ internal partial class ImageEngine
             return new ImageExportResult { Success = false };
         }
         _rc = null;
-        _log($"✅  PNG 已生成{(merged ? "（合并单图）" : "")}：{outPath}（画板 {W}×{H}，1:1 内容放大 {F(_pngKx)}×{F(_pngKy)} 倍{(_transparentBg ? "，透明背景" : "")}）");
+        _log($"✅  PNG 已生成{(merged ? "（合并单图）" : "")}：{outPath}（画板 {W}×{H}px，1:1 内容放大 {F(k)} 倍（统一比例，与 SVG/PDF 一致）{(_transparentBg ? "，透明背景" : "")}）");
         LogPerfSummary();
-        return PngResult(W, H, merged, System.Array.Empty<ImageTile>());
+        return PngResult(W, H, merged, k, System.Array.Empty<ImageTile>());
     }
 
     // 分块（瓦片）渲染：整幅 1:1×zoom 画布按 cols×rows 网格切分，每个瓦片建独立小画布，
@@ -579,10 +589,10 @@ internal partial class ImageEngine
                 var rc = new RasterCanvas(tw, th);
                 ClearPngBg(rc);
                 _rc = rc;
-                // 整幅全局比例（各瓦片一致），配合 _tileOx/_tileOy 把整幅场景映射到该瓦片局部坐标系；
+                // 整幅统一比例 = 恰好 zoom（各瓦片一致，与 SVG/PDF 严格一致；语义见 WritePng），
+                // 配合 _tileOx/_tileOy 把整幅场景映射到该瓦片局部坐标系；
                 // 越界像素由 RasterCanvas.Blend 裁剪 → 每瓦片显示对应子区域，瓦片间无缝拼接。
-                _pngKx = (double)fullW / _w;
-                _pngKy = (double)fullH / _h;
+                _pngKx = zoom; _pngKy = zoom;
                 _tileOx = x0; _tileOy = y0;
 
                 // 空间剔除：仅渲染与瓦片数据区域相交的顶层实体（AABB 不相交 ⇒ 本瓦片 0 像素贡献，像素级安全）。
@@ -637,7 +647,7 @@ internal partial class ImageEngine
         _log($"✅  PNG 分块输出：{seq} 张瓦片（{cols} 列 × {rows} 行，单瓦片 ≤ {tile}×{tile}px，整幅 {fullW}×{fullH} @1:1×{F(zoom)}，OGC WMTS 命名 tiles/{zLevel}/{{row}}/{{col}}.png{(_transparentBg ? "，透明背景" : "")}）");
         _log($"   空间剔除：{seq} 瓦片共需 {totalPairs} 次实体渲染，实际 {renderedPairs} 次（剔除 {skipPct:F0}%；编码写盘已后台并行）");
         LogPerfSummary();
-        return PngResult(fullW, fullH, false, tiles);
+        return PngResult(fullW, fullH, false, zoom, tiles);
     }
 
     // 清背景（黑/白/透明）
@@ -647,14 +657,15 @@ internal partial class ImageEngine
         else rc.Clear(_whiteBg ? (byte)255 : (byte)0, _whiteBg ? (byte)255 : (byte)0, _whiteBg ? (byte)255 : (byte)0, 255);
     }
 
-    // 组装 PNG 导出结果（整幅画布包围盒 + 瓦片列表 + 合并标志）
-    private ImageExportResult PngResult(int fullW, int fullH, bool merged, System.Collections.Generic.IEnumerable<ImageTile> tiles)
+    // 组装 PNG 导出结果（整幅画布包围盒 + 瓦片列表 + 合并标志 + 实际统一比例 k）
+    private ImageExportResult PngResult(int fullW, int fullH, bool merged, double k, System.Collections.Generic.IEnumerable<ImageTile> tiles)
     {
         return new ImageExportResult
         {
             Success = true,
             CanvasPixelsW = fullW,
             CanvasPixelsH = fullH,
+            PixelsPerUnit = k,
             DataX0 = _minX - _margin,
             DataX1 = _maxX + _margin,
             DataY0 = _minY - _margin,

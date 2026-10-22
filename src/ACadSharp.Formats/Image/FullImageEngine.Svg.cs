@@ -1974,6 +1974,7 @@ internal partial class ImageEngine
             Success = true,
             CanvasPixelsW = (int)Math.Ceiling(_w * _opt.OutputZoom),
             CanvasPixelsH = (int)Math.Ceiling(_h * _opt.OutputZoom),
+            PixelsPerUnit = _opt.OutputZoom,
             DataX0 = _minX - _margin,
             DataX1 = _maxX + _margin,
             DataY0 = _minY - _margin,

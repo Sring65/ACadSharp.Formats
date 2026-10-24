@@ -248,6 +248,7 @@ internal partial class ImageEngine
                     break;
                 }
             case Insert ins: ExpandInsert(ins, b.Ex); break;
+            case Leader ld: ExpandLeaderExtents(ld, _doc, b.Ex); break; // 与 ComputeExtents 同展开（含样条过冲+箭头 bbox）
             case XLine _: b.mnx=_minX; b.mny=_minY; b.mxx=_maxX; b.mxy=_maxY; b.any=true; break; // 无限线：不剔除
             case Ray _: b.mnx=_minX; b.mny=_minY; b.mxx=_maxX; b.mxy=_maxY; b.any=true; break;
             default: b.mnx=_minX; b.mny=_minY; b.mxx=_maxX; b.mxy=_maxY; b.any=true; break; // 未知：不剔除（安全）
@@ -1054,51 +1055,76 @@ internal partial class ImageEngine
                 {
                     string col = ColorOf(EntityAciIndex(ent), layerAci, byBlockAci);
                     double w = StrokeWidth(ent, scaleMul);
-                    var pts = new List<(double X, double Y)>(ld.Vertices?.Count ?? 0);
-                    if (ld.Vertices != null)
+                    // DXF 组码71：缺省=有箭头，0=无箭头；XData 341 指向空块（_None）= 显式无箭头
+                    var (arrowBr, asz, noArrow) = LeaderArrowResolve(ld, _doc, Math.Max(w * 6.0, 4.0 * (tr?.Scale ?? 1.0)));
+                    bool arrow = ld.ArrowHeadEnabled && !noArrow;
+                    // 世界坐标显示路径：直线引线含钩线合成（角点 + 水平着陆段，端点按标注控制延长，见 LeaderDisplayPath）；
+                    // 样条引线返回 null（下方 LeaderSplineFlatten 处理，末段切向强制水平着陆）。
+                    var worldPath = LeaderDisplayPath(ld, _doc, asz);
+                    var pts = new List<(double X, double Y)>();
+                    if (worldPath != null)
+                    {
+                        foreach (var p in worldPath) pts.Add(tr == null ? p : tr.Apply(p.X, p.Y));
+                    }
+                    else if (ld.Vertices != null)
+                    {
                         foreach (var v in ld.Vertices)
                         {
                             var p = tr == null ? (v.X, v.Y) : tr.Apply(v.X, v.Y);
                             pts.Add(p);
                         }
+                    }
                     if (pts.Count >= 2)
                     {
-                        bool arrow = ld.ArrowHeadEnabled; // DXF 组码71：缺省=有箭头，0=无箭头
-                        // 箭头形状 + 缩放：LeaderArrow(341) 块 + ArrowSize(41, DIMASZ)。fallback 用旧启发式长度。
-                        double alen = Math.Max(w * 6.0, 4.0 * (tr?.Scale ?? 1.0));
-                        var (arrowBr, asz) = LeaderArrowResolve(ld, _doc, alen);
                         var trA = arrow ? LeaderArrowTransform(pts, asz) : null;
-                        // 引线：有箭头时起点移到箭头底边中心（避免细线穿入箭头内部）；无箭头时折线直达尖端 pts[0]
-                        var lp = new List<(double X, double Y)>(pts);
+                        // 箭头几何先算得底边距离 trim，再截引线起点：线停于箭头底边（LeaderTrimDistance），
+                        // 空心箭头不再有线穿入内部、块箭头尖端不再有线伸入块内（AutoCAD 行为）。
+                        // 刻线 _ArchTick/_Oblique 斜线过尖端 → trim≈0（不截断，线接斜线中点=尖端）。
+                        List<List<(double X, double Y)>> aStrokes = null, aFills = null;
+                        List<(double X, double Y)> aTri = null;
+                        double trim = 0;
                         if (arrow && trA != null)
                         {
-                            var bp = LeaderArrowBasePoint(pts, asz);
-                            lp[0] = (bp.X, bp.Y);
-                        }
-                        // 水平着陆线（末段非水平时补画，供关联文字坐落）——独立于箭头，按 TextWidth/HookLineDirection 判断
-                        if (LeaderLandingEndpoint(ld, pts, out var lex, out var ley))
-                            lp.Add((lex, ley));
-                        StrokePts(lp, false, col, w, dash);
-                        // 箭头（无箭头 71=0 时不画）：实心闭合=单个填充三角；其余按块几何描边/填充
-                        if (arrow && trA != null)
-                        {
-                            if (arrowBr != null && IsClosedFilledArrow(arrowBr))
+                            if (arrowBr != null && !IsClosedFilledArrow(arrowBr))
+                            {
+                                aStrokes = new List<List<(double X, double Y)>>();
+                                aFills = new List<List<(double X, double Y)>>();
+                                LeaderArrowGeom(arrowBr, trA, aStrokes, aFills);
+                                trim = LeaderTrimDistance(pts, aStrokes, aFills);
+                            }
+                            else
                             {
                                 var tip = trA.Apply(0, 0);
                                 var c1 = trA.Apply(-1.0, 0.16666667);
                                 var c2 = trA.Apply(-1.0, -0.16666667);
-                                EmitQuadFillPng(new List<(double X, double Y)> { tip, c1, c2 }, col);
+                                aTri = new List<(double X, double Y)> { tip, c1, c2 };
+                                trim = LeaderTrimDistance(pts, null, new List<List<(double X, double Y)>> { aTri });
                             }
-                            else if (arrowBr != null)
+                        }
+                        double firstSeg = Math.Sqrt(
+                            (pts[1].X - pts[0].X) * (pts[1].X - pts[0].X) +
+                            (pts[1].Y - pts[0].Y) * (pts[1].Y - pts[0].Y));
+                        if (trim > firstSeg) trim = firstSeg;
+                        // 样条引线（组码72=1）：LeaderSplineFlatten 平滑曲线（末段强制水平着陆，与 GT 一致）；
+                        // 直线引线用 LeaderDisplayPath 合成的显示路径（含钩线/水平着陆段）。
+                        var lp = (ld.PathType == LeaderPathType.Spline)
+                            ? LeaderSplineFlatten(pts, 24)
+                            : pts;
+                        StrokePts(TrimPolylineStart(lp, trim), false, col, w, dash);
+                        // 箭头（无箭头 71=0 / XData 空块时不画）：
+                        //  · 块箭头（非 _Closed）→ 按块几何忠实渲染（空心描边/常宽闭合填充，_ClosedBlank 空心、_Dot 实心圆点等）。
+                        //  · _Closed 块或无块（系统默认闭合箭头）→ 实心三角，按解析尺寸 asz（trA 已缩放）。
+                        if (arrow && trA != null)
+                        {
+                            if (aStrokes != null)
                             {
-                                var strokes = new List<List<(double X, double Y)>>();
-                                var fills = new List<List<(double X, double Y)>>();
-                                LeaderArrowGeom(arrowBr, trA, strokes, fills);
-                                foreach (var s in strokes) StrokePts(s, false, col, w, dash);
-                                foreach (var f in fills) EmitQuadFillPng(f, col);
+                                foreach (var s in aStrokes) StrokePts(s, false, col, w, dash);
+                                foreach (var f in aFills) EmitQuadFillPng(f, col);
                             }
-                            else if (LeaderArrowWings(ld, pts, alen, out var w1x, out var w1y, out var w2x, out var w2y))
-                                EmitQuadFillPng(new List<(double X, double Y)> { (pts[0].X, pts[0].Y), (w1x, w1y), (w2x, w2y) }, col);
+                            else if (aTri != null)
+                            {
+                                EmitQuadFillPng(aTri, col);
+                            }
                         }
                     }
                 }

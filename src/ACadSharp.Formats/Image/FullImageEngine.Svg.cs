@@ -1501,58 +1501,6 @@ internal partial class ImageEngine
         return true;
     }
 
-    // 箭头底边中心（折线止点）：尖端 pts[0] 沿指向 pts[1] 方向推进 arrowLen*cos30°。
-    // 实心三角（尖端+两翼）的底边中点即此处，引线止于该点避免细线穿入三角内部。
-    private static bool LeaderArrowBase(List<(double X, double Y)> pts, double arrowLen, out double bx, out double by)
-    {
-        bx = by = 0;
-        if (pts == null || pts.Count < 2) return false;
-        double dx = pts[1].X - pts[0].X, dy = pts[1].Y - pts[0].Y;
-        double len = Math.Sqrt(dx * dx + dy * dy);
-        if (len < 1e-9) return false;
-        // 推进距离 = arrowLen*cos30，钳制不超过首段长度（箭头比首段长时折线止于 pts[1]，避免反向）
-        double adv = Math.Min(arrowLen * Math.Cos(0.5236), len);
-        bx = pts[0].X + dx / len * adv;
-        by = pts[0].Y + dy / len * adv;
-        return true;
-    }
-
-    // Leader 水平着陆线（landing line）端点（三引擎共享）。
-    // AutoCAD 引线在「文字坐落端」（pts 最后一个顶点）会沿 HorizontalDirection 画一段水平线，
-    // 文字就摆在这段线上。仅当引线末段「不水平」时顶点序列里不含这条水平线，需渲染端补画：
-    //   端点 = V[last] + HorizontalDirection * sign * TextWidth
-    //     sign：HookLineDirection==Opposite(0) → +1；Same(1) → -1
-    //     （以 CAD 实测为准：Opposite 时水平线沿 HD 正向、落在文字坐落侧，作为文字下划线；
-    //      早期按枚举字面"opposite 取反向"实现为 -1，导致线段画到文字对侧，2026-10-17 修正）
-    // 末段已水平（HasHookline==true）时，该水平段已是末段本身（或末段延伸方向相同），不再叠加，
-    // 否则会出现"水平线 + 又一段水平线"的重影。
-    // 返回 false = 无需补画（末段已水平 / 无水平方向 / TextWidth<=0）。
-    private static bool LeaderLandingEndpoint(Leader ld, List<(double X, double Y)> pts,
-        out double ex, out double ey)
-    {
-        ex = ey = 0;
-        if (pts == null || pts.Count < 2) return false;
-        if (ld.TextWidth <= 1e-9) return false;
-        var hd = ld.HorizontalDirection;
-        double hdx = hd.X, hdy = hd.Y;
-        double hlen = Math.Sqrt(hdx * hdx + hdy * hdy);
-        if (hlen < 1e-9) return false;
-        hdx /= hlen; hdy /= hlen;
-        // 末段方向（V[last-1] → V[last]）
-        double dx = pts[pts.Count - 1].X - pts[pts.Count - 2].X;
-        double dy = pts[pts.Count - 1].Y - pts[pts.Count - 2].Y;
-        double dlen = Math.Sqrt(dx * dx + dy * dy);
-        if (dlen < 1e-9) return false;
-        double dot = (dx * hdx + dy * hdy) / dlen; // ±1 = 末段与水平线平行
-        if (Math.Abs(dot) > 0.999) return false;   // 末段已水平 → 水平线已是末段，不补
-        // CAD 实测：Opposite(0) 时水平线沿 HD 正向（+1）落在文字坐落侧；Same(1) 取反向（-1）。
-        int sign = ld.HookLineDirection == HookLineDirection.Same ? -1 : 1;
-        var last = pts[pts.Count - 1];
-        ex = last.X + sign * hdx * ld.TextWidth;
-        ey = last.Y + sign * hdy * ld.TextWidth;
-        return true;
-    }
-
     // ===== Leader 箭头块（三引擎共享）=====
     // 引线箭头由两个属性决定：
     //   ① 箭头形状 = DimensionStyle.LeaderArrow（DXF 组码 341 / DIMLDRBLK）——指向一个箭头块
@@ -1560,11 +1508,70 @@ internal partial class ImageEngine
     //   ② 箭头缩放 = DimensionStyle.ArrowSize（DXF 组码 41 / DIMASZ）——标准箭头块长度归一为 1.0，
     //      故 DIMASZ 即箭头长度（闭合箭头长宽比 6:1，与 AutoCAD 一致）。
     // 解析出 (箭头块, 缩放)；块无法解析时 Block=null，调用方回退旧实心三角。缩放取 DIMASZ，<=0 时回退 fallbackScale。
-    private static (BlockRecord Block, double Scale) LeaderArrowResolve(Leader ld, CadDocument doc, double fallbackScale)
+    // 引线级 DSTYLE 覆盖 XData（组码 1001 ACAD / 1000 DSTYLE / 1002 { … }）解析：
+    //   1070 341 + 1005 <句柄>  → DIMLDRBLK 箭头块（引用 BLOCK_RECORD 句柄）
+    //   1070 147 + 1040 <实数>  → DIMASZ   箭头尺寸
+    // 仅当该引线实体上带覆盖时返回非 null；否则由调用方回退到引线样式默认。
+    // 说明：AutoCAD 把"与样式不同的引线属性"以 DSTYLE XData 形式挂在引线实体上；
+    //       自定义箭头块（_ClosedBlank/_Dot 等）正是通过 341 句柄覆盖指定，尺寸通过 147 覆盖。
+    private static (BlockRecord Block, double? Size) ParseLeaderXDataArrow(Leader ld, CadDocument doc)
     {
+        BlockRecord block = null;
+        double? size = null;
+        try
+        {
+            if (ld?.ExtendedData == null || doc == null) return (null, null);
+            if (!ld.ExtendedData.TryGet(AppId.DefaultName, out var edata) || edata?.Records == null)
+                return (null, null);
+            var header = edata.Records.FirstOrDefault() as XData.ExtendedDataString;
+            if (header == null || header.Value != DimensionStyle.StyleOverrideEntryName)
+                return (null, null);
+            // 取 { … } 之间的 (code, value) 记录序列
+            var vals = edata.Records
+                .SkipWhile(c => c is not XData.ExtendedDataControlString)
+                .Skip(1)
+                .TakeWhile(c => c is not XData.ExtendedDataControlString)
+                .ToList();
+            for (int i = 0; i + 1 < vals.Count; i += 2)
+            {
+                if (vals[i] is not XData.ExtendedDataInteger16 code) continue;
+                var val = vals[i + 1];
+                if (code.Value == 341 && val is XData.ExtendedDataHandle h)
+                    block = doc.GetCadObject<BlockRecord>(h.Value);
+                else if (code.Value == 147 && val is XData.ExtendedDataReal r)
+                    size = r.Value;
+            }
+        }
+        catch { }
+        return (block, size);
+    }
+
+    // 引线箭头块 + 尺寸解析（块忠实渲染）。优先级：
+    //   块：引线 DSTYLE XData 341（自定义箭头块，如 _ClosedBlank/_Dot）
+    //       > 引线样式 LeaderArrow（DIMLDRBLK）
+    //       > 文档内 _Closed 块（AutoCAD 默认实心闭合箭头）
+    //       > null（调用方退回 V 形启发式）
+    //   尺寸：XData 147（DIMASZ 覆盖）> 样式 ArrowSize > fallbackScale
+    private static (BlockRecord Block, double Scale, bool NoArrow) LeaderArrowResolve(Leader ld, CadDocument doc, double fallbackScale)
+    {
+        var (xdBlock, xdSize) = ParseLeaderXDataArrow(ld, doc);
+
+        // 箭头尺寸 = 样式 ArrowSize（DIMSTYLE DIMASZ，组码 41，如 2.5）。
+        // XData 147 与 DIMSTYLE 42/147 同值（如 0.625），是 DIMEXO 类偏移量，不是 DIMASZ，
+        // 不用于箭头尺寸（GT 实测箭头≈2.5，取 XData 147 会画成 ~0.6 的小箭头）。
         double asz = 0;
         try { asz = ld.Style?.ArrowSize ?? 0; } catch { }
         double scale = asz > 1e-9 ? asz : fallbackScale;
+
+        // XData 341 存在但指向空块（如 _None，0 实体）= 显式"无箭头"。
+        // 此时不得回退样式/_Closed/默认实心三角（GT 行23 _None 为纯引线无箭头）。
+        if (xdBlock != null)
+        {
+            if (xdBlock.Entities == null || xdBlock.Entities.Count == 0)
+                return (null, scale, true);
+            return (xdBlock, scale, false);
+        }
+
         BlockRecord br = null;
         try { br = ld.Style?.LeaderArrow; } catch { }
         bool ok = br != null && br.Entities != null && br.Entities.Count > 0;
@@ -1578,14 +1585,22 @@ internal partial class ImageEngine
             }
             catch { }
         }
-        return ok ? (br, scale) : (null, scale);
+        return ok ? (br, scale, false) : (null, scale, false);
     }
 
-    // 是否为"实心闭合"箭头（默认 / _Closed）：AutoCAD 将其渲染为**填充**三角（块内是轮廓线+中线，
-    // 但标准闭合箭头显示为实心）。其余标准块（_Open/_Dot/_BoxFilled/_Integral…）按块几何如实绘制。
+    // 是否为"实心闭合"箭头（仅 _Closed）：渲染为**填充**三角。
+    // _ClosedBlank 块内是空心 chevron 轮廓线（(0,0)→(-1,±1/6)），GT 实测为**空心**三角（仅描边不填充），
+    // 故与其余标准块一样按块几何如实绘制（LeaderArrowGeom 描边）。
+    // 无块默认（341 缺失）= 系统默认实心闭合箭头，走调用方的填充三角分支。
     private static bool IsClosedFilledArrow(BlockRecord br)
     {
-        try { return br != null && br.Name == "_Closed"; } catch { return false; }
+        try
+        {
+            if (br == null) return false;
+            string n = br.Name;
+            return n == "_Closed";
+        }
+        catch { return false; }
     }
 
     // 箭头放置变换：块局部「尖端=(0,0)、主体朝 -X」→ 尖端对齐 pts[0]（指向目标），主体沿 pts[0]→pts[1]
@@ -1599,17 +1614,6 @@ internal partial class ImageEngine
         double ux = dx / len, uy = dy / len;
         // 块 -X 轴 → (ux,uy)  ⇒  旋转矩阵列 (Ca,Sa) = (-ux,-uy)
         return new Transform2D { Ca = -ux, Sa = -uy, Sx = ascale, Sy = ascale, Tx = pts[0].X, Ty = pts[0].Y };
-    }
-
-    // 箭头底边中心（引线止点）：尖端 pts[0] 沿入段方向推进 ascale（钳制首段长，避免箭头比首段长时折线反向）。
-    private static (double X, double Y) LeaderArrowBasePoint(List<(double X, double Y)> pts, double ascale)
-    {
-        if (pts == null || pts.Count < 2) return pts?[0] ?? (0, 0);
-        double dx = pts[1].X - pts[0].X, dy = pts[1].Y - pts[0].Y;
-        double len = Math.Sqrt(dx * dx + dy * dy);
-        if (len < 1e-9) return pts[0];
-        double adv = Math.Min(ascale, len);
-        return (pts[0].X + dx / len * adv, pts[0].Y + dy / len * adv);
     }
 
     // 圆弧采样为折线点（世界坐标，含旋转）。startDeg/endDeg 为**世界**角度（度）。
@@ -1655,7 +1659,15 @@ internal partial class ImageEngine
                 case LwPolyline pl:
                 {
                     var pp = LwPolylineSamplePoints(pl, trA); // 含闭合段（首尾回 v0）
-                    if (pp.Count >= 2) strokes.Add(pp);
+                    double hw = pl.ConstantWidth * 0.5 * trA.Scale;
+                    if (pl.ConstantWidth > 1e-9 && hw > 1e-9 && pp.Count >= 2)
+                    {
+                        // 定宽多段线：AutoCAD 按"定宽带"填充为实心形，而非细线轮廓。
+                        //   闭合（如 _Dot 圆点）→ 外扩半宽得实心形；开放（如 _ArchTick 拱形刻线）→ 中线两侧外扩得实心带。
+                        if (pl.IsClosed && pp.Count >= 3) fills.Add(ThickClosedPolygon(pp, hw));
+                        else fills.Add(ThickOpenPolygon(pp, hw));
+                    }
+                    else if (pp.Count >= 2) strokes.Add(pp);
                     break;
                 }
                 case Arc a: // 必须先于 Circle（fork 继承关系）
@@ -1688,6 +1700,273 @@ internal partial class ImageEngine
         }
     }
 
+    // 箭头"底边"距离（三引擎共享）：从尖端 pts[0] 沿引线方向（pts[0]→pts[1]，即块的 −X 轴方向）出发，
+    // 求射线与箭头边界（描边 strokes + 填充 fills 的外轮廓）在"朝向末端一侧"的最远交点距离。
+    // 引线应在此处截断（线停于箭头底边，箭头叠在其上），避免线穿入空心箭头内部 / 伸入块箭头。
+    //   · 形（三角/方/圆点 + 可选茎）→ 最远交点 = 底边（含茎时取茎端，AutoCAD 行为：茎属箭头块，线接茎端）。
+    //   · 刻线 _ArchTick/_Oblique（斜线过尖端）→ 射线恰在尖端 t≈0 相交（t≤0 被排除）→ 返回 0（不截断，
+    //     线接到斜线中点=尖端），正是旧"截到块底边"实现丢尖端的陷阱所在。
+    // 与 AutoCAD 一致：线自末端侧进入箭头，首先碰到的是底边（最远交点），故取 max(t)。
+    private static double LeaderTrimDistance(List<(double X, double Y)> pts,
+        List<List<(double X, double Y)>> strokes, List<List<(double X, double Y)>> fills)
+    {
+        if (pts == null || pts.Count < 2) return 0;
+        double ux = pts[1].X - pts[0].X, uy = pts[1].Y - pts[0].Y;
+        double len = Math.Sqrt(ux * ux + uy * uy);
+        if (len < 1e-12) return 0;
+        ux /= len; uy /= len;
+        var T = pts[0];
+        double best = 0;
+        void DoPolyline(List<(double X, double Y)> poly, bool closed)
+        {
+            int n = poly.Count;
+            if (n < 2) return;
+            int last = closed ? n : n - 1;
+            for (int i = 0; i < last; i++)
+            {
+                var A = poly[i];
+                var B = poly[(i + 1) % n];
+                double ex = B.X - A.X, ey = B.Y - A.Y;
+                double det = ex * uy - ey * ux; // cross(e, d)
+                if (Math.Abs(det) < 1e-12)
+                {
+                    // 共线/平行段（如沿射线方向的茎/中心线）：叉积交点退化，改用端点投影——
+                    // 取落在射线（±eps 内）的端点投影中最大 t≥0（茎端 = AutoCAD 线接点）。
+                    // 平行但偏离射线的段（两端点偏移均 > eps）不计入。
+                    double offA = Math.Abs(ux * (A.Y - T.Y) - uy * (A.X - T.X));
+                    double offB = Math.Abs(ux * (B.Y - T.Y) - uy * (B.X - T.X));
+                    const double epsC = 1e-8;
+                    if (offA < epsC && offB < epsC)
+                    {
+                        double tA = (A.X - T.X) * ux + (A.Y - T.Y) * uy;
+                        double tB = (B.X - T.X) * ux + (B.Y - T.Y) * uy;
+                        double tm = Math.Max(tA, tB);
+                        if (tm > best) best = tm > 0 ? tm : 0;
+                    }
+                    continue;
+                }
+                double ax = A.X - T.X, ay = A.Y - T.Y;
+                double t = (ex * ay - ey * ax) / det; // cross(e, A-T)/det
+                if (t <= 1e-9) continue;            // 须朝末端一侧（t>0）
+                double s = (ux * ay - uy * ax) / det; // cross(d, A-T)/det
+                if (s < -1e-9 || s > 1 + 1e-9) continue;
+                if (t > best) best = t;
+            }
+        }
+        if (strokes != null) foreach (var s in strokes) DoPolyline(s, false);
+        if (fills != null) foreach (var f in fills) DoPolyline(f, true);
+        return best;
+    }
+
+    // 沿折线从起点 pts[0] 向末端走 distance 长度，返回该点之后的子折线（用于把引线起点截到箭头底边）。
+    // distance≤0 或 ≥ 折线总长时原样返回（不截断）。不修改入参。
+    private static List<(double X, double Y)> TrimPolylineStart(List<(double X, double Y)> pts, double distance)
+    {
+        if (pts == null || pts.Count < 2 || distance <= 1e-9) return pts;
+        double remaining = distance;
+        for (int i = 0; i < pts.Count - 1; i++)
+        {
+            double dx = pts[i + 1].X - pts[i].X, dy = pts[i + 1].Y - pts[i].Y;
+            double seg = Math.Sqrt(dx * dx + dy * dy);
+            if (seg <= 1e-12) continue;
+            if (remaining <= seg)
+            {
+                double f = remaining / seg;
+                var result = new List<(double X, double Y)>(pts.Count - i) { (pts[i].X + dx * f, pts[i].Y + dy * f) };
+                for (int j = i + 1; j < pts.Count; j++) result.Add(pts[j]);
+                return result;
+            }
+            remaining -= seg;
+        }
+        return pts; // distance ≥ 总长，不截断
+    }
+
+    // 闭合定宽多段线的填充外边界：以采样点形心为基准，把每个点沿"形心→点"方向外扩 off。
+    // 对凸形（圆/凸多边形，如 _Dot 圆点）精确；凹形为近似（标准箭头块均为凸形）。
+    private static List<(double X, double Y)> ThickClosedPolygon(List<(double X, double Y)> pp, double off)
+    {
+        double cx = 0, cy = 0;
+        foreach (var p in pp) { cx += p.X; cy += p.Y; }
+        cx /= pp.Count; cy /= pp.Count;
+        var res = new List<(double X, double Y)>(pp.Count);
+        foreach (var p in pp)
+        {
+            double dx = p.X - cx, dy = p.Y - cy;
+            double d = Math.Sqrt(dx * dx + dy * dy);
+            if (d < 1e-9) { res.Add((p.X + off, p.Y)); continue; }
+            double s = (d + off) / d;
+            res.Add((cx + dx * s, cy + dy * s));
+        }
+        return res;
+    }
+
+    // 开放定宽多段线的实心带：沿中线两侧各外扩 hw（平头端帽）。用于 _ArchTick 等开放定宽刻线——
+    // AutoCAD 把开放定宽多段线渲染为"实心带"（填充），而非细描边。两侧偏移用平滑法线（相邻切线均值），
+    // 端点取单侧切线法线，保证直段为矩形带、折角处平滑过渡。
+    private static List<(double X, double Y)> ThickOpenPolygon(List<(double X, double Y)> pp, double hw)
+    {
+        int n = pp.Count;
+        var left = new List<(double X, double Y)>(n);
+        var right = new List<(double X, double Y)>(n);
+        for (int i = 0; i < n; i++)
+        {
+            double tx, ty;
+            if (i == 0) { tx = pp[1].X - pp[0].X; ty = pp[1].Y - pp[0].Y; }
+            else if (i == n - 1) { tx = pp[n - 1].X - pp[n - 2].X; ty = pp[n - 1].Y - pp[n - 2].Y; }
+            else
+            {
+                double a1x = pp[i].X - pp[i - 1].X, a1y = pp[i].Y - pp[i - 1].Y;
+                double a2x = pp[i + 1].X - pp[i].X, a2y = pp[i + 1].Y - pp[i].Y;
+                double l1 = Math.Sqrt(a1x * a1x + a1y * a1y), l2 = Math.Sqrt(a2x * a2x + a2y * a2y);
+                if (l1 < 1e-9) l1 = 1e-9; if (l2 < 1e-9) l2 = 1e-9;
+                tx = a1x / l1 + a2x / l2; ty = a1y / l1 + a2y / l2;
+            }
+            double tl = Math.Sqrt(tx * tx + ty * ty);
+            if (tl < 1e-9) tl = 1e-9;
+            tx /= tl; ty /= tl;
+            left.Add((pp[i].X - ty * hw, pp[i].Y + tx * hw));
+            right.Add((pp[i].X + ty * hw, pp[i].Y - tx * hw));
+        }
+        var res = new List<(double X, double Y)>(n * 2);
+        res.AddRange(left);
+        for (int i = n - 1; i >= 0; i--) res.Add(right[i]);
+        return res;
+    }
+
+    // 直线引线显示路径（世界坐标）——三引擎（Svg/Png/Pdf）共享。
+    // 背景：ACadSharp 的 Leader.HasHookline 是只读计算属性（无 setter），文件里存储的 75（钩线）
+    // 标志在 DXF/DWG 读回时丢失，读回的只是"末段是否水平"的计算值。但 AutoCAD 对带钩线的引线
+    // 始终绘制 角点 + 水平着陆段，其形状与端点由几何与关联标注共同决定（已逐条与 GT 核对）：
+    //   · DXF 4 顶点形式（末段已水平存储）：角点 = 第 n-1 个顶点；水平段 = 存储的末段。
+    //   · DWG 3 顶点形式（末段为斜线、角点被读取器丢弃）：角点 = (末顶点.x − 箭头长, 末顶点.y)；
+    //     水平段自角点沿 +X 画到端点。
+    //     核对：#2 角点 2703.307−2.5=2700.807、#1 角点 2701.624−2.5=2699.124 —— 恰为 DXF 存储的角点。
+    // 水平段端点 endX（标注控制）：若引线末端严格位于 MTEXT 左缘左侧（last.x < textLeft），
+    //   AutoCAD 把基线延长到文字右缘 textRight；否则保持存储末端。
+    //   核对：#1 末点 2701.62 < 2A6 左缘 2702.25 → 延长到 2730.98（=2702.25+28.73，文字右缘）；
+    //         #2/#4 末点 2703.31 == 2B1 左缘 → 不延长（保持 2703.31）。
+    // 文字宽度优先取 MText.RectangleWidth（DWG 中为 0），回退 Leader.TextWidth（组码 41，恒有存储）。
+    // 返回 null：样条引线（由 LeaderSplineFlatten 处理）或无钩线信号的直线引线（保持原顶点折线）。
+    private static List<(double X, double Y)> LeaderDisplayPath(Leader ld, CadDocument doc, double arrowSize)
+    {
+        if (ld?.Vertices == null) return null;
+        if (ld.PathType == LeaderPathType.Spline) return null;
+        var V = ld.Vertices;
+        int n = V.Count;
+        if (n < 3) return null;
+
+        var prev = V[n - 2];
+        var last = V[n - 1];
+        // 末段是否已水平（∥ HorizontalDirection；叉积 ≤ 1e-6·弦长 ≈ 1e-6 rad 容差）
+        double hx = 1, hy = 0;
+        try
+        {
+            var hd = ld.HorizontalDirection;
+            if (hd != null && (hd.X != 0 || hd.Y != 0)) { hx = hd.X; hy = hd.Y; }
+        }
+        catch { }
+        double ddx = last.X - prev.X, ddy = last.Y - prev.Y;
+        double dl = Math.Sqrt(ddx * ddx + ddy * ddy);
+        bool lastHorizontal = dl > 1e-9 && Math.Abs(ddx * hy - ddy * hx) <= 1e-6 * dl;
+
+        // 关联 MTEXT（73=0 表示带文字标注；读取器已把 340 句柄解析为实体）
+        MText mt = null;
+        if (ld.CreationType == LeaderCreationType.CreatedWithTextAnnotation)
+            try { mt = ld.AssociatedAnnotation as MText; } catch { }
+
+        if (!lastHorizontal && mt == null) return null;   // 无钩线信号：保持原折线
+
+        // 角点：4 顶点形式取存储的第 n-1 顶点；3 顶点形式 = 末顶点左移一个箭头长
+        double cornerX, cornerY;
+        if (lastHorizontal) { cornerX = prev.X; cornerY = prev.Y; }
+        else { cornerX = last.X - (arrowSize > 1e-9 ? arrowSize : 0); cornerY = last.Y; }
+
+        // 水平段端点：标注存在且引线末端严格短于文字左缘 → 延长到文字右缘
+        double endX = last.X;
+        if (mt != null)
+        {
+            double tx = mt.InsertPoint.X;
+            double tw = mt.RectangleWidth > 1e-9 ? mt.RectangleWidth : (ld.TextWidth > 1e-9 ? ld.TextWidth : 0);
+            if (tw > 1e-9)
+            {
+                double textLeft;
+                switch (mt.AttachmentPoint)
+                {
+                    case AttachmentPointType.TopCenter:
+                    case AttachmentPointType.MiddleCenter:
+                    case AttachmentPointType.BottomCenter:
+                        textLeft = tx - tw / 2; break;
+                    case AttachmentPointType.TopRight:
+                    case AttachmentPointType.MiddleRight:
+                    case AttachmentPointType.BottomRight:
+                        textLeft = tx - tw; break;
+                    default: // Left 家族（TopLeft/MiddleLeft/BottomLeft）
+                        textLeft = tx; break;
+                }
+                if (last.X < textLeft) endX = textLeft + tw;
+            }
+        }
+
+        var path = new List<(double X, double Y)>(n + 1);
+        for (int i = 0; i < n - 1; i++) path.Add((V[i].X, V[i].Y));
+        if (!lastHorizontal) path.Add((cornerX, cornerY));
+        path.Add((endX, last.Y));
+        return path;
+    }
+
+    // 样条引线（LEADER 组码 72=1，PathType=Spline）的平滑曲线：AutoCAD 对"样条"引线类型
+    // 用一条穿过全部顶点的三次样条（拟合点=顶点）渲染，而非折线。
+    // 前 n-1 段用 Catmull-Rom（端点钳制）→ 三次贝塞尔逐段密集采样；
+    // 末段强制水平切向（AutoCAD 样条引线总是水平着陆，GT #3/#5 末段恰为水平）——用 Hermite：
+    //   起切向 (P[n-1]−P[n-3])/2（与 Catmull-Rom 在 P[n-2] 的切向一致，保 C1 连续），
+    //   终切向 = 水平（方向 = 末段水平行进方向 sign(P[n-1].x−P[n-2].x)，幅值 = 末段弦长，m2scale=1.0）。
+    // 注：74(HookLineDirection)/HorizontalDirection 数据驱动符号不可用——本文件未存 211/221/231
+    // （HorizontalDirection 默认 +X），74=Opposite ⇒ −X 与 GT 的 +X 终切向相矛盾；
+    // 行进方向（direction of travel）与 GT 一致（#3/#5 均 +X）。
+    // 起点切向 = (P1−P0)，与直线引线的箭头朝向一致，故箭头几何（LeaderArrowTransform 等）无需改动。
+    // 非样条引线不应调用本函数（直接保留原顶点折线）。
+    private static List<(double X, double Y)> LeaderSplineFlatten(List<(double X, double Y)> pts, int steps = 24)
+    {
+        var outp = new List<(double X, double Y)>();
+        int n = pts?.Count ?? 0;
+        if (n == 0) return outp;
+        if (n == 1) { outp.Add(pts[0]); return outp; }
+        if (n == 2) { outp.Add(pts[0]); outp.Add(pts[1]); return outp; }
+        for (int i = 0; i < n - 1; i++)
+        {
+            var p1 = pts[i];
+            var p2 = pts[i + 1];
+            double b1x, b1y, b2x, b2y;
+            if (i == n - 2)
+            {
+                // 末段：Hermite，终切向强制水平（GT：样条引线末段恰为水平）
+                var p0 = pts[i - 1];
+                double m1x = (p2.X - p0.X) / 2.0, m1y = (p2.Y - p0.Y) / 2.0;
+                double chord = Math.Sqrt((p2.X - p1.X) * (p2.X - p1.X) + (p2.Y - p1.Y) * (p2.Y - p1.Y));
+                double sgn = (p2.X - p1.X) >= 0 ? 1.0 : -1.0;
+                double m2x = sgn * chord, m2y = 0.0;
+                b1x = p1.X + m1x / 3.0; b1y = p1.Y + m1y / 3.0;
+                b2x = p2.X - m2x / 3.0; b2y = p2.Y - m2y / 3.0;
+            }
+            else
+            {
+                var p0 = pts[i > 0 ? i - 1 : 0];
+                var p3 = pts[i + 2 < n ? i + 2 : n - 1];
+                b1x = p1.X + (p2.X - p0.X) / 6.0; b1y = p1.Y + (p2.Y - p0.Y) / 6.0;
+                b2x = p2.X - (p3.X - p1.X) / 6.0; b2y = p2.Y - (p3.Y - p1.Y) / 6.0;
+            }
+            for (int s = 0; s < steps; s++)
+            {
+                double t = s / (double)steps, mt = 1.0 - t;
+                double a = mt * mt * mt, b = 3.0 * mt * mt * t, c = 3.0 * mt * t * t, d = t * t * t;
+                outp.Add((a * p1.X + b * b1x + c * b2x + d * p2.X,
+                          a * p1.Y + b * b1y + c * b2y + d * p2.Y));
+            }
+        }
+        outp.Add(pts[n - 1]);
+        return outp;
+    }
+
     // spline-fit（样条拟合）多段线（POLYLINE 组码 70 bit2=curved）的顶点混合两类：
     //   SplineVertexFromSplineFitting —— 样条拟合点，AutoCAD 实际渲染的显示路径；
     //   SplineFrameControlPoint      —— 样条框架控制点，AutoCAD 不显示（仅定义拟合曲线）。
@@ -1695,6 +1974,73 @@ internal partial class ImageEngine
     // 普通（非拟合）多段线顶点不带该标志，不受影响。
     private static bool IsDisplayVertex(ACadSharp.Entities.Vertex v)
         => v != null && !v.Flags.HasFlag(ACadSharp.Entities.VertexFlags.SplineFrameControlPoint);
+
+    // 引线范围贡献（ComputeExtents[SVG/PDF] 与 Png 剔除共用，保证画布不裁掉样条过冲与箭头底边）：
+    //  1) 引线全路径点（样条用 LeaderSplineFlatten 输出，可能超出顶点凸包）；
+    //  2) 箭头世界坐标 bbox：块箭头取块实体局部 bbox → LeaderArrowTransform 四角（旋转+等比+平移，
+    //     角点给出保守外接 AABB）；无块默认取实心三角局部 bbox x:[-1,0] y:[±1/6]。
+    //  旧实现仅展开 ld.Vertices，箭头块（尤其 _Dot/_BoxFilled/五边形等）与样条过冲被裁出画布
+    //  （leaderTest 行24 五边形下缘 y≈1438.7 < 旧 minY≈1439.38，整条底部缺失）。
+    private static void ExpandLeaderExtents(Leader ld, CadDocument doc, Action<double, double> ex)
+    {
+        if (ld?.Vertices == null || ld.Vertices.Count < 2) return;
+        var (arrowBr, asz, noArrow) = LeaderArrowResolve(ld, doc, 0);
+        var pts = new List<(double X, double Y)>();
+        foreach (var v in ld.Vertices) pts.Add((v.X, v.Y));
+        // 显示路径：直线引线含钩线合成（角点 + 水平着陆段，端点按标注控制延长，见 LeaderDisplayPath）；
+        // 样条引线平滑（LeaderSplineFlatten，末段强制水平着陆）。与 emit 路径一致，保证包围盒不被裁切。
+        List<(double X, double Y)> path;
+        if (ld.PathType == LeaderPathType.Spline) path = LeaderSplineFlatten(pts, 24);
+        else path = LeaderDisplayPath(ld, doc, asz) ?? pts;
+        foreach (var p in path) ex(p.X, p.Y);
+
+        if (!ld.ArrowHeadEnabled || noArrow || asz <= 1e-9) return;
+        var trA = LeaderArrowTransform(pts, asz);
+
+        double mnx = double.MaxValue, mny = double.MaxValue, mxx = double.MinValue, mxy = double.MinValue;
+        bool any = false;
+        void LEx(double x, double y)
+        {
+            if (!any) { mnx = mxx = x; mny = mxy = y; any = true; }
+            else { if (x < mnx) mnx = x; if (x > mxx) mxx = x; if (y < mny) mny = y; if (y > mxy) mxy = y; }
+        }
+        void LExCircle(double cx, double cy, double r) { LEx(cx - r, cy - r); LEx(cx + r, cy + r); }
+
+        if (arrowBr == null || IsClosedFilledArrow(arrowBr))
+        {
+            // 默认实心三角局部 bbox：尖端 (0,0)，底边 x=-1、y=±1/6
+            LEx(0, 0); LEx(-1, 1.0 / 6.0); LEx(-1, -1.0 / 6.0);
+        }
+        else if (arrowBr.Entities != null)
+        {
+            foreach (var e in arrowBr.Entities)
+            {
+                switch (e)
+                {
+                    case Line l: LEx(l.StartPoint.X, l.StartPoint.Y); LEx(l.EndPoint.X, l.EndPoint.Y); break;
+                    case LwPolyline pl:
+                        foreach (var p in LwPolylineSamplePoints(pl, null)) LEx(p.X, p.Y);
+                        if (pl.ConstantWidth > 1e-9 && any)
+                        { double hw = pl.ConstantWidth * 0.5; mnx -= hw; mny -= hw; mxx += hw; mxy += hw; }
+                        break;
+                    case Arc a: LExCircle(a.Center.X, a.Center.Y, a.Radius); break; // 必须先于 Circle（fork 继承）
+                    case Circle c: LExCircle(c.Center.X, c.Center.Y, c.Radius); break;
+                    case Ellipse el: LExCircle(el.Center.X, el.Center.Y, Math.Max(el.MajorAxis, el.MinorAxis) / 2.0); break;
+                    case Solid sd:
+                        LEx(sd.FirstCorner.X, sd.FirstCorner.Y); LEx(sd.SecondCorner.X, sd.SecondCorner.Y);
+                        LEx(sd.ThirdCorner.X, sd.ThirdCorner.Y); LEx(sd.FourthCorner.X, sd.FourthCorner.Y); break;
+                    case Spline sp: foreach (var p in SplineSample(sp, null, 4)) LEx(p.X, p.Y); break;
+                    case Point pt: LEx(pt.Location.X, pt.Location.Y); break;
+                }
+            }
+        }
+        if (!any) return;
+        foreach (var c in new[] { (mnx, mny), (mxx, mny), (mnx, mxy), (mxx, mxy) })
+        {
+            var q = trA.Apply(c.Item1, c.Item2);
+            ex(q.X, q.Y);
+        }
+    }
 
     private IEnumerable<Entity> AllEntities()
     {
@@ -1753,6 +2099,8 @@ internal partial class ImageEngine
                     foreach (var loop in BuildHatchLoops(ht, null))
                         foreach (var p in loop) Expand(p.X, p.Y); break;
                 case Insert ins: ExpandInsert(ins, Expand); break;
+                case Leader ld: // 引线全路径（样条含过冲）+ 箭头 bbox 计入图框，否则箭头/样条过冲被裁出画布
+                    ExpandLeaderExtents(ld, _doc, Expand); break;
                 default: break;
             }
         }
@@ -2265,54 +2613,83 @@ internal partial class ImageEngine
 
             case Leader ld:
                 {
-                    // 引线：折线 + 尖端箭头（AutoCAD 默认实心/开放箭头，此处用开放 V 形）
+                    // 引线：折线/平滑曲线 + 尖端箭头（AutoCAD 默认实心/开放箭头，此处用开放 V 形）
                     string col = ColorOf(EntityAciIndex(ent), layerAci, byBlockAci);
                     double w = StrokeWidth(ent, scaleMul);
-                    var pts = new List<(double X, double Y)>(ld.Vertices?.Count ?? 0);
-                    if (ld.Vertices != null)
+                    // DXF 组码71：缺省=有箭头，0=无箭头；XData 341 指向空块（_None）= 显式无箭头
+                    var (arrowBr, asz, noArrow) = LeaderArrowResolve(ld, _doc, Math.Max(w * 6.0, 4.0 * (tr?.Scale ?? 1.0)));
+                    bool arrow = ld.ArrowHeadEnabled && !noArrow;
+                    // 世界坐标显示路径：直线引线含钩线合成（角点 + 水平着陆段，端点按标注控制延长，详见 LeaderDisplayPath）；
+                    // 样条引线返回 null（下方 LeaderSplineFlatten 处理，末段切向强制水平着陆）。
+                    var worldPath = LeaderDisplayPath(ld, _doc, asz);
+                    var pts = new List<(double X, double Y)>();
+                    if (worldPath != null)
+                    {
+                        foreach (var p in worldPath) pts.Add(tr == null ? p : tr.Apply(p.X, p.Y));
+                    }
+                    else if (ld.Vertices != null)
+                    {
                         foreach (var v in ld.Vertices)
                         {
                             var p = tr == null ? (v.X, v.Y) : tr.Apply(v.X, v.Y);
                             pts.Add(p);
                         }
+                    }
                     if (pts.Count >= 2)
                     {
-                        bool arrow = ld.ArrowHeadEnabled; // DXF 组码71：缺省=有箭头，0=无箭头
-                        // 箭头形状 + 缩放：LeaderArrow(341) 块 + ArrowSize(41, DIMASZ)。fallback 用旧启发式长度。
-                        double alen = Math.Max(w * 6.0, 4.0 * (tr?.Scale ?? 1.0));
-                        var (arrowBr, asz) = LeaderArrowResolve(ld, _doc, alen);
                         var trA = arrow ? LeaderArrowTransform(pts, asz) : null;
-                        // 引线：有箭头时起点移到箭头底边中心（避免细线穿入箭头内部）；无箭头时折线直达尖端 pts[0]
-                        var lp = new List<(double X, double Y)>(pts);
+                        // 箭头几何（块 strokes/fills 或默认实心三角）先算，得到底边距离 trim，再截引线起点：
+                        // 引线自末端侧进入箭头，线应停于箭头底边（LeaderTrimDistance），箭头叠在其上——
+                        // 空心箭头不再有线穿入内部、块箭头尖端不再有线伸入块内（AutoCAD 行为）。
+                        // 刻线 _ArchTick/_Oblique 的斜线过尖端 → trim≈0（不截断，线接斜线中点=尖端），
+                        // 避免旧"截到块底边"丢尖端→底边一段横线的陷阱。
+                        List<List<(double X, double Y)>> aStrokes = null, aFills = null;
+                        List<(double X, double Y)> aTri = null;
+                        double trim = 0;
                         if (arrow && trA != null)
                         {
-                            var bp = LeaderArrowBasePoint(pts, asz);
-                            lp[0] = (bp.X, bp.Y);
-                        }
-                        // 水平着陆线（末段非水平时补画，供关联文字坐落）——独立于箭头，按 TextWidth/HookLineDirection 判断
-                        if (LeaderLandingEndpoint(ld, pts, out var lex, out var ley))
-                            lp.Add((lex, ley));
-                        EmitPolyline(sb, lp, col, w, false, dash);
-                        // 箭头（无箭头 71=0 时不画）：实心闭合=单个填充三角；其余按块几何描边/填充
-                        if (arrow && trA != null)
-                        {
-                            if (arrowBr != null && IsClosedFilledArrow(arrowBr))
+                            if (arrowBr != null && !IsClosedFilledArrow(arrowBr))
+                            {
+                                aStrokes = new List<List<(double X, double Y)>>();
+                                aFills = new List<List<(double X, double Y)>>();
+                                LeaderArrowGeom(arrowBr, trA, aStrokes, aFills);
+                                trim = LeaderTrimDistance(pts, aStrokes, aFills);
+                            }
+                            else
                             {
                                 var tip = trA.Apply(0, 0);
                                 var c1 = trA.Apply(-1.0, 0.16666667);
                                 var c2 = trA.Apply(-1.0, -0.16666667);
-                                EmitQuadFill(sb, new List<(double X, double Y)> { tip, c1, c2 }, col);
+                                aTri = new List<(double X, double Y)> { tip, c1, c2 };
+                                trim = LeaderTrimDistance(pts, null, new List<List<(double X, double Y)>> { aTri });
                             }
-                            else if (arrowBr != null)
+                        }
+                        // 截断距离夹到首段长度内，防止越过第一个顶点（箭头应落在首段内）。
+                        double firstSeg = Math.Sqrt(
+                            (pts[1].X - pts[0].X) * (pts[1].X - pts[0].X) +
+                            (pts[1].Y - pts[0].Y) * (pts[1].Y - pts[0].Y));
+                        if (trim > firstSeg) trim = firstSeg;
+                        // 样条引线（组码72=1，PathType=Spline）：路径为穿过全部顶点的平滑曲线（LeaderSplineFlatten，末段强制水平着陆，
+                        // 与 GT 一致）；直线引线用 LeaderDisplayPath 合成的显示路径（含钩线/水平着陆段）。
+                        var lp = (ld.PathType == LeaderPathType.Spline)
+                            ? LeaderSplineFlatten(pts, 24)
+                            : pts;
+                        EmitPolyline(sb, TrimPolylineStart(lp, trim), col, w, false, dash);
+                        // 箭头（无箭头 71=0 / XData 空块时不画）：
+                        //  · 块箭头（非 _Closed）→ 按块几何忠实渲染：空心轮廓描边 / 常宽闭合填充（_ClosedBlank 空心、_Dot 实心圆点等）。
+                        //  · _Closed 块或无块（系统默认闭合箭头）→ 单个实心三角，按解析尺寸 asz（trA 已缩放）。
+                        //    尺寸取样式 ArrowSize(DIMASZ, 组码41)。
+                        if (arrow && trA != null)
+                        {
+                            if (aStrokes != null)
                             {
-                                var strokes = new List<List<(double X, double Y)>>();
-                                var fills = new List<List<(double X, double Y)>>();
-                                LeaderArrowGeom(arrowBr, trA, strokes, fills);
-                                foreach (var s in strokes) EmitPolyline(sb, s, col, w, false, dash);
-                                foreach (var f in fills) EmitQuadFill(sb, f, col);
+                                foreach (var s in aStrokes) EmitPolyline(sb, s, col, w, false, dash);
+                                foreach (var f in aFills) EmitQuadFill(sb, f, col);
                             }
-                            else if (LeaderArrowWings(ld, pts, alen, out var w1x, out var w1y, out var w2x, out var w2y))
-                                EmitQuadFill(sb, new List<(double X, double Y)> { (pts[0].X, pts[0].Y), (w1x, w1y), (w2x, w2y) }, col);
+                            else if (aTri != null)
+                            {
+                                EmitQuadFill(sb, aTri, col);
+                            }
                         }
                     }
                 }

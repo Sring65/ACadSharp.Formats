@@ -289,11 +289,13 @@ internal partial class ImageEngine
                         if (hasAttribs && e is AttributeDefinition) continue; // 有实际属性值 → 跳过模板默认值
                         EmitEntityPdf(cs, e, t, t.Scale, insAci, insDash, insPat, childLtMul, insLayerAci);
                     }
-                    // 属性实际值（ATTRIB）：DXF 中其 InsertPoint 已是世界坐标（= INSERT 插入点 + 块变换），
-                    // 故只受父层累积变换（tr），不再套本 INSERT 的 t（否则平移/缩放会叠加两次）；字高仍随块缩放（t.Scale）。
+                    // 属性实际值（ATTRIB）：InsertPoint（组10）与 Height（组40）同一坐标系（顶层=世界/嵌套=父块局部），
+                    // AutoCAD 存档时已把字高预乘插入比例。位置只受父层累积变换（tr），字高也按该同一变换缩放
+                    // （tr.Scale），不再乘本 INSERT 全变换 t 的 t.Scale（会把已含插入比例的字高再放大一次）。
+                    // 治 sample.dwg gc200（scale=10）属性 "3.94"：字高 20 被双重缩放开成 200，GT AutoCAD 按 20 渲染。
                     if (hasAttribs)
                         foreach (var att in ins.Attributes)
-                            EmitEntityPdf(cs, att, tr, t.Scale, insAci, insDash, insPat, childLtMul, insLayerAci);
+                            EmitEntityPdf(cs, att, tr, tr?.Scale ?? 1.0, insAci, insDash, insPat, childLtMul, insLayerAci);
                 }
                 break;
 
@@ -370,10 +372,33 @@ internal partial class ImageEngine
 
             case Mesh mesh:
                 {
-                    // 3D 网格：渲染边线框
+                    // 3D 网格（现代 MESH）：等轴测 3D 着色实体渲染（Bug4 DOME）
+                    // 有面 → 等轴测投影 + 背面剔除 + 法线灰度着色 + 画家算法排序 + 可见边实线/隐藏边虚线
+                    // 无面 → 退化为顶视线框（与 SVG/PNG 端 MeshIsoRender 共用核心）
                     double w = StrokeWidth(ent, scaleMul);
-                    if (mesh.Edges != null && mesh.Vertices != null && mesh.Vertices.Count > 0)
+                    var isoRes = MeshIsoRender(mesh);
+                    if (isoRes.Faces.Count > 0)
                     {
+                        // 先画面（远→近，画家算法），再画边
+                        for (int fi = 0; fi < isoRes.Faces.Count; fi++)
+                        {
+                            int g = isoRes.Grays[fi];
+                            PdfQuadFill(cs, $"#{g:X2}{g:X2}{g:X2}", isoRes.Faces[fi]);
+                        }
+                        double ew = Math.Max(0.4, w);
+                        var dv = new StringBuilder();
+                        foreach (var ed in isoRes.Vis)
+                            dv.Append(F(Sx(ed.X1)) + " " + F(Py(ed.Y1)) + " m " + F(Sx(ed.X2)) + " " + F(Py(ed.Y2)) + " l ");
+                        if (dv.Length > 0) PdfStroke(cs, "#000000", ew, null, dv + "S");
+                        double[] hidDash = { 1.2, 0.8 };
+                        var dh = new StringBuilder();
+                        foreach (var ed in isoRes.Hid)
+                            dh.Append(F(Sx(ed.X1)) + " " + F(Py(ed.Y1)) + " m " + F(Sx(ed.X2)) + " " + F(Py(ed.Y2)) + " l ");
+                        if (dh.Length > 0) PdfStroke(cs, "#666666", Math.Max(0.25, ew * 0.6), hidDash, dh + "S");
+                    }
+                    else if (mesh.Edges != null && mesh.Vertices != null && mesh.Vertices.Count > 0)
+                    {
+                        // 无面退化：顶视线框
                         var d = new StringBuilder();
                         foreach (var e in mesh.Edges)
                         {
@@ -957,10 +982,14 @@ internal partial class ImageEngine
     }
 
     // 解析 IMAGE/UNDERLAY 的相对文件路径（DWG 目录优先、绝对路径、仅文件名兜底）。
+    // _srcDir 惰性初始化：三引擎（SVG/PNG/PDF）共用本方法，此前仅 WritePdf 设置 _srcDir，
+    // 导致 SVG/PNG 先于 PDF 渲染时 IMAGE 相对路径只按 cwd 解析而"文件缺失"（2026-10-24 修复）。
     private string ResolveAssetPath(string rel)
     {
         if (string.IsNullOrEmpty(rel)) return null;
         if (Path.IsPathRooted(rel) && File.Exists(rel)) return rel;
+        if (_srcDir == null && !string.IsNullOrEmpty(SourceFilePath))
+            _srcDir = Path.GetDirectoryName(Path.GetFullPath(SourceFilePath));
         var cands = new List<string>();
         if (_srcDir != null)
         {
@@ -1515,9 +1544,9 @@ internal partial class ImageEngine
         // 中心图形
         switch (shape)
         {
-            case 0: // 点：小实心圆（随框半径适度缩放）
+            case 0: // 点：固定小实心圆（2026-10-24 用户 bug1：中间点不随缩放/点大小变化，仅外框随点渲染比例缩放）
             {
-                double pr = Math.Max(Math.Abs(w), r * 0.15);
+                double pr = CenterDotRadius;
                 var d = new StringBuilder();
                 AppendCircleBezier(d, scx, scy, pr);
                 CsAscii(cs, rgb + " rg\n" + rgb + " RG\n" + F(Math.Min(pr * 0.3, Math.Abs(w))) + " w\n" + d + "f\n");

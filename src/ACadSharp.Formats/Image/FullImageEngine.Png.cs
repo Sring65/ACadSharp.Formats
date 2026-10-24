@@ -117,9 +117,6 @@ internal partial class ImageEngine
     private long _insDrawContentMs = 0;               // DrawInsertContent 总耗时（直渲+离屏各算一次）
     private long _insDrawContentCalls = 0;            // DrawInsertContent 调用次数
     private long _insDirectDrawMs = 0;                // 空 AABB 直渲路径（DrawInsertContent 含）总耗时
-    // —— 临时诊断：采样【空 AABB 建筑块】的子实体结构，定位 EntityLocalPoints 为何取不到点 ——
-    private int _insEmptyDiagBudget = 120;
-    private readonly HashSet<string> _insEmptyDiagDumped = new(StringComparer.Ordinal);
 
     // —— LwPolyline 子路径细分计时（定位 16s 瓶颈在哪个分支）—— 单位 ms（TickCount64 差值）
     private long _lwComplexMs = 0, _lwComplexCnt = 0;  // 复杂线型 TryEmitComplexPng 命中
@@ -791,10 +788,30 @@ internal partial class ImageEngine
 
             case Mesh mesh:
                 {
-                    // 3D 网格：渲染边线框
+                    // 3D 网格：等轴测 3D 着色实体渲染（Bug4 DOME）
                     string col = ColorOf(EntityAciIndex(ent), layerAci, byBlockAci);
                     double w = StrokeWidth(ent, scaleMul);
-                    if (mesh.Edges != null && mesh.Vertices != null && mesh.Vertices.Count > 0)
+                    var isoRes = MeshIsoRender(mesh);
+                    if (isoRes.Faces.Count > 0)
+                    {
+                        // 先画面（远→近，画家算法）
+                        for (int fi = 0; fi < isoRes.Faces.Count; fi++)
+                        {
+                            int g = isoRes.Grays[fi];
+                            var contour = new List<RasterCanvas.P>(isoRes.Faces[fi].Count);
+                            foreach (var p in isoRes.Faces[fi])
+                                contour.Add(new RasterCanvas.P((float)PngSx(p.X), (float)PngSy(p.Y)));
+                            _rc.Fill(new List<List<RasterCanvas.P>> { contour }, false, new RasterCanvas.Rgb((byte)g, (byte)g, (byte)g));
+                        }
+                        // 可见边实线
+                        foreach (var ed in isoRes.Vis)
+                            StrokePts(new List<(double X, double Y)> { (ed.X1, ed.Y1), (ed.X2, ed.Y2) }, false, "#000000", Math.Max(0.4, w), null);
+                        // 隐藏边虚线
+                        double[] hidDash = { 1.2, 0.8 };
+                        foreach (var ed in isoRes.Hid)
+                            StrokePts(new List<(double X, double Y)> { (ed.X1, ed.Y1), (ed.X2, ed.Y2) }, false, "#666666", Math.Max(0.25, w * 0.6), hidDash);
+                    }
+                    else if (mesh.Edges != null && mesh.Vertices != null && mesh.Vertices.Count > 0)
                         foreach (var e in mesh.Edges)
                         {
                             if (e.Start < 0 || e.End < 0 || e.Start >= mesh.Vertices.Count || e.End >= mesh.Vertices.Count) continue;
@@ -938,7 +955,7 @@ internal partial class ImageEngine
                         double k = PngK;
                         double r = PointGlyphRadius();
                         double wPx = Math.Max(lw * k, 1.0);
-                        double ext = 2.0 * r + 0.5 * wPx / k + 1.0 / k; // 加号/X 半伸出 2r + 线宽半宽 + 1px 余量（数据单位）
+                        double ext = Math.Max(2.0 * r, CenterDotRadius) + 0.5 * wPx / k + 1.0 / k; // 加号/X 半伸出 2r 或固定点径(取大) + 线宽半宽 + 1px 余量（数据单位）
                         string key = "P" + _pdMode + "|" + r.ToString("R") + "|" + wPx.ToString("R")
                             + "|" + col.R + "," + col.G + "," + col.B
                             + "|" + (_transparentBg ? 1 : 0) + (_whiteBg ? 1 : 0);
@@ -1285,9 +1302,9 @@ internal partial class ImageEngine
         // 中心图形
         switch (shape)
         {
-            case 0: // 点：小实心圆（随框半径适度缩放）
+            case 0: // 点：固定小实心圆（2026-10-24 用户 bug1：中间点不随缩放/点大小变化，仅外框随点渲染比例缩放）
             {
-                float rad = (float)Math.Max(w, r * k * 0.15);
+                float rad = Math.Max(1.0f, (float)(CenterDotRadius * k));   // 固定数据单位 → 像素，保底 1px
                 // 背景色光晕环（透明背景无底色，跳过，避免在透明上出现一圈边）
                 if (!_transparentBg)
                     _rc.FillDisc(fx, fy, rad + Math.Max(0.5f, rad * 0.3f), _whiteBg ? RasterCanvas.Rgb.White : RasterCanvas.Rgb.Black);
@@ -1440,7 +1457,7 @@ internal partial class ImageEngine
                     return;
                 }
                 // 空 AABB（几何无定界）：几何直渲 + 属性直渲
-                if (PerfOn) { _insEmptyAabbCalls++; _insAttribGeoDirect++; DiagEmptyAabbBlock(ins); }
+                if (PerfOn) { _insEmptyAabbCalls++; _insAttribGeoDirect++; }
                 DrawInsertGeometry(ins, tr, insAci, insDash, insPat, childLtMul, insLayerAci);
                 DrawInsertAttribs(ins, tr, insAci, insDash, insPat, childLtMul, insLayerAci);
                 return;
@@ -1540,37 +1557,6 @@ internal partial class ImageEngine
         return false;
     }
 
-    // 临时诊断：采样空 AABB 建筑块子实体结构，定位 EntityLocalPoints 为何取不到点。
-    // 按块名去重，预算内逐块打印：块名/子实体数/各子类型/首个子实体坐标与顶点数。
-    private void DiagEmptyAabbBlock(Insert ins)
-    {
-        if (_insEmptyDiagBudget-- <= 0) return;
-        var br = ins.Block;
-        if (br == null || !_insEmptyDiagDumped.Add(br.Name)) return;
-        bool aabbOk = EntityWorldAabb(ins, out double ax0, out double ay0, out double ax1, out double ay1);
-        var ents = br.Entities;
-        int n = ents?.Count ?? 0;
-        var sbd = new System.Text.StringBuilder();
-        sbd.Append($"[diag] 空AABB块 {br.Name}: 子实体数={n} EntityWorldAabb(ins)={aabbOk}");
-        if (aabbOk) sbd.Append($" [{ax0:F1},{ay0:F1}]~[{ax1:F1},{ay1:F1}]");
-        int shown = 0;
-        if (ents != null)
-            foreach (var e in ents)
-            {
-                if (shown++ >= 6) { sbd.Append(" …"); break; }
-                string first = (e is Point) ? "Point" : (e is Line) ? "Line" : (e is LwPolyline) ? "LwPolyline"
-                    : (e is Polyline3D) ? "Polyline3D" : (e is Polyline2D) ? "Polyline2D" : (e is MLine) ? "MLine"
-                    : (e is Mesh) ? "Mesh" : (e is PolyfaceMesh) ? "PolyfaceMesh" : (e is PolygonMesh) ? "PolygonMesh"
-                    : (e is Wipeout) ? "Wipeout" : (e is Face3D) ? "Face3D" : (e is RasterImage) ? "RasterImage"
-                    : (e is Circle) ? "Circle" : (e is Arc) ? "Arc" : (e is Ellipse) ? "Ellipse"
-                    : (e is TextEntity) ? "TextEntity" : (e is MText) ? "MText" : (e is Solid) ? "Solid"
-                    : (e is Spline) ? "Spline" : (e is Hatch) ? "Hatch" : "???";
-                var pts = EntityLocalPoints(e).ToList();
-                sbd.Append($" | {e.GetType().FullName} firstMatch={first} 点{pts.Count}");
-            }
-        _log(sbd.ToString());
-    }
-
     // 仅画【几何】（块子实体）：无属性 → 含 ATTDEF 模板默认值（全内容，|full 签名）；
     // 有属性 → 跳过 ATTDEF 模板默认值（改由 DrawInsertAttribs 画真实值，|geo 签名）。
     // 几何位置无关（相对插入点固定）→ 可进内容签名精灵缓存。
@@ -1584,13 +1570,14 @@ internal partial class ImageEngine
         }
     }
 
-    // 仅画【属性文字】（ins.Attributes，世界坐标，值随插入不同）：受父累积变换 parent（顶层=null），不套本 tr。
-    // 位置与值均随每个插入变化 → 不进缓存，逐次直渲。
+    // 仅画【属性文字】（ins.Attributes，世界坐标，值随插入不同）：顶层直渲，位置=世界坐标（变换=null）。
+    // 字高=世界字高：AutoCAD 存档时已把字高预乘插入比例，不再乘 tr.Scale（否则 gc200 scale=10 时
+    // "3.94" 字高 20 被双重缩放开成 200；GT AutoCAD 实测按 20 渲染）。位置与值均随每个插入变化 → 不进缓存。
     private void DrawInsertAttribs(Insert ins, Transform2D tr, short insAci, double[] insDash, LtpPattern insPat, double childLtMul, short insLayerAci)
     {
         if (ins.Attributes == null) return;
         foreach (var att in ins.Attributes)
-            EmitEntityPng(att, null, tr.Scale, insAci, insDash, insPat, childLtMul, insLayerAci);
+            EmitEntityPng(att, null, 1.0, insAci, insDash, insPat, childLtMul, insLayerAci);
     }
 
     // 展开 Insert 块子实体（原 Core 主体）。ATTDEF 只在【无】实际属性值时画（模板默认值）；
@@ -1604,8 +1591,10 @@ internal partial class ImageEngine
             EmitEntityPng(e, tr, tr.Scale, insAci, insDash, insPat, childLtMul, insLayerAci);
         }
         if (hasAttribs)
+            // ATTRIB 字高（组40）与位置（组10）同一坐标系（AutoCAD 已预乘插入比例）：按位置所用变换 parent 缩放，
+            // 不乘本 INSERT 全变换 tr 的 tr.Scale（双重缩放；见 DrawInsertAttribs 注释）。
             foreach (var att in ins.Attributes)
-                EmitEntityPng(att, parent, tr.Scale, insAci, insDash, insPat, childLtMul, insLayerAci);
+                EmitEntityPng(att, parent, parent?.Scale ?? 1.0, insAci, insDash, insPat, childLtMul, insLayerAci);
     }
 
     // Insert 内容签名精灵渲染：命中→blit；未命中→离屏光栅化一次（临时重定位使插入点→(Bx,By)，与 TryEmitSprite 同机制）后 blit。

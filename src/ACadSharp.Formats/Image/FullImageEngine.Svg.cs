@@ -62,6 +62,7 @@ internal partial class ImageEngine
             _pdSize = doc.Header.PointDisplaySize;
         }
         catch { _pdMode = 0; _pdSize = 0.0; }
+
     }
 
     #region ===== 颜色：AutoCAD 标准 ACI 调色板 =====
@@ -1340,35 +1341,52 @@ internal partial class ImageEngine
         return result;
     }
 
-    // PolyfaceMesh 线框（三引擎共享）：旧式 3D 多面体网格。每个 Face（VertexFaceRecord.Index1-4，
-    // 1-based，0=无效）把有效顶点索引连成一条线串；3 点成三角、4 点成四边形。
-    // 顶点（VertexFaceMesh.Location）经 tr 世界化，返回世界系线段列表 (a, b)。
+    // PolyfaceMesh 线框（三引擎共享）：旧式 3D 多面体网格。按 DXF POLYFACE_MESH 面引用语义：
+    //   • Index1-4 为 1-based 顶点引用，0 = 面结束（其后引用忽略）；
+    //   • 负引用 = 该顶点仍参与成面，但【该顶点到下一顶点】的边不显示（抑制出边）；
+    //   • 面是闭合多边形（末点回首点），三角 3 边、四边形 4 边；
+    //   • 全局按无向边去重（相邻面共享边只画一次），避免双线/重叠。
+    // 顶点（VertexFaceMesh.Location）取 X/Y（丢弃 Z，投影到当前显示平面）经 tr 世界化，
+    // 返回世界系线段列表 (a, b)。
     private static List<((double AX, double AY), (double BX, double BY))> PolyfaceMeshWire(PolyfaceMesh pf, Transform2D tr)
     {
         var segs = new List<((double AX, double AY), (double BX, double BY))>();
         var verts = pf?.Vertices;
         var faces = pf?.Faces;
         if (verts == null || verts.Count == 0 || faces == null) return segs;
-        // 顶点世界化（Location 为 XYZ）
+        // 顶点投影到显示平面（X/Y，Z 丢弃）并世界化
         var wp = new (double X, double Y)[verts.Count];
         for (int i = 0; i < verts.Count; i++)
         {
             var p = tr == null ? (verts[i].Location.X, verts[i].Location.Y) : tr.Apply(verts[i].Location.X, verts[i].Location.Y);
             wp[i] = p;
         }
+        // 全局无向边去重（key = 较小索引 <<32 | 较大索引）
+        var drawn = new HashSet<long>();
         foreach (var f in faces)
         {
             short[] idx = { f.Index1, f.Index2, f.Index3, f.Index4 };
-            var valid = new List<(double X, double Y)>();
-            foreach (var ix in idx)
+            var fverts = new List<int>();   // 0-based 顶点索引（按面内顺序）
+            var sup = new List<bool>();     // 该顶点出边（指向下一顶点，末点回首点）是否被抑制
+            foreach (var r in idx)
             {
-                int i0 = ix - 1;
-                if (i0 < 0 || i0 >= wp.Length) continue; // 0 或越界 → 无效索引
-                valid.Add(wp[i0]);
+                if (r == 0) break;                                  // 0 = 面结束
+                int vi = (int)(r < 0 ? -r : r) - 1;                 // 1-based → 0-based
+                if (vi < 0 || vi >= wp.Length) continue;            // 越界引用 → 跳过该引用
+                fverts.Add(vi);
+                sup.Add(r < 0);                                     // 负引用 = 抑制出边
             }
-            // 依次连线（首尾不重复闭合；三角 3 点、四边形 4 点）
-            for (int k = 1; k < valid.Count; k++)
-                segs.Add(((valid[k - 1].X, valid[k - 1].Y), (valid[k].X, valid[k].Y)));
+            int n = fverts.Count;
+            if (n < 3) continue;                                    // 少于 3 顶点不成面
+            for (int i = 0; i < n; i++)
+            {
+                if (sup[i]) continue;                               // 该出边被抑制
+                int a = fverts[i], b = fverts[(i + 1) % n];         // 闭合：末点回首点
+                if (a == b) continue;
+                long key = a < b ? ((long)a << 32) | (uint)b : ((long)b << 32) | (uint)a;
+                if (!drawn.Add(key)) continue;                      // 共享边去重
+                segs.Add(((wp[a].X, wp[a].Y), (wp[b].X, wp[b].Y)));
+            }
         }
         return segs;
     }
@@ -2200,6 +2218,34 @@ internal partial class ImageEngine
                 expand(wx, wy);
             }
         }
+        // 【属性文字范围】顶层 INSERT 的 ATTRIB（ins.Attributes）为世界坐标（parent=null，
+        // AutoCAD 存档时已把块定义 ATDEF 的位置/字高预乘插入比例），不套本 INSERT 的 tr。
+        // 直接按字高估算文字盒扩展范围——否则插入块属性（如 Drawing2 的 "3.94"，位于圆圈上方
+        // ~16 单位处）被裁出画布，出图只见块几何、不见属性文字。
+        // 升档两处（针对 SHX 字体，如 rs.shx）：
+        //   ① asc 取 1.05H——SHX 帽高=H（scale=H/Above，数字帽高恰为 H），TextMetrics 的 0.85H
+        //      会裁掉 SHX 字形顶部（"3.94" 数字上缘恰在基线+H）。
+        //   ② 宽度取 max(估算, 0.9em/字)——EstimateTextWidth 的 0.55em/字 对 SHX 偏窄
+        //      （rs.shx 数字实测 ~0.79em/字@wf=1），纯估算会裁掉右端字符（如 "3.94" 的 "4"）。
+        if (ins.Attributes != null)
+            foreach (var att in ins.Attributes)
+            {
+                double aH = att.Height > 0 ? att.Height : 1.0;
+                double aWf = att.WidthFactor > 0 ? att.WidthFactor : 1.0;
+                int aLen = (att.Value ?? "").Length;
+                double aW = Math.Max(EstimateTextWidth(att.Value ?? "", aH) * aWf, 0.9 * aLen * aH * aWf);
+                aW = Math.Max(aW, aH);
+                double asc = 1.05 * aH, desc = 0.35 * aH;
+                // 基线左对齐盒（渲染端以 InsertPoint 为基线左端点、文字向右延伸，实测 Drawing2
+                // "3.94" 左缘恰在 InsertPoint）：局部 4 角 (0,-desc)/(aW,-desc)/(aW,asc)/(0,asc)
+                // 绕 (cx,cy) 旋转 att.Rotation 后逐点扩展。居中海箱会向 InsertPoint 左侧空扩
+                // 半个字宽（Drawing2 左侧多出 ~52 单位空白）。
+                double ar = att.Rotation, cc = Math.Cos(ar), ss = Math.Sin(ar);
+                double cx = att.InsertPoint.X, cy = att.InsertPoint.Y;
+                double[] ox = { 0, aW, aW, 0 }, oy = { -desc, -desc, asc, asc };
+                for (int i = 0; i < 4; i++)
+                    expand(cx + ox[i] * cc - oy[i] * ss, cy + ox[i] * ss + oy[i] * cc);
+            }
     }
 
     private void ExpandInsertTransformed(Insert nested, double ca, double sa, double sx, double sy, double px, double py, Action<double, double> expand)
@@ -2218,24 +2264,48 @@ internal partial class ImageEngine
                 expand(bx + lx * nca - ly * nsa, by + lx * nsa + ly * nca);
             }
         }
+        // 【属性文字范围】嵌套 INSERT 的 ATTRIB 位于父块（本 INSERT 的 Block）局部坐标
+        // （渲染端以 parent=父变换 直渲），按父变换（ca/sa/sx/sy/px/py）变换到世界再扩展范围，
+        // 不套嵌套自身变换；升档规则同顶层（SHX 帽高=H、每字 ≥0.9em）。
+        if (nested.Attributes != null)
+            foreach (var att in nested.Attributes)
+            {
+                double aH = att.Height > 0 ? att.Height : 1.0;
+                double aWf = att.WidthFactor > 0 ? att.WidthFactor : 1.0;
+                int aLen = (att.Value ?? "").Length;
+                double aW = Math.Max(EstimateTextWidth(att.Value ?? "", aH) * aWf, 0.9 * aLen * aH * aWf);
+                aW = Math.Max(aW, aH);
+                double asc = 1.05 * aH, desc = 0.35 * aH;
+                double ar = att.Rotation, cc = Math.Cos(ar), ss = Math.Sin(ar);
+                double[] ox = { 0, aW, aW, 0 }, oy = { -desc, -desc, asc, asc };
+                for (int i = 0; i < 4; i++)
+                {
+                    // 局部旋转 → 父块局部坐标 → 套父变换（sx,sy,ca,sa,px,py）到世界
+                    double rx = ox[i] * cc - oy[i] * ss, ry = ox[i] * ss + oy[i] * cc;
+                    double lx = (att.InsertPoint.X + rx) * sx, ly = (att.InsertPoint.Y + ry) * sy;
+                    expand(px + lx * ca - ly * sa, py + lx * sa + ly * ca);
+                }
+            }
     }
 
     // 取实体在局部坐标系下的关键点（用于范围/插入展开；MText 走真实排版占位，须为实例方法）
     private IEnumerable<XY> EntityLocalPoints(Entity e)
     {
-        if (e is Point pt) yield return new XY(pt.Location.X, pt.Location.Y);
+        if (e is Point pt) { yield return new XY(pt.Location.X, pt.Location.Y); }
         else if (e is Line ln) { yield return new XY(ln.StartPoint.X, ln.StartPoint.Y); yield return new XY(ln.EndPoint.X, ln.EndPoint.Y); }
-        else if (e is LwPolyline p2) foreach (var v in p2.Vertices) yield return new XY(v.Location.X, v.Location.Y);
-        else if (e is Polyline3D p3) foreach (var v in p3.Vertices) if (IsDisplayVertex(v)) yield return new XY(v.Location.X, v.Location.Y);
+        // ⚠️ LwPolyline 须用 bulge 感知采样（LwPolylineSamplePoints），与 EntityWorldAabb 一致：
+        // 仅取顶点会漏掉 bulge 弧（弧伸出顶点 AABB 之外）→ Insert 内容范围偏小 → 精灵画布裁掉 bulge 弧（Bug2）。
+        else if (e is LwPolyline p2) { foreach (var p in LwPolylineSamplePoints(p2, null)) yield return new XY(p.X, p.Y); }
+        else if (e is Polyline3D p3) { foreach (var v in p3.Vertices) if (IsDisplayVertex(v)) yield return new XY(v.Location.X, v.Location.Y); }
         // ⚠️ 以下类型此前遗漏 → ExpandInsert 取不到点 → Insert 内容 AABB 为空 → 走直渲（Insert 60s 瓶颈真根因）。
         // 建筑平面图块大量用闭合 Polyline2D（带宽度）/MLine/面域，须与 EntityWorldAabb 覆盖一致（含其 IsDisplayVertex 守卫）。
         // 循环变量名须唯一（if-else 链内 pattern var 与 foreach var 共享作用域，重名触发 CS0136）。
-        else if (e is Polyline2D p2d) foreach (var vp2d in p2d.Vertices) if (IsDisplayVertex(vp2d)) yield return new XY(vp2d.Location.X, vp2d.Location.Y);
-        else if (e is MLine ml) foreach (var mli in MLineElements(ml, null)) foreach (var mlp in mli.Center) yield return new XY(mlp.X, mlp.Y);
-        else if (e is Mesh me) if (me.Vertices != null) foreach (var vmesh in me.Vertices) yield return new XY(vmesh.X, vmesh.Y);
-        else if (e is PolyfaceMesh pf) if (pf.Vertices != null) foreach (var vpf in pf.Vertices) yield return new XY(vpf.Location.X, vpf.Location.Y);
-        else if (e is PolygonMesh pm) if (pm.Vertices != null) foreach (var vpm in pm.Vertices) yield return new XY(vpm.Location.X, vpm.Location.Y);
-        else if (e is Wipeout wo) foreach (var wop in WipeoutWorldPoly(wo, null)) yield return new XY(wop.X, wop.Y);
+        else if (e is Polyline2D p2d) { foreach (var vp2d in p2d.Vertices) if (IsDisplayVertex(vp2d)) yield return new XY(vp2d.Location.X, vp2d.Location.Y); }
+        else if (e is MLine ml) { foreach (var mli in MLineElements(ml, null)) foreach (var mlp in mli.Center) yield return new XY(mlp.X, mlp.Y); }
+        else if (e is Mesh me) { if (me.Vertices != null) foreach (var vmesh in me.Vertices) yield return new XY(vmesh.X, vmesh.Y); }
+        else if (e is PolyfaceMesh pf) { if (pf.Vertices != null) foreach (var vpf in pf.Vertices) yield return new XY(vpf.Location.X, vpf.Location.Y); }
+        else if (e is PolygonMesh pm) { if (pm.Vertices != null) foreach (var vpm in pm.Vertices) yield return new XY(vpm.Location.X, vpm.Location.Y); }
+        else if (e is Wipeout wo) { foreach (var wop in WipeoutWorldPoly(wo, null)) yield return new XY(wop.X, wop.Y); }
         else if (e is Face3D f3d)
         {
             yield return new XY(f3d.FirstCorner.X, f3d.FirstCorner.Y);
@@ -2262,10 +2332,10 @@ internal partial class ImageEngine
             yield return new XY(so.FourthCorner.X, so.FourthCorner.Y);
         }
         else if (e is Spline sp2)
-            foreach (var p in SplineSample(sp2, null, 4)) yield return new XY(p.X, p.Y);
+            { foreach (var p in SplineSample(sp2, null, 4)) yield return new XY(p.X, p.Y); }
         else if (e is Hatch ht2)
-            foreach (var loop in BuildHatchLoops(ht2, null))
-                foreach (var p in loop) yield return new XY(p.X, p.Y);
+            { foreach (var loop in BuildHatchLoops(ht2, null))
+                foreach (var p in loop) yield return new XY(p.X, p.Y); }
     }
 
     #endregion
@@ -2417,10 +2487,28 @@ internal partial class ImageEngine
 
             case Mesh mesh:
                 {
-                    // 3D 网格（现代 MESH）：渲染边线框（Edges 逐边画线段），与 AutoCAD 线框显示一致
+                    // 3D 网格（现代 MESH）：等轴测 3D 着色实体渲染（Bug4 DOME）
+                    // 有面 → 等轴测投影 + 背面剔除 + 法线灰度着色 + 画家算法排序 + 可见边实线/隐藏边虚线
+                    // 无面 → 退化为顶视线框
                     string col = ColorOf(EntityAciIndex(ent), layerAci, byBlockAci);
                     double w = StrokeWidth(ent, scaleMul);
-                    if (mesh.Edges != null && mesh.Vertices != null && mesh.Vertices.Count > 0)
+                    var isoRes = MeshIsoRender(mesh);
+                    if (isoRes.Faces.Count > 0)
+                    {
+                        // 先画面（远→近，画家算法），再画边
+                        for (int fi = 0; fi < isoRes.Faces.Count; fi++)
+                        {
+                            int g = isoRes.Grays[fi];
+                            EmitQuadFill(sb, isoRes.Faces[fi], $"rgb({g},{g},{g})");
+                        }
+                        double ew = Math.Max(0.4, w);
+                        foreach (var ed in isoRes.Vis)
+                            EmitLine(sb, ed.X1, ed.Y1, ed.X2, ed.Y2, "#000000", ew, null);
+                        double[] hidDash = { 1.2, 0.8 };
+                        foreach (var ed in isoRes.Hid)
+                            EmitLine(sb, ed.X1, ed.Y1, ed.X2, ed.Y2, "#666666", Math.Max(0.25, ew * 0.6), hidDash);
+                    }
+                    else if (mesh.Edges != null && mesh.Vertices != null && mesh.Vertices.Count > 0)
                     {
                         foreach (var e in mesh.Edges)
                         {
@@ -2942,11 +3030,15 @@ internal partial class ImageEngine
             if (hasAttribs && e is AttributeDefinition) continue; // 有实际属性值 → 跳过模板默认值
             EmitEntitySvg(sb, e, tr, tr.Scale, insAci, insDash, insPat, childLtMul, insLayerAci);
         }
-        // 属性实际值（ATTRIB）：DXF 中其 InsertPoint 已是世界坐标（= INSERT 插入点 + 块变换），
-        // 故只受父层累积变换（parent），不再套本 INSERT 的 tr（否则平移/缩放会叠加两次）；字高仍随块缩放（tr.Scale）。
+        // 属性实际值（ATTRIB）：DXF 中其 InsertPoint（组10）与 Height（组40）在同一坐标系——
+        // 顶层插入=世界坐标（AutoCAD 存档时已把块定义 ATDEF 的位置/字高预乘插入比例），嵌套=父块局部坐标。
+        // 故位置只受父层累积变换（parent），字高也按该同一变换缩放（parent.Scale），不再乘本 INSERT 的 tr：
+        // tr 含本块插入比例，会把已含插入比例的字高再放大一次（双重缩放）。
+        // 治 sample.dwg gc200（scale=10）属性 "3.94"：字高 20 曾被双重缩放开成 200；
+        // GT AutoCAD 暗色截图实测按 20 渲染（"3.94" 字形 ≈15px @0.8px/u ≈ 18.75≈20 数据单位）。
         if (hasAttribs)
             foreach (var att in ins.Attributes)
-                EmitEntitySvg(sb, att, parent, tr.Scale, insAci, insDash, insPat, childLtMul, insLayerAci);
+                EmitEntitySvg(sb, att, parent, parent?.Scale ?? 1.0, insAci, insDash, insPat, childLtMul, insLayerAci);
     }
 
     // 按 TEXT 对齐方式（DXF 72/73 组码）计算基线起点、旋转与缩放。
@@ -3323,7 +3415,11 @@ internal partial class ImageEngine
         if (string.IsNullOrEmpty(probe) || !File.Exists(probe)) return false; // 无对应 .shx 文件 → TTF
         var lat = GetShapeFont(fname); // 已确认能解析到 .shx，直接加载（按文件名缓存）
         if (lat == null) return false;
-        if (lat.Format != ShxFormat.Unifont && lat.Format != ShxFormat.BigFont) return false;
+        // Unifont/BigFont 是常规文字面；Shapes 容器若带 shape-0 字体定义（"形状外衣的文字面"，如 rs.shx）也接受
+        // （IsTextFont 由 LoadShapes 判定），其字形按字符码=形状号直接查表，advance/缩放路径与 unifont 一致。
+        bool latOk = lat.Format == ShxFormat.Unifont || lat.Format == ShxFormat.BigFont
+            || (lat.Format == ShxFormat.Shapes && lat.IsTextFont);
+        if (!latOk) return false;
         latin = lat;
         if (!string.IsNullOrWhiteSpace(bfname))
         {
@@ -3517,7 +3613,9 @@ internal partial class ImageEngine
         if (string.IsNullOrEmpty(probe) || !File.Exists(probe)) return false;
         var lat = GetShapeFont(fontName);
         if (lat == null) return false;
-        if (lat.Format != ShxFormat.Unifont && lat.Format != ShxFormat.BigFont) return false;
+        bool latOk = lat.Format == ShxFormat.Unifont || lat.Format == ShxFormat.BigFont
+            || (lat.Format == ShxFormat.Shapes && lat.IsTextFont);
+        if (!latOk) return false;
         latin = lat;
         if (!string.IsNullOrWhiteSpace(bigFontName))
         {
@@ -4285,7 +4383,8 @@ internal partial class ImageEngine
         //   —— em 盒(Above+Below) + 一个下降部(Below)作行间固定间隙；simplex=(21+14)/21=1.6667。
         //   bigfont/shapes 无有效 above/below 文本度量 → 回落文档统一常数 1.66。
         var shx = GetShapeFont(font);
-        if (shx != null && shx.Format == ShxFormat.Unifont && shx.Above > 0)
+        if (shx != null && shx.Above > 0
+            && (shx.Format == ShxFormat.Unifont || (shx.Format == ShxFormat.Shapes && shx.IsTextFont)))
         {
             double nat = (double)(shx.Above + 2 * shx.Below) / shx.Above;
             if (nat > 0.5 && nat < 4.0) return nat;
@@ -4430,28 +4529,6 @@ internal partial class ImageEngine
             FlushCur();
         }
         FinishMTextLayout(result);
-        if (System.Environment.GetEnvironmentVariable("GDB2CAD_WRAP") != null)
-        {
-            try
-            {
-                var sbd = new StringBuilder();
-                sbd.AppendLine("#refWidth=" + refWidth.ToString("F3") + "  styleFont=" + styleFont);
-                for (int i = 0; i < result.Lines.Count; i++)
-                {
-                    var ln = result.Lines[i];
-                    var parts = new List<string>();
-                    foreach (var rr in ln.Runs)
-                    {
-                        string fn = rr.Font ?? styleFont;
-                        string tag = rr.IsFraction ? ",FRAC" : "";
-                        parts.Add("\"" + rr.Text + "\"(H" + rr.Height.ToString("F2") + ",wf" + rr.WidthFactor.ToString("F2") + ",f:" + fn + tag + ")");
-                    }
-                    sbd.AppendLine("[L" + i + "] W=" + ln.Width.ToString("F2") + " indent=" + ln.FirstIndent.ToString("F2") + " | " + string.Join(" | ", parts));
-                }
-                System.IO.File.AppendAllText(@"C:\GDB2CAD_WRAP.txt", sbd.ToString() + "\r\n");
-            }
-            catch { }
-        }
         return result;
     }
 
@@ -4881,9 +4958,9 @@ internal partial class ImageEngine
         // 中心图形
         switch (shape)
         {
-            case 0: // 点：小实心圆（随框半径适度缩放）
+            case 0: // 点：固定小实心圆（2026-10-24 用户 bug1：中间点不随缩放/点大小变化，仅外框随点渲染比例缩放）
             {
-                double pr = Math.Max(Math.Abs(w), r * 0.15);
+                double pr = CenterDotRadius;
                 sb.AppendLine($"  <circle cx=\"{F(scx)}\" cy=\"{F(scy)}\" r=\"{F(pr)}\" fill=\"{color}\" stroke=\"{halo}\" stroke-width=\"{F(Math.Min(pr * 0.3, Math.Abs(w)))}\"/>");
                 break;
             }
@@ -4923,6 +5000,9 @@ internal partial class ImageEngine
     // 方框半宽/圆框半径 = 点大小值/2；加号/X 半伸出 = 点大小值；竖线总长 = 点大小值/2；点径 = 0.15×点大小值/2。
     // 依赖 _h（画布高度），须在 WriteSvg/WritePdf/WritePng 定稿 _h 之后调用。
     private const double PointGlyphScale = 0.5;   // 2026-10-17 用户：点样式整体缩小一半
+    // 2026-10-24 用户 bug1：中间点（PDMODE 位0=点）为固定小实心圆，不随点大小/缩放变化；
+    // 仅周围方框/圆框/+/X/竖线随点渲染比例（PointGlyphRadius）缩放。取 ≈GT(AutoCAD) 点径（数据单位）。
+    private const double CenterDotRadius = 1.5;   // 点中心实心圆固定半径（数据单位）
     private double PointGlyphRadius()
     {
         double viewH = _h;
@@ -5022,6 +5102,128 @@ internal partial class ImageEngine
             d.Append($"{(i == 0 ? "" : "L")}{F(Sx(pts[i].X))},{F(Sy(pts[i].Y))}");
         d.Append("Z");
         sb.AppendLine($"  <path d=\"{d}\" fill=\"{color}\" stroke=\"{color}\" stroke-width=\"0.15\"/>");
+    }
+
+    // 等轴测 3D 网格渲染（Bug4 DOME）：把 (x,y,z) 投影到等轴测 2D（世界坐标，y 向上），
+    // 背面剔除 + 法线光照灰度着色 + 画家算法深度排序；邻接≥1可见面的边=实线，其余=虚线。
+    // 返回 (面多边形[远→近], 每面灰度, 可见边, 隐藏边)；所有坐标为等轴测世界坐标（y 向上）。
+    private static (List<List<(double X,double Y)>> Faces, List<byte> Grays,
+                     List<(double X1,double Y1,double X2,double Y2)> Vis,
+                     List<(double X1,double Y1,double X2,double Y2)> Hid)
+        MeshIsoRender(Mesh mesh)
+    {
+        var eFaces = new List<List<(double X,double Y)>>();
+        var eGrays = new List<byte>();
+        var eVis = new List<(double X1,double Y1,double X2,double Y2)>();
+        var eHid = new List<(double X1,double Y1,double X2,double Y2)>();
+        if (mesh == null) return (eFaces, eGrays, eVis, eHid);
+        var vs = mesh.Vertices;
+        var fs = mesh.Faces;
+        if (vs == null || vs.Count < 3) return (eFaces, eGrays, eVis, eHid);
+
+        // 1) (x,y) 质心，作为等轴测投影锚点（保持 DOME 位于其顶视中心）
+        double cx = 0, cy = 0;
+        foreach (var v in vs) { cx += v.X; cy += v.Y; }
+        cx /= vs.Count; cy /= vs.Count;
+
+        // 2) 等轴测投影：iso_x = cx + 0.866*(dx-dy);  iso_y = cy + 0.5*(dx+dy) + dz
+        const double C30 = 0.8660254037844386;
+        var iso = new (double X, double Y)[vs.Count];
+        for (int i = 0; i < vs.Count; i++)
+        {
+            double dx = vs[i].X - cx, dy = vs[i].Y - cy, dz = vs[i].Z;
+            iso[i] = (cx + C30 * (dx - dy), cy + 0.5 * (dx + dy) + dz);
+        }
+
+        // 光照方向（顶偏左）：使 顶面最亮、左面中等、右面最暗
+        double Lx = -0.75, Ly = -0.35, Lz = 0.95;
+        double Ln = Math.Sqrt(Lx * Lx + Ly * Ly + Lz * Lz); Lx /= Ln; Ly /= Ln; Lz /= Ln;
+        const double Ambient = 0.35, Diffuse = 0.62;
+
+        // 视图方向（进入屏幕）= (1,1,-1)
+        var faces = new List<(List<(double X,double Y)> Pts, byte Gray, double Depth)>();
+        var faceVis = fs != null ? new bool[fs.Count] : new bool[0];
+
+        if (fs != null)
+        {
+            for (int fi = 0; fi < fs.Count; fi++)
+            {
+                var f = fs[fi];
+                if (f == null || f.Length < 3) continue;
+                var a = vs[f[0]];
+                var b = vs[f[1]];
+                var c = vs[f[2]];
+                double e1x = b.X - a.X, e1y = b.Y - a.Y, e1z = b.Z - a.Z;
+                double e2x = c.X - a.X, e2y = c.Y - a.Y, e2z = c.Z - a.Z;
+                double nx = e1y * e2z - e1z * e2y;
+                double ny = e1z * e2x - e1x * e2z;
+                double nz = e1x * e2y - e1y * e2x;
+                double nl = Math.Sqrt(nx * nx + ny * ny + nz * nz);
+                if (nl < 1e-9) continue;
+                nx /= nl; ny /= nl; nz /= nl;
+                // 朝相机（-视图方向）为可见：facing = nz - nx - ny
+                bool vis = (nz - nx - ny) > 1e-6;
+                faceVis[fi] = vis;
+                if (!vis) continue;
+                int n = f.Length;
+                double px = 0, py = 0, pz = 0;
+                for (int i = 0; i < n; i++) { var vv = vs[f[i]]; px += vv.X; py += vv.Y; pz += vv.Z; }
+                px /= n; py /= n; pz /= n;
+                double depth = (px + py - pz) / Math.Sqrt(3.0); // 进入屏幕深度（越大越远）
+                double lam = nx * Lx + ny * Ly + nz * Lz;
+                if (lam < 0) lam = 0;
+                int gray = (int)Math.Round((Ambient + Diffuse * lam) * 255);
+                if (gray < 0) gray = 0; if (gray > 255) gray = 255;
+                var pts = new List<(double X,double Y)>(n);
+                for (int i = 0; i < n; i++) pts.Add(iso[f[i]]);
+                faces.Add((pts, (byte)gray, depth));
+            }
+        }
+
+        // 3) 画家算法：远（depth 大）先画，近后画
+        faces.Sort((p, q) => q.Depth.CompareTo(p.Depth));
+
+        // 4) 边：邻接≥1 可见面 → 实线；否则虚线
+        var edgeFaces = new Dictionary<long, List<int>>();
+        if (fs != null)
+        {
+            for (int fi = 0; fi < fs.Count; fi++)
+            {
+                var f = fs[fi];
+                if (f == null || f.Length < 3) continue;
+                for (int i = 0; i < f.Length; i++)
+                {
+                    int u = f[i], w = f[(i + 1) % f.Length];
+                    long key = ((long)Math.Min(u, w) << 32) | (uint)Math.Max(u, w);
+                    if (!edgeFaces.TryGetValue(key, out var lst)) { lst = new List<int>(); edgeFaces[key] = lst; }
+                    lst.Add(fi);
+                }
+            }
+        }
+        var visEdges = new List<(double X1,double Y1,double X2,double Y2)>();
+        var hidEdges = new List<(double X1,double Y1,double X2,double Y2)>();
+        var es = mesh.Edges;
+        if (es != null)
+        {
+            foreach (var e in es)
+            {
+                int u = e.Start, w = e.End;
+                if (u < 0 || w < 0 || u >= vs.Count || w >= vs.Count) continue;
+                long key = ((long)Math.Min(u, w) << 32) | (uint)Math.Max(u, w);
+                bool solid = false;
+                if (edgeFaces.TryGetValue(key, out var fl))
+                    for (int k = 0; k < fl.Count; k++)
+                        if (fl[k] < faceVis.Length && faceVis[fl[k]]) { solid = true; break; }
+                var pa = iso[u];
+                var pb = iso[w];
+                (solid ? visEdges : hidEdges).Add((pa.X, pa.Y, pb.X, pb.Y));
+            }
+        }
+
+        var facePolys = new List<List<(double X,double Y)>>(faces.Count);
+        var grays = new List<byte>(faces.Count);
+        foreach (var fc in faces) { facePolys.Add(fc.Pts); grays.Add(fc.Gray); }
+        return (facePolys, grays, visEdges, hidEdges);
     }
     #endregion
 

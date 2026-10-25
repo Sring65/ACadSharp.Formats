@@ -483,7 +483,12 @@ internal sealed class RasterCanvas
 
     /// <summary>把解码后的 RGBA 位图按任意平行四边形绘制到画布（仿射贴图 + 双线性采样）。
     /// 顶点语义（画布像素系）：p0=左下(a0)、p10=右下(a10)、p01=左上(a01)；
-    /// 图像像素 (0,0)=左上 → p01，(IW,0)=右上 → p10，(0,IH)=左下 → p0（与 CAD 光栅图朝向一致）。</summary>
+    /// 图像像素 (0,0)=左上 → p01，(IW,0)=右上 → p10，(0,IH)=左下 → p0（与 CAD 光栅图朝向一致）。
+    /// 采样语义（2026-10-26 修复，与浏览器 &lt;image&gt;/PDF XObject 一致）：图像铺满整个平行四边形区域
+    /// [0,IW]×[0,IH]，每个像素占一个单元 [i,i+1)×[j,j+1)、值在单元中心 (i+0.5,j+0.5)，
+    /// 在画布像素中心 (dx+0.5,dy+0.5) 处做单元中心双线性、边缘钳位。
+    /// 旧实现按「点格点」采样（像素 i 位于 u=i，画布像素角点取样）→ 内容整体偏移 0.5 图像像素、
+    /// 且底/右缘 1 像素宽区域被域检查 u&gt;iw-1 丢弃留白（实测 12.12% 像素色差 + 底部 12px 白条）。</summary>
     public void DrawImageParallelogram(int iw, int ih, byte[] rgba,
         double p0x, double p0y, double p10x, double p10y, double p01x, double p01y)
     {
@@ -510,15 +515,23 @@ internal sealed class RasterCanvas
 
         for (int dy = y0; dy <= y1; dy++)
         {
+            double dyc = dy + 0.5 - F; // 画布像素中心（像素 dy 覆盖 [dy,dy+1)，中心 dy+0.5）
             for (int dx = x0; dx <= x1; dx++)
             {
-                double u = ((dx - C) * E - B * (dy - F)) / det;
-                double v = (A * (dy - F) - D * (dx - C)) / det;
-                if (u < 0 || v < 0 || u > iw - 1 || v > ih - 1) continue;
-                int sx0 = (int)u, sy0 = (int)v;
-                double fx = u - sx0, fy = v - sy0;
-                int sx1 = sx0 + 1 < iw ? sx0 + 1 : sx0;
-                int sy1 = sy0 + 1 < ih ? sy0 + 1 : sy0;
+                double dxc = dx + 0.5 - C;
+                double u = (dxc * E - B * dyc) / det;
+                double v = (A * dyc - D * dxc) / det;
+                // 全区域域 [0,iw]×[0,ih]：底/右缘（u∈(iw-1,iw] 等）不再被丢弃
+                if (u < 0 || v < 0 || u > iw || v > ih) continue;
+                // 单元中心双线性：u→us=u-0.5（像素 i 的值位于 us=i），四邻边缘钳位
+                double us = u - 0.5, vs = v - 0.5;
+                int sx0 = (int)Math.Floor(us), sy0 = (int)Math.Floor(vs);
+                double fx = us - sx0, fy = vs - sy0;
+                int sx1 = sx0 + 1, sy1 = sy0 + 1;
+                if (sx0 < 0) sx0 = 0; else if (sx0 > iw - 1) sx0 = iw - 1;
+                if (sy0 < 0) sy0 = 0; else if (sy0 > ih - 1) sy0 = ih - 1;
+                if (sx1 < 0) sx1 = 0; else if (sx1 > iw - 1) sx1 = iw - 1;
+                if (sy1 < 0) sy1 = 0; else if (sy1 > ih - 1) sy1 = ih - 1;
                 int i00 = (sy0 * iw + sx0) * 4;
                 int i10 = (sy0 * iw + sx1) * 4;
                 int i01 = (sy1 * iw + sx0) * 4;
@@ -649,6 +662,36 @@ internal sealed class RasterCanvas
             return true;
         }
         catch { return false; }
+    }
+
+    /// <summary>把画布编码为 PNG 字节（与 SavePng 同实现，写内存流）；供 SVG data URI 内联等无文件落盘场景。失败返回 null。</summary>
+    public byte[] ToPngBytes()
+    {
+        try
+        {
+            var ms = new MemoryStream();
+            ms.Write(_pngSig, 0, _pngSig.Length);
+            var ihdr = new byte[13];
+            WriteU32(ihdr, 0, (uint)Width);
+            WriteU32(ihdr, 4, (uint)Height);
+            ihdr[8] = 8;  // bit depth
+            ihdr[9] = 6;  // color type RGBA
+            WriteChunk(ms, "IHDR", ihdr);
+            var idat = new MemoryStream();
+            using (var zs = new ZLibStream(idat, CompressionLevel.Optimal, true))
+            {
+                for (int y = 0; y < Height; y++)
+                {
+                    zs.WriteByte(0); // filter: none
+                    int row = y * Width * 4;
+                    zs.Write(_px, row, Width * 4);
+                }
+            }
+            WriteChunk(ms, "IDAT", idat.ToArray());
+            WriteChunk(ms, "IEND", Array.Empty<byte>());
+            return ms.ToArray();
+        }
+        catch { return null; }
     }
 }
 

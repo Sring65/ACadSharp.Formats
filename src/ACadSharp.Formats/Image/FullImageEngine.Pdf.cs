@@ -441,14 +441,35 @@ internal partial class ImageEngine
 
             case Wipeout wo:
                 {
-                    // 擦除多边形：用背景色填充（透明背景无底色可擦则跳过）
-                    if (!_transparentBg)
-                        PdfQuadFill(cs, _whiteBg ? "#FFFFFF" : "#000000", WipeoutWorldPoly(wo, tr));
+                    // WIPEOUT 属性渲染（三引擎共享 WipeoutFillHex/WipeoutFrame）：填充=42(0/缺省=背景擦除,透明底不画)；
+                    // 边框=文件全局 DisplayImageFrame(WIPEOUTVARIABLES 组码70)=1 或 41>0，色=图元/图层色（有图/无图均适用）。
+                    // 边框为真实颜色（图元/图层色），透明底也绘制；仅填充(背景擦除)在透明底跳过。
+                    var wpoly = WipeoutWorldPoly(wo, tr);
+                    if (wpoly.Count >= 3)
+                    {
+                        if (!_transparentBg)
+                        {
+                            string fill = WipeoutFillHex(wo.FillColor, _whiteBg);
+                            PdfQuadFill(cs, fill, wpoly);
+                        }
+                        var frame = WipeoutFrame(wo, layerAci, byBlockAci, scaleMul);
+                        if (frame.Show)
+                        {
+                            var fd = new StringBuilder();
+                            for (int i = 0; i < wpoly.Count; i++) fd.Append(F(Sx(wpoly[i].X)) + " " + F(Py(wpoly[i].Y)) + " " + (i == 0 ? "m" : "l") + " ");
+                            fd.Append("h ");
+                            PdfStroke(cs, frame.Col, Math.Max(0.1, frame.W), null, fd + "S");
+                        }
+                    }
                 }
                 break;
 
             case RasterImage ri:
                 EmitRasterImagePdf(cs, ri, tr, scaleMul);
+                break;
+
+            case Ole2Frame olef5:
+                EmitOle2FramePdf(cs, olef5, tr, scaleMul);
                 break;
 
             case PdfUnderlay pu:
@@ -491,6 +512,7 @@ internal partial class ImageEngine
 
             case Point pt:
                 {
+                    if (Math.Abs(_pdSize) < 1e-12) break;   // $PDSIZE=0：参考 PDF 点实体无墨迹（2026-10-26 像素验证）→ 不绘制
                     var (cx, cy) = tr == null ? (pt.Location.X, pt.Location.Y) : tr.Apply(pt.Location.X, pt.Location.Y);
                     EmitPointPdf(cs, cx, cy, col, StrokeWidth(pt, scaleMul));
                 }
@@ -1133,6 +1155,81 @@ internal partial class ImageEngine
         CsAscii(cs, "q\n" + F(cmA) + " " + F(cmB) + " " + F(cmC) + " " + F(cmD) + " " + F(ex) + " " + F(ey) + " cm\n/" + name + " Do\nQ\n");
     }
 
+    // PDF OLE2 嵌入对象（Ole2Frame，组码310 内嵌 OLE CFB 容器）：
+    // 提取内嵌 BMP（OLE 图片对象的 DIB 预览，24/32 位）→ 解码 RGBA → RGB 逐行 + /FlateDecode(Predictor 15)
+    // 嵌入为 /Subtype /Image XObject，按 UL/LR 两角矩形 cm 贴图（a0=左下、a10=右下、a01=左上）。
+    // 非图片类 OLE/提取/解码失败 → 矩形边框 + 对角线降级（与 IMAGE 一致）。
+    private void EmitOle2FramePdf(MemoryStream cs, Ole2Frame ole, Transform2D tr, double scaleMul)
+    {
+        double xL = Math.Min(ole.UpperLeftCorner.X, ole.LowerRightCorner.X);
+        double xR = Math.Max(ole.UpperLeftCorner.X, ole.LowerRightCorner.X);
+        double yB = Math.Min(ole.UpperLeftCorner.Y, ole.LowerRightCorner.Y);
+        double yT = Math.Max(ole.UpperLeftCorner.Y, ole.LowerRightCorner.Y);
+        (double X, double Y) P(double x, double y) { if (tr == null) return (x, y); var p = tr.Apply(x, y); return (p.Item1, p.Item2); }
+        var a0 = P(xL, yB);   // 左下
+        var a10 = P(xR, yB);  // 右下
+        var a01 = P(xL, yT);  // 左上
+        double ex = Sx(a0.X), ey = Py(a0.Y);
+        double cmA = Sx(a10.X) - ex, cmB = Py(a10.Y) - ey;
+        double cmC = Sx(a01.X) - ex, cmD = Py(a01.Y) - ey;
+        if (!Ole2Frame.TryExtractBmp(ole.BinaryData, out byte[] bmpBytes))
+        {
+            PdfQuadOutline(cs, ex, ey, cmA, cmB, cmC, cmD, "#888888");
+            RecordSkip("OLE2FRAME(无内嵌BMP)");
+            _log("⚠️  OLE2FRAME 未提取到内嵌 BMP（类型=" + ole.OleObjectType + "），降级为边框");
+            return;
+        }
+        int w = 0, h = 0; byte[] rgba = null;
+        try { var d = RasterHelpers.DecodeBmpToRgba(bmpBytes); w = d.width; h = d.height; rgba = d.rgba; }
+        catch (Exception ex2) { _log("⚠️  OLE2FRAME 内嵌 BMP 解码失败: " + ex2.Message); }
+        if (w <= 0 || h <= 0 || rgba == null)
+        {
+            PdfQuadOutline(cs, ex, ey, cmA, cmB, cmC, cmD, "#888888");
+            RecordSkip("OLE2FRAME(BMP解码失败)");
+            return;
+        }
+        string name = "Im" + _pdfXObjSeq++;
+        _pdfXObjRegs.Add(new PdfXObjReg
+        {
+            Name = name,
+            Build = (baseNum) =>
+            {
+                var objs = new List<(int, byte[])>();
+                try
+                {
+                    var raw = new byte[w * h * 3 + h]; // 每行前置 filter 字节 0
+                    int o = 0;
+                    for (int y = 0; y < h; y++)
+                    {
+                        raw[o++] = 0;
+                        for (int x = 0; x < w; x++)
+                        {
+                            int src = (y * w + x) * 4;
+                            raw[o++] = rgba[src]; raw[o++] = rgba[src + 1]; raw[o++] = rgba[src + 2];
+                        }
+                    }
+                    byte[] comp;
+                    using (var ms = new MemoryStream()) { using (var zs = new ZLibStream(ms, CompressionLevel.Optimal, true)) zs.Write(raw, 0, raw.Length); comp = ms.ToArray(); }
+                    var head = "<< /Type /XObject /Subtype /Image /Width " + w + " /Height " + h +
+                               " /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /FlateDecode /DecodeParms << /Predictor 15 /Colors 3 /BitsPerComponent 8 /Columns " + w + " >> /Length " + comp.Length + " >>\nstream\n";
+                    var body = new byte[head.Length + comp.Length + "\nendstream".Length];
+                    var hb = Encoding.ASCII.GetBytes(head);
+                    Buffer.BlockCopy(hb, 0, body, 0, hb.Length);
+                    Buffer.BlockCopy(comp, 0, body, hb.Length, comp.Length);
+                    var tb = Encoding.ASCII.GetBytes("\nendstream");
+                    Buffer.BlockCopy(tb, 0, body, hb.Length + comp.Length, tb.Length);
+                    objs.Add((baseNum, body));
+                }
+                catch
+                {
+                    objs.Add((baseNum, Encoding.ASCII.GetBytes("<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Length 3 >>\nstream\n\xff\xff\xff\nendstream")));
+                }
+                return objs;
+            }
+        });
+        CsAscii(cs, "q\n" + F(cmA) + " " + F(cmB) + " " + F(cmC) + " " + F(cmD) + " " + F(ex) + " " + F(ey) + " cm\n/" + name + " Do\nQ\n");
+    }
+
     // PDF 底图引用（PDFUNDERLAY / PdfUnderlay）：将外部 PDF 页面按其正确尺寸绘制为引用占位框。
     // 矢量嵌入（Form XObject）需递归资源导入，留待后续增强；此处先保证"显示引用位置/尺寸"，不再空白缺失。
     private void EmitPdfUnderlayPdf(MemoryStream cs, PdfUnderlay pu, Transform2D tr, double scaleMul)
@@ -1521,6 +1618,7 @@ internal partial class ImageEngine
     // 描边一律用合法路径操作符（"0 360 arc" 非 PDF 标准，合规查看器直接忽略导致点/框消失）。
     private void EmitPointPdf(MemoryStream cs, double cx, double cy, string color, double lw)
     {
+        if (Math.Abs(_pdSize) < 1e-12) return;   // $PDSIZE=0：参考 PDF 点实体无墨迹（2026-10-26 像素验证）→ 不绘制
         int mode = _pdMode;
         int shape = mode & 7;
         bool hasFrame = (mode & 96) != 0;

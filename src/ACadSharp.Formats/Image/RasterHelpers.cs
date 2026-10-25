@@ -51,6 +51,56 @@ internal static class RasterHelpers
     }
     #endregion
 
+    #region ===== BMP 解码（OLE2FRAME 内嵌 DIB 预览）=====
+
+    /// <summary>
+    /// 解码 24/32 位 BI_RGB BMP（BITMAPFILEHEADER + 40 字节 BITMAPINFOHEADER）为**自上而下**的 RGBA 字节。
+    /// 用于 OLE2FRAME（组码310 内嵌 OLE CFB 容器中的 DIB 预览图）：BMP 行序为底向上（biHeight&gt;0）
+    /// 或顶向下（biHeight&lt;0），统一翻转/直通为顶向下，与 PNG/JPEG 解码输出及 DrawImageParallelogram
+    /// （图像 (0,0)=左上）的约定一致。不支持压缩/调色板/16 位（OLE DIB 均为 BI_RGB 24/32）。
+    /// 失败抛 InvalidDataException（调用方 catch 后降级为边框）。
+    /// </summary>
+    public static (int width, int height, byte[] rgba) DecodeBmpToRgba(byte[] bmp)
+    {
+        if (bmp == null || bmp.Length < 54) throw new InvalidDataException("BMP 过短（<54 字节）");
+        if (bmp[0] != 0x42 || bmp[1] != 0x4D) throw new InvalidDataException("非 BMP（BM 魔数缺失）");
+        int dataOff = BitConverter.ToInt32(bmp, 10);
+        int biSize = BitConverter.ToInt32(bmp, 14);
+        if (biSize < 40) throw new InvalidDataException("不支持的 BITMAPINFOHEADER（biSize=" + biSize + "）");
+        int w = BitConverter.ToInt32(bmp, 18);
+        int h = BitConverter.ToInt32(bmp, 22);
+        short planes = BitConverter.ToInt16(bmp, 26);
+        short bpp = BitConverter.ToInt16(bmp, 28);
+        int compression = BitConverter.ToInt32(bmp, 30);
+        if (planes != 1) throw new InvalidDataException("不支持的 BMP（biPlanes=" + planes + "）");
+        if (bpp != 24 && bpp != 32) throw new InvalidDataException("不支持的 BMP 位深（" + bpp + "）");
+        if (compression != 0) throw new InvalidDataException("不支持的 BMP 压缩（" + compression + "）");
+        if (w <= 0 || w > 16384 || h == 0 || Math.Abs(h) > 16384) throw new InvalidDataException("BMP 尺寸非法（" + w + "x" + h + "）");
+        bool topDown = h < 0;
+        int H = Math.Abs(h);
+        int stride = (w * (bpp / 8) + 3) & ~3; // 行 4 字节对齐
+        if (dataOff < 54 || (long)dataOff + (long)stride * H > bmp.Length) throw new InvalidDataException("BMP 像素数据截断");
+        var rgba = new byte[w * H * 4];
+        for (int y = 0; y < H; y++)
+        {
+            int srcRow = topDown ? y : (H - 1 - y);
+            int srow = dataOff + srcRow * stride;
+            int drow = y * w * 4;
+            for (int x = 0; x < w; x++)
+            {
+                int si = srow + x * (bpp / 8);
+                int di = drow + x * 4;
+                rgba[di] = bmp[si + 2];      // R
+                rgba[di + 1] = bmp[si + 1];  // G
+                rgba[di + 2] = bmp[si];      // B
+                rgba[di + 3] = 255;          // A（DIB 无透明度）
+            }
+        }
+        return (w, H, rgba);
+    }
+
+    #endregion
+
     #region ===== PNG 解码（8-bit）=====
     /// <summary>解码 PNG 为像素字节。返回 channels: 3(RGB)/4(RGBA)。失败抛异常。</summary>
     public static (int width, int height, int channels, byte[] pixels) DecodePngToRgb(byte[] png)

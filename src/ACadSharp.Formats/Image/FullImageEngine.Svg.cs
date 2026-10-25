@@ -26,11 +26,14 @@ internal partial class ImageEngine
     private readonly HashSet<BlockRecord> _insertAncestors = new();
     private readonly bool _whiteBg;
     private readonly bool _transparentBg; // 仅 PNG 光栅端使用：true=画布不画底色（全透明 alpha）
+    private bool _wipeoutDisplayImageFrame; // $WIPEOUTFRAME（WipeoutVariables 组码70）：有图 WIPEOUT 是否显示边框
     private bool _useRealTextWidth;       // PNG 光栅端置 true：文字对齐锚点用真实字体度量算宽（修正居中/右对正漂移）
     private double _ltScale = 1.0;
     private double _scale = 1.0;
     private short _pdMode;                 // $PDMODE 点样式：位0-2=0点/1无/2+/3X/4竖线；位5(32)=圆框；位6(64)=方框
     private double _pdSize;                // $PDSIZE 点尺寸：0=视高5%；>0=绝对单位；<0=视高百分比(|v|%)
+    private bool _lwDisplay;               // $LWDISPLAY 线宽显示开关：开=应用全局线宽缩放($LWEIGHTSCALE)；关=按实际(未缩放)线宽渲染
+    private double _lwScale = 1.0;         // $LWEIGHTSCALE 全局线宽缩放系数(1=名义不缩放)：仅 _lwDisplay 开时作用于"显示线宽"(组码370)的描边；多段线几何宽(40/43)走填充多边形、不受控
     private double _minX = double.MaxValue, _minY = double.MaxValue, _maxX = double.MinValue, _maxY = double.MinValue;
     private double _margin = 2.0, _w = 1.0, _h = 1.0;
 
@@ -50,6 +53,8 @@ internal partial class ImageEngine
         _log = opt.Log ?? (_ => { });
         _whiteBg = opt.WhiteBackground;
         _transparentBg = opt.TransparentBackground;
+        // $WIPEOUTFRAME：有图 WIPEOUT 的边框显示开关（遗留无图 WIPEOUT 不受影响→仍为擦除器，无边框）
+        try { _wipeoutDisplayImageFrame = doc.GetCadObjects<ACadSharp.Objects.WipeoutVariables>().FirstOrDefault()?.DisplayImageFrame ?? false; } catch { }
         try
         {
             double v = doc.Header.LineTypeScale;
@@ -62,7 +67,16 @@ internal partial class ImageEngine
             _pdSize = doc.Header.PointDisplaySize;
         }
         catch { _pdMode = 0; _pdSize = 0.0; }
-
+        // 全局线宽：$LWDISPLAY(开=应用全局缩放 / 关=按实际未缩放线宽) + $LWEIGHTSCALE(缩放系数)。
+        // 只作用于"显示线宽"(组码370)的描边路径(StrokeWidth)；多段线几何宽(40/43/ConstantWidth)
+        // 走 EmitTaperedPolyline 填充多边形、不经过本方法，故其自有的全局宽度不受全局缩放控制。
+        try
+        {
+            _lwDisplay = doc.Header.DisplayLineWeight;
+            double s = doc.Header.LineweightScale;
+            if (double.IsFinite(s) && s > 0) _lwScale = s;
+        }
+        catch { _lwDisplay = false; _lwScale = 1.0; }
     }
 
     #region ===== 颜色：AutoCAD 标准 ACI 调色板 =====
@@ -1474,7 +1488,28 @@ internal partial class ImageEngine
     private static List<(double X, double Y)> WipeoutWorldPoly(Wipeout wo, Transform2D tr)
     {
         var pts = new List<(double X, double Y)>();
-        var clip = wo?.ClipBoundaryVertices;
+        if (wo == null) return pts;
+
+        // [PATCH] 优先消费 DXF 92/310 世界裁剪预览 blob（TryDecodeWorldClip 校验
+        // int32[0]==总长、int32[4]==顶点数）：它就是权威世界几何。部分文件的 14/24 局部顶点
+        // 是该 blob 的镜像（WO1 同边长 Y 镜像、WO2 鞋带符号相反），只用局部顶点会把擦除形状
+        // 画成错位/翻转的。blob 缺失（DWG 不存该 blob）或损坏时回退 origin + x·U + y·V。
+        if (wo.WorldClipPreview != null && CadWipeoutBase.TryDecodeWorldClip(wo.WorldClipPreview, out var wv))
+        {
+            foreach (var v in wv)
+            {
+                if (tr == null)
+                    pts.Add((v.X, v.Y));
+                else
+                {
+                    var p = tr.Apply(v.X, v.Y);
+                    pts.Add((p.Item1, p.Item2));
+                }
+            }
+            return pts;
+        }
+
+        var clip = wo.ClipBoundaryVertices;
         if (clip == null || clip.Count < 2) return pts;
         double ix, iy, ux, uy, vx, vy;
         if (tr == null)
@@ -1497,6 +1532,33 @@ internal partial class ImageEngine
             pts.Add((wx, wy));
         }
         return pts;
+    }
+
+    // ===== Wipeout 属性渲染（三引擎共享，参考 DXF WIPEOUT 组码规格）=====
+    // 现代(AC1027+) WIPEOUT 组码：41=边框宽(0/缺省=无边框)、42=填充色(0=背景/71=黑/72=白/73=灰)、43=填充透明(0..1)。
+    // 遗留(R13,无41/42) WIPEOUT：无图(340=0)时为"背景擦除器"→填充=背景色(模拟 AutoCAD 擦除底层)。
+    // 边框(多段线)显示由文件全局 $WIPEOUTFRAME(WIPEOUTVARIABLES 组码70 DisplayImageFrame)控制：
+    //   70=1 → 显示裁剪边界多段线（无论有无图）；70=0 → 不显示。实体41>0 时也显示（显式边框宽）。
+    // 色=图元/图层色，宽=多段线标准(StrokeWidth，与多段线同一函数)。本测试文件：base 70=1 显示、off 70=0 不显示、D 70=1 显示。
+    private static string WipeoutFillHex(double fillKind, bool whiteBg)
+    {
+        switch ((int)fillKind)
+        {
+            case 71: return "#000000";
+            case 72: return "#FFFFFF";
+            case 73: return "#808080";
+            default: return whiteBg ? "#FFFFFF" : "#000000"; // 0/非法 = 背景擦除
+        }
+    }
+
+    // 边框决策：返回 (是否画框, 边框色hex, 边框宽)。
+    // 触发条件：文件全局 DisplayImageFrame(WIPEOUTVARIABLES 70)=1 或 实体边框宽41>0。
+    // 无图(340=0)WIPEOUT 同样按 70 显示裁剪边界多段线（AutoCAD 行为，非仅"有图"才显示）。
+    private (bool Show, string Col, double W) WipeoutFrame(Wipeout wo, short layerAci, short byBlockAci, double scaleMul)
+    {
+        if (wo.BorderWidth > 0 || _wipeoutDisplayImageFrame)
+            return (true, ColorOf(EntityAciIndex(wo), layerAci, byBlockAci), StrokeWidth(wo, scaleMul));
+        return (false, null, 0);
     }
 
     // Leader 实心箭头两翼（三引擎共享）：尖端 pts[0]（指向目标点），两翼沿 pts[0]→pts[1] 方向张开 ±30°，
@@ -2103,6 +2165,10 @@ internal partial class ImageEngine
                 case PolyfaceMesh pf: if (pf.Vertices != null) foreach (var v in pf.Vertices) Expand(v.Location.X, v.Location.Y); break;
                 case PolygonMesh pm: if (pm.Vertices != null) foreach (var v in pm.Vertices) Expand(v.Location.X, v.Location.Y); break;
                 case Wipeout wo: foreach (var p in WipeoutWorldPoly(wo, null)) Expand(p.X, p.Y); break;
+                case Ole2Frame olef: // OLE2 嵌入对象（310 内嵌图片）：UL/LR 两角计入图幅，否则图片区域撑大画布被裁
+                    Expand(Math.Min(olef.UpperLeftCorner.X, olef.LowerRightCorner.X), Math.Min(olef.UpperLeftCorner.Y, olef.LowerRightCorner.Y));
+                    Expand(Math.Max(olef.UpperLeftCorner.X, olef.LowerRightCorner.X), Math.Max(olef.UpperLeftCorner.Y, olef.LowerRightCorner.Y));
+                    break;
                 case Arc a: ExpandCircle(a.Center.X, a.Center.Y, a.Radius); break; // 必须先于 Circle（fork 继承）
                 case Circle c: ExpandCircle(c.Center.X, c.Center.Y, c.Radius); break;
                 case Ellipse el: ExpandCircle(el.Center.X, el.Center.Y, Math.Max(el.MajorAxis, el.MinorAxis) / 2.0); break;
@@ -2318,6 +2384,11 @@ internal partial class ImageEngine
             yield return new XY(ri.InsertPoint.X, ri.InsertPoint.Y);
             yield return new XY(ri.InsertPoint.X + ri.UVector.X * ri.Size.X, ri.InsertPoint.Y + ri.UVector.Y * ri.Size.Y);
             yield return new XY(ri.InsertPoint.X + ri.VVector.X * ri.Size.Y, ri.InsertPoint.Y + ri.VVector.Y * ri.Size.Y);
+        }
+        else if (e is Ole2Frame olef2) // OLE2 嵌入对象：UL/LR 两角（与 ComputeExtents 一致，防块内图片撑大内容盒）
+        {
+            yield return new XY(olef2.UpperLeftCorner.X, olef2.UpperLeftCorner.Y);
+            yield return new XY(olef2.LowerRightCorner.X, olef2.LowerRightCorner.Y);
         }
         else if (e is Circle c) { yield return new XY(c.Center.X - c.Radius, c.Center.Y - c.Radius); yield return new XY(c.Center.X + c.Radius, c.Center.Y + c.Radius); }
         else if (e is Arc a) { yield return new XY(a.Center.X - a.Radius, a.Center.Y - a.Radius); yield return new XY(a.Center.X + a.Radius, a.Center.Y + a.Radius); }
@@ -2547,17 +2618,38 @@ internal partial class ImageEngine
 
             case Wipeout wo:
                 {
-                    // 擦除多边形：用背景色填充（模拟 AutoCAD 擦除底层图元）；透明背景无底色可擦则跳过
-                    if (!_transparentBg)
+                    // WIPEOUT 属性渲染（三引擎共享 WipeoutFillHex/WipeoutFrame）：
+                    //  填充=42 属性(0/缺省=背景擦除,71=黑,72=白,73=灰)；透明底不画填充(叠加到未知底色时背景色不可知)；
+                    //  边框=文件全局 DisplayImageFrame(WIPEOUTVARIABLES 组码70)=1 或 41>0，色=图元/图层色（有图/无图均适用）。
+                    // 边框为真实颜色（图元/图层色），透明底也绘制；仅填充(背景擦除)在透明底跳过。
+                    var wpoly = WipeoutWorldPoly(wo, tr);
+                    if (wpoly.Count >= 3)
                     {
-                        var wpoly = WipeoutWorldPoly(wo, tr);
-                        EmitQuadFill(sb, wpoly, _whiteBg ? "#FFFFFF" : "#000000");
+                        if (!_transparentBg)
+                        {
+                            string fill = WipeoutFillHex(wo.FillColor, _whiteBg);
+                            EmitQuadFill(sb, wpoly, fill);
+                        }
+                        var frame = WipeoutFrame(wo, layerAci, byBlockAci, scaleMul);
+                        if (frame.Show)
+                        {
+                            var fd = new StringBuilder();
+                            fd.Append("M");
+                            for (int i = 0; i < wpoly.Count; i++)
+                                fd.Append($"{(i == 0 ? "" : "L")}{F(Sx(wpoly[i].X))},{F(Sy(wpoly[i].Y))}");
+                            fd.Append("Z");
+                            sb.AppendLine($"  <path d=\"{fd}\" fill=\"none\" stroke=\"{frame.Col}\" stroke-width=\"{F(Math.Max(0.1, frame.W))}\"/>");
+                        }
                     }
                 }
                 break;
 
             case RasterImage ri:
                 EmitRasterImageSvg(sb, ri, tr);
+                break;
+
+            case Ole2Frame olef3:
+                EmitOle2FrameSvg(sb, olef3, tr);
                 break;
 
             case Arc a: // 必须先于 Circle（fork 继承关系）
@@ -2874,6 +2966,60 @@ internal partial class ImageEngine
           .Append(F(m)).Append(' ').Append(F(bb)).Append(' ').Append(F(c)).Append(' ')
           .Append(F(dd)).Append(' ').Append(F(e)).Append(' ').Append(F(f))
           .Append(")\" href=\"data:").Append(mime).Append(";base64,").Append(b64).Append("\"/>\n");
+    }
+
+    // SVG OLE2 嵌入对象（Ole2Frame，组码310 内嵌 OLE CFB 容器）：
+    // 提取内嵌 BMP（OLE 图片对象的 DIB 预览）→ 解码 RGBA → 离屏透明画布编码 PNG → data URI 内联 <image>，
+    // 按 UL/LR 两角矩形仿射贴图（矩阵与 EmitRasterImageSvg 同式）。非图片类 OLE/提取/解码失败 → 边框 + 对角线降级。
+    private void EmitOle2FrameSvg(StringBuilder sb, Ole2Frame ole, Transform2D tr)
+    {
+        double xL = Math.Min(ole.UpperLeftCorner.X, ole.LowerRightCorner.X);
+        double xR = Math.Max(ole.UpperLeftCorner.X, ole.LowerRightCorner.X);
+        double yB = Math.Min(ole.UpperLeftCorner.Y, ole.LowerRightCorner.Y);
+        double yT = Math.Max(ole.UpperLeftCorner.Y, ole.LowerRightCorner.Y);
+        (double X, double Y) P(double x, double y) => tr == null ? (x, y) : tr.Apply(x, y);
+        var a0 = P(xL, yB);   // 左下
+        var a10 = P(xR, yB);  // 右下
+        var a01 = P(xL, yT);  // 左上
+        double a0x = Sx(a0.X), a0y = Sy(a0.Y);
+        double a10x = Sx(a10.X), a10y = Sy(a10.Y);
+        double a01x = Sx(a01.X), a01y = Sy(a01.Y);
+        if (!Ole2Frame.TryExtractBmp(ole.BinaryData, out byte[] bmpBytes))
+        {
+            SvgImageRectFallback(sb, a0x, a0y, a10x, a10y, a01x, a01y, "#888888");
+            RecordSkip("OLE2FRAME(无内嵌BMP)");
+            _log("⚠️  OLE2FRAME 未提取到内嵌 BMP（类型=" + ole.OleObjectType + "），降级为边框");
+            return;
+        }
+        int iw = 0, ih = 0; byte[] pix = null;
+        try { var d = RasterHelpers.DecodeBmpToRgba(bmpBytes); iw = d.width; ih = d.height; pix = d.rgba; }
+        catch (Exception ex) { _log("⚠️  OLE2FRAME 内嵌 BMP 解码失败: " + ex.Message); }
+        if (iw <= 0 || ih <= 0 || pix == null)
+        {
+            SvgImageRectFallback(sb, a0x, a0y, a10x, a10y, a01x, a01y, "#888888");
+            RecordSkip("OLE2FRAME(BMP解码失败)");
+            return;
+        }
+        // 24/32 位 DIB 无透明通道，浏览器不支持 BMP data URI → 离屏透明画布 blit 后编码 PNG 内联
+        var rc = new RasterCanvas(iw, ih);
+        rc.Clear(0, 0, 0, 0);
+        rc.BlitRgba(pix, iw, ih, 0, 0);
+        byte[] png = rc.ToPngBytes();
+        if (png == null)
+        {
+            SvgImageRectFallback(sb, a0x, a0y, a10x, a10y, a01x, a01y, "#888888");
+            RecordSkip("OLE2FRAME(PNG编码失败)");
+            return;
+        }
+        string b64 = Convert.ToBase64String(png);
+        double m = (a10x - a0x) / iw, bb = (a10y - a0y) / iw;
+        double c = (a0x - a01x) / ih, dd = (a0y - a01y) / ih;
+        double e = a01x, f = a01y;
+        sb.Append("  <image x=\"0\" y=\"0\" width=\"").Append(iw).Append("\" height=\"").Append(ih)
+          .Append("\" preserveAspectRatio=\"none\" transform=\"matrix(")
+          .Append(F(m)).Append(' ').Append(F(bb)).Append(' ').Append(F(c)).Append(' ')
+          .Append(F(dd)).Append(' ').Append(F(e)).Append(' ').Append(F(f))
+          .Append(")\" href=\"data:image/png;base64,").Append(b64).Append("\"/>\n");
     }
 
     // SVG 图片降级：用四边形边框 + 对角线表示图片位置/尺寸
@@ -4948,6 +5094,9 @@ internal partial class ImageEngine
 
     private void EmitPoint(StringBuilder sb, double cx, double cy, string color, double lw)
     {
+        // $PDSIZE=0：参考 PDF（sampleWIPEOUT-Model.pdf）像素级验证点实体无任何墨迹（2026-10-26）
+        // → 固定比例矢量导出（无“屏幕高度”语境）不绘制点；PDSIZE>0/<0 仍走下方样式机制。
+        if (Math.Abs(_pdSize) < 1e-12) return;
         // 点样式（$PDMODE/$PDSIZE）——2026-10-16 用户定稿标准 + 2026-10-17 整体缩小一半：
         //   ① 笔画与直线一致（lw，1 像素不加粗，废除随字形缩放的加粗公式）
         //   ② 半径 = 点大小值 × 0.5（数据单位）：PDSIZE=0 → 视高 5%；>0 → 绝对值；<0 → 视高百分比
@@ -5061,6 +5210,7 @@ internal partial class ImageEngine
 
     private bool HasVisiblePointGlyph()
     {
+        if (Math.Abs(_pdSize) < 1e-12) return false;   // PDSIZE=0：点无墨迹（与 EmitPoint 一致）→ 无需扩界
         int mode = _pdMode;
         if ((mode & 7) == 1 && (mode & 96) == 0) return false;   // PDMODE=1：无可见字形
         foreach (var ent in AllEntities())
@@ -6199,6 +6349,11 @@ internal partial class ImageEngine
     private double StrokeWidth(Entity e, double scaleMul)
     {
         double lw = LwMm(e);
+        // 全局线宽缩放：仅作用于"显示线宽"(组码370)的描边路径。
+        // $LWDISPLAY 开→乘 $LWEIGHTSCALE(全局缩放)；关→按实际(未缩放)线宽渲染。
+        // 多段线几何宽(全局宽度/40/43)走 EmitTaperedPolyline 填充多边形、不经过本方法，故不受全局缩放。
+        if (lw > 0 && _lwDisplay && _lwScale > 0)
+            lw *= _lwScale;
         double w = lw > 0 ? BaseStroke * lw / DefaultLwMm : BaseStroke;
         return Math.Max(0.1, w * scaleMul);
     }

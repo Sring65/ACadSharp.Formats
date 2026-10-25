@@ -244,6 +244,13 @@ internal partial class ImageEngine
                     b.Ex(ri.InsertPoint.X + ri.VVector.X * ri.Size.Y, ri.InsertPoint.Y + ri.VVector.Y * ri.Size.Y);
                     break;
                 }
+            case Ole2Frame olef:
+                {
+                    // OLE2 嵌入对象：UL/LR 两角（与 ComputeExtents 一致，防分块渲染误剔除）
+                    b.Ex(Math.Min(olef.UpperLeftCorner.X, olef.LowerRightCorner.X), Math.Min(olef.UpperLeftCorner.Y, olef.LowerRightCorner.Y));
+                    b.Ex(Math.Max(olef.UpperLeftCorner.X, olef.LowerRightCorner.X), Math.Max(olef.UpperLeftCorner.Y, olef.LowerRightCorner.Y));
+                    break;
+                }
             case Insert ins: ExpandInsert(ins, b.Ex); break;
             case Leader ld: ExpandLeaderExtents(ld, _doc, b.Ex); break; // 与 ComputeExtents 同展开（含样条过冲+箭头 bbox）
             case XLine _: b.mnx=_minX; b.mny=_minY; b.mxx=_maxX; b.mxy=_maxY; b.any=true; break; // 无限线：不剔除
@@ -852,15 +859,24 @@ internal partial class ImageEngine
 
             case Wipeout wo:
                 {
-                    // 擦除多边形：用背景色填充（透明背景无底色可擦则跳过）
-                    if (!_transparentBg && _rc != null)
+                    // WIPEOUT 属性渲染（三引擎共享 WipeoutFillHex/WipeoutFrame）：填充=42(0/缺省=背景擦除,透明底不画)；
+                    // 边框=文件全局 DisplayImageFrame(WIPEOUTVARIABLES 组码70)=1 或 41>0，色=图元/图层色（有图/无图均适用）。
+                    // 边框为真实颜色（图元/图层色），透明底也绘制；仅填充(背景擦除)在透明底跳过。
+                    if (_rc != null)
                     {
                         var wpoly = WipeoutWorldPoly(wo, tr);
                         if (wpoly.Count >= 3)
                         {
-                            var pp = new List<RasterCanvas.P>(wpoly.Count);
-                            foreach (var p in wpoly) pp.Add(new RasterCanvas.P((float)PngSx(p.X), (float)PngSy(p.Y)));
-                            _rc.Fill(new List<List<RasterCanvas.P>> { pp }, false, _whiteBg ? RasterCanvas.Rgb.White : RasterCanvas.Rgb.Black);
+                            if (!_transparentBg)
+                            {
+                                string fill = WipeoutFillHex(wo.FillColor, _whiteBg);
+                                var pp = new List<RasterCanvas.P>(wpoly.Count);
+                                foreach (var p in wpoly) pp.Add(new RasterCanvas.P((float)PngSx(p.X), (float)PngSy(p.Y)));
+                                _rc.Fill(new List<List<RasterCanvas.P>> { pp }, false, HexToRgb(fill));
+                            }
+                            var frame = WipeoutFrame(wo, layerAci, byBlockAci, scaleMul);
+                            if (frame.Show)
+                                StrokePts(wpoly, true, frame.Col, Math.Max(0.1, frame.W), null);
                         }
                     }
                 }
@@ -868,6 +884,10 @@ internal partial class ImageEngine
 
             case RasterImage ri:
                 EmitRasterImagePng(ri, tr);
+                break;
+
+            case Ole2Frame olef4:
+                EmitOle2FramePng(olef4, tr);
                 break;
 
             case Arc a: // 必须先于 Circle（fork 继承关系）
@@ -942,6 +962,7 @@ internal partial class ImageEngine
 
             case Point pt:
                 {
+                    if (Math.Abs(_pdSize) < 1e-12) break;   // $PDSIZE=0：参考 PDF 点实体无墨迹（2026-10-26 像素验证）→ 不绘制
                     var (cx, cy) = tr == null ? (pt.Location.X, pt.Location.Y) : tr.Apply(pt.Location.X, pt.Location.Y);
                     double lw = StrokeWidth(ent, scaleMul);
                     var col = HexToRgb(ColorOf(EntityAciIndex(ent), layerAci, byBlockAci));
@@ -1245,6 +1266,43 @@ internal partial class ImageEngine
     }
 
     // PNG 图片降级：把 CAD 四边形（画布像素）填充为灰色矩形
+    // PNG OLE2 嵌入对象（Ole2Frame，组码310 内嵌 OLE CFB 容器）：
+    // 提取内嵌 BMP（OLE 图片对象的 DIB 预览）→ 解码 RGBA → 按 UL/LR 两角矩形仿射贴图
+    // （DrawImageParallelogram：p0=左下、p10=右下、p01=左上，图像顶行 → yT 侧，与 CAD 光栅图朝向一致）。
+    // 非图片类 OLE/提取/解码失败 → 灰色矩形边框降级（与 IMAGE 一致）。
+    private void EmitOle2FramePng(Ole2Frame ole, Transform2D tr)
+    {
+        if (_rc == null) return;
+        double xL = Math.Min(ole.UpperLeftCorner.X, ole.LowerRightCorner.X);
+        double xR = Math.Max(ole.UpperLeftCorner.X, ole.LowerRightCorner.X);
+        double yB = Math.Min(ole.UpperLeftCorner.Y, ole.LowerRightCorner.Y);
+        double yT = Math.Max(ole.UpperLeftCorner.Y, ole.LowerRightCorner.Y);
+        (double X, double Y) P(double x, double y) => tr == null ? (x, y) : tr.Apply(x, y);
+        var a0 = P(xL, yB);   // 左下
+        var a10 = P(xR, yB);  // 右下
+        var a01 = P(xL, yT);  // 左上
+        double p0x = PngSx(a0.X), p0y = PngSy(a0.Y);
+        double p10x = PngSx(a10.X), p10y = PngSy(a10.Y);
+        double p01x = PngSx(a01.X), p01y = PngSy(a01.Y);
+        if (!Ole2Frame.TryExtractBmp(ole.BinaryData, out byte[] bmpBytes))
+        {
+            PngImageRectFallback(p0x, p0y, p10x, p10y, p01x, p01y, 136, 136, 136);
+            RecordSkip("OLE2FRAME(无内嵌BMP)");
+            _log("⚠️  OLE2FRAME 未提取到内嵌 BMP（类型=" + ole.OleObjectType + "），降级为边框");
+            return;
+        }
+        int iw = 0, ih = 0; byte[] pix = null;
+        try { var d = RasterHelpers.DecodeBmpToRgba(bmpBytes); iw = d.width; ih = d.height; pix = d.rgba; }
+        catch (Exception ex) { _log("⚠️  OLE2FRAME 内嵌 BMP 解码失败: " + ex.Message); }
+        if (iw <= 0 || ih <= 0 || pix == null)
+        {
+            PngImageRectFallback(p0x, p0y, p10x, p10y, p01x, p01y, 136, 136, 136);
+            RecordSkip("OLE2FRAME(BMP解码失败)");
+            return;
+        }
+        _rc.DrawImageParallelogram(iw, ih, pix, p0x, p0y, p10x, p10y, p01x, p01y);
+    }
+
     private void PngImageRectFallback(double p0x, double p0y, double p10x, double p10y, double p01x, double p01y, byte r, byte g, byte b)
     {
         double p11x = p10x + p01x - p0x, p11y = p10y + p01y - p0y;
@@ -1264,6 +1322,7 @@ internal partial class ImageEngine
     //   位0-2：0=点(实心小圆) 1=不显示 2=加号 3=X 4=竖线；位5(32)=外加圆框；位6(64)=外加方框
     private void EmitPointPng(double cx, double cy, RasterCanvas.Rgb col, double lw)
     {
+        if (Math.Abs(_pdSize) < 1e-12) return;   // $PDSIZE=0：参考 PDF 点实体无墨迹（2026-10-26 像素验证）→ 不绘制
         int mode = _pdMode;
         int shape = mode & 7;
         bool hasFrame = (mode & 96) != 0;

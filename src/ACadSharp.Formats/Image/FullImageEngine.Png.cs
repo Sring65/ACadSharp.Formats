@@ -2000,12 +2000,22 @@ internal partial class ImageEngine
         {
             // 行起点 = 段落首行缩进 − 首字左侧留白：AutoCAD 以【墨迹左缘】对齐左边界（插入点），
             // 而非字形 advance 占位盒左界（参考图实测：每行墨迹左缘距插入点≈0，我们旧版右偏 0.44 单位）。
-            // 仅左对齐生效：居中/右对齐仍按 advance 盒宽排布，避免各行留白不同造成的参差不齐。
+            // 左对齐：墨迹左缘对齐文本框左缘；居中/右对齐：每行在文本框内按附件点水平定位
+            // （多行 MTEXT 的短行必须各自居中/右对齐，而非都贴在文本框左缘——合并单元格多行居中修复）。
             bool leftAligned = layout.Lines[li].InkLeft > 0 &&
                 (mt.AttachmentPoint == AttachmentPointType.TopLeft
                  || mt.AttachmentPoint == AttachmentPointType.MiddleLeft
                  || mt.AttachmentPoint == AttachmentPointType.BottomLeft);
-            double x = (layout.Lines[li].FirstIndent - (leftAligned ? layout.Lines[li].InkLeft : 0.0)) * scaleMul;
+            bool centerAligned = mt.AttachmentPoint == AttachmentPointType.TopCenter
+                || mt.AttachmentPoint == AttachmentPointType.MiddleCenter
+                || mt.AttachmentPoint == AttachmentPointType.BottomCenter;
+            bool rightAligned = mt.AttachmentPoint == AttachmentPointType.TopRight
+                || mt.AttachmentPoint == AttachmentPointType.MiddleRight
+                || mt.AttachmentPoint == AttachmentPointType.BottomRight;
+            double lineX = layout.Lines[li].FirstIndent;
+            if (centerAligned) lineX += (layout.MaxLineWidth - layout.Lines[li].Width) / 2;
+            else if (rightAligned) lineX += layout.MaxLineWidth - layout.Lines[li].Width;
+            double x = (lineX - (leftAligned ? layout.Lines[li].InkLeft : 0.0)) * scaleMul;
             foreach (var run in layout.Lines[li].Runs)
             {
                 double rw = MTextRunWidth(run, styleFont, styleBig) * scaleMul;

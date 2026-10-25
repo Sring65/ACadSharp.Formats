@@ -4476,6 +4476,24 @@ internal partial class ImageEngine
                         }
                         ln.Runs.Add(new MTextRun { Text = t, Height = run.Height, WidthFactor = run.WidthFactor, Color = run.Color, Underline = run.Underline, Overline = run.Overline, Bold = run.Bold, Italic = run.Italic, Oblique = run.Oblique, Font = run.Font, BaselineShift = run.BaselineShift, IsFraction = run.IsFraction, Tracking = run.Tracking });
                     }
+                    // 行尾空白裁剪（仅对含墨迹的行）：行尾空格（含换行时从上一行掉落的长空格串）
+                    // AutoCAD 不渲染、不计入行宽（否则合并单元格居中时行宽被空格串虚增 →
+                    // 居中/右对齐偏移错误）。末 run 尾随空白 TrimEnd；末 run 纯空白则移除后
+                    // 继续检查新末 run。纯空白行（无墨迹）不裁剪——保留原行为（FinishMTextLayout
+                    // 移除末尾纯空白行），避免影响段落行距。
+                    bool hasInk = false;
+                    foreach (var r in ln.Runs) if (!string.IsNullOrWhiteSpace(r.Text)) { hasInk = true; break; }
+                    if (hasInk)
+                        while (ln.Runs.Count > 0)
+                        {
+                            var tail = ln.Runs[ln.Runs.Count - 1];
+                            string tailTrim = tail.Text.TrimEnd();
+                            if (tailTrim.Length == tail.Text.Length) break; // 无尾随空白
+                            if (tailTrim.Length == 0) { ln.Runs.RemoveAt(ln.Runs.Count - 1); continue; }
+                            tail.Text = tailTrim;
+                            ln.Runs[ln.Runs.Count - 1] = tail;
+                            break;
+                        }
                     ln.Recalc(this, styleFont, styleBig);
                     result.Lines.Add(ln);
                 }
@@ -4606,12 +4624,22 @@ internal partial class ImageEngine
         {
             // 行起点 = 段落首行缩进 − 首字左侧留白：AutoCAD 以【墨迹左缘】对齐左边界（插入点），
             // 而非字形 advance 占位盒左界（参考图实测：每行墨迹左缘距插入点≈0，我们旧版右偏 0.44 单位）。
-            // 仅左对齐生效：居中/右对齐仍按 advance 盒宽排布，避免各行留白不同造成的参差不齐。
+            // 左对齐：墨迹左缘对齐文本框左缘；居中/右对齐：每行在文本框内按附件点水平定位
+            // （多行 MTEXT 的短行必须各自居中/右对齐，而非都贴在文本框左缘——合并单元格多行居中修复）。
             bool leftAligned = layout.Lines[li].InkLeft > 0 &&
                 (mt.AttachmentPoint == AttachmentPointType.TopLeft
                  || mt.AttachmentPoint == AttachmentPointType.MiddleLeft
                  || mt.AttachmentPoint == AttachmentPointType.BottomLeft);
-            double x = (layout.Lines[li].FirstIndent - (leftAligned ? layout.Lines[li].InkLeft : 0.0)) * scaleMul;
+            bool centerAligned = mt.AttachmentPoint == AttachmentPointType.TopCenter
+                || mt.AttachmentPoint == AttachmentPointType.MiddleCenter
+                || mt.AttachmentPoint == AttachmentPointType.BottomCenter;
+            bool rightAligned = mt.AttachmentPoint == AttachmentPointType.TopRight
+                || mt.AttachmentPoint == AttachmentPointType.MiddleRight
+                || mt.AttachmentPoint == AttachmentPointType.BottomRight;
+            double lineX = layout.Lines[li].FirstIndent;
+            if (centerAligned) lineX += (layout.MaxLineWidth - layout.Lines[li].Width) / 2;
+            else if (rightAligned) lineX += layout.MaxLineWidth - layout.Lines[li].Width;
+            double x = (lineX - (leftAligned ? layout.Lines[li].InkLeft : 0.0)) * scaleMul;
             foreach (var run in layout.Lines[li].Runs)
             {
                 double rw = MTextRunWidth(run, styleFont, styleBig) * scaleMul;

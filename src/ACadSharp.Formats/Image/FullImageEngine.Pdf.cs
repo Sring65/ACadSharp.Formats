@@ -512,7 +512,8 @@ internal partial class ImageEngine
 
             case Point pt:
                 {
-                    if (Math.Abs(_pdSize) < 1e-12) break;   // $PDSIZE=0：参考 PDF 点实体无墨迹（2026-10-26 像素验证）→ 不绘制
+                    // 2026-10-26 用户裁定：$PDSIZE=0 不再抑制点——中心点恒按基础 1 像素（1pt）绘制（见 EmitPointPdf），
+                    // 外框/臂按设置比例（PointGlyphRadius）绘制；PDMODE=1 且无外框 → 不绘制。
                     var (cx, cy) = tr == null ? (pt.Location.X, pt.Location.Y) : tr.Apply(pt.Location.X, pt.Location.Y);
                     EmitPointPdf(cs, cx, cy, col, StrokeWidth(pt, scaleMul));
                 }
@@ -1610,15 +1611,16 @@ internal partial class ImageEngine
         d.Append(F(cx + k) + " " + F(cy - r) + " " + F(cx + r) + " " + F(cy - k) + " " + F(cx + r) + " " + F(cy) + " c h ");
     }
 
-    // 点样式（$PDMODE/$PDSIZE）→ PDF 内容流，与 SVG 端 EmitPoint 逐样式一致（2026-10-16 定稿标准）：
-    //   ① 笔画与直线一致（lw，1 像素不加粗）；② 框半径 = 点大小值 × 0.5（数据单位，2026-10-17 缩小一半）
-    //   ③ 方框半宽/圆框半径 = 同一半径；④ 加号/X 半伸出 = 2r（伸出框外一 r）；竖线总长 = r（第 5 列）
+    // 点样式（$PDMODE/$PDSIZE）→ PDF 内容流，与 SVG 端 EmitPoint 逐样式一致（2026-10-16 定稿标准 + 10-17/10-26 两次各缩小一半）：
+    //   ① 笔画与直线一致（lw，1 像素不加粗）；② 框半径 = 点大小值 × 0.25（数据单位，2026-10-26 用户“边框再减半”）
+    //   ③ 方框半宽/圆框半径 = 同一半径；④ 加号半伸出（沿轴）= 2r；X 臂长（沿 45° 对角）= 2r（尖在 ±r√2，伸出圆外一 r）；竖线总长 = r（第 5 列）
     //   位0-2：0=点(实心小圆) 1=不显示 2=加号 3=X 4=竖线；位5(32)=外加圆框；位6(64)=外加方框
     // 填充色必须显式 rg（PdfStroke 只设 RG 描边色，填充沿用上一条残留状态会致颜色不确定）；
     // 描边一律用合法路径操作符（"0 360 arc" 非 PDF 标准，合规查看器直接忽略导致点/框消失）。
     private void EmitPointPdf(MemoryStream cs, double cx, double cy, string color, double lw)
     {
-        if (Math.Abs(_pdSize) < 1e-12) return;   // $PDSIZE=0：参考 PDF 点实体无墨迹（2026-10-26 像素验证）→ 不绘制
+        // 2026-10-26 用户裁定：$PDSIZE=0 不再抑制点——中心点恒按基础 1 像素（0.5pt 半径，1px≙1pt）绘制，
+        // 不受 PDSIZE/缩放影响；外框/臂按设置比例（PointGlyphRadius）绘制；PDMODE=1 且无外框 → 不绘制。
         int mode = _pdMode;
         int shape = mode & 7;
         bool hasFrame = (mode & 96) != 0;
@@ -1627,10 +1629,12 @@ internal partial class ImageEngine
         double r = PointGlyphRadius();                // 框半径（数据单位）= 点大小值
         if (!double.IsFinite(r) || r <= 0) return;
         double w = lw;                                // 笔画与直线一致，不加粗
-        double arm = r * 2.0;                         // 加号/X 半伸出 = 2r（伸出框外一 r）
+        double arm = r * 2.0;                         // 加号半伸出（沿轴）= 2r（伸出框外一 r）
+        double xarm = r * Math.Sqrt(2.0);             // X 臂尖坐标偏移 = 2r/√2：沿 45° 对角臂长恰为 2r，伸出圆外恰一 r（2026-10-26 用户修正）
         double scx = Sx(cx), scy = Py(cy);
         double x0 = Sx(cx - r), x1 = Sx(cx + r), y0 = Py(cy - r), y1 = Py(cy + r);
         double ax0 = Sx(cx - arm), ax1 = Sx(cx + arm), ay0 = Py(cy - arm), ay1 = Py(cy + arm);
+        double xax0 = Sx(cx - xarm), xax1 = Sx(cx + xarm), xay0 = Py(cy - xarm), xay1 = Py(cy + xarm);
         string rgb = HexToRgbPdf(color);
         // 外加圆框（位5=32；对话框第 2 行）：贝塞尔整圆描边，半径 = 点大小值
         if ((mode & 32) != 0)
@@ -1652,12 +1656,12 @@ internal partial class ImageEngine
         // 中心图形
         switch (shape)
         {
-            case 0: // 点：固定小实心圆（2026-10-24 用户 bug1：中间点不随缩放/点大小变化，仅外框随点渲染比例缩放）
+            case 0: // 点：基础 1 像素小实心圆（2026-10-26 用户裁定：中心点恒 1px 屏幕直径 = 0.5pt 半径，
+            // 不随 PDSIZE/缩放变化，纯填充无背景光晕；仅外框/臂随 PointGlyphRadius 比例缩放）
             {
-                double pr = CenterDotRadius;
                 var d = new StringBuilder();
-                AppendCircleBezier(d, scx, scy, pr);
-                CsAscii(cs, rgb + " rg\n" + rgb + " RG\n" + F(Math.Min(pr * 0.3, Math.Abs(w))) + " w\n" + d + "f\n");
+                AppendCircleBezier(d, scx, scy, 0.5);
+                CsAscii(cs, rgb + " rg\n" + d + "f\n");
                 break;
             }
             case 2: // 加号：横竖两笔（±2r，伸出框外一 r）
@@ -1668,11 +1672,11 @@ internal partial class ImageEngine
                 PdfStroke(cs, color, w, null, d + "S");
                 break;
             }
-            case 3: // X：两条对角线（±2r，伸出框外一 r）
+            case 3: // X：两条对角线（臂长沿 45° 对角 = 2r，尖在 ±r√2，伸出圆外一 r）
             {
                 var d = new StringBuilder();
-                d.Append(F(ax0)).Append(' ').Append(F(ay0)).Append(" m ").Append(F(ax1)).Append(' ').Append(F(ay1)).Append(" l ")
-                 .Append(F(ax0)).Append(' ').Append(F(ay1)).Append(" m ").Append(F(ax1)).Append(' ').Append(F(ay0)).Append(" l ");
+                d.Append(F(xax0)).Append(' ').Append(F(xay0)).Append(" m ").Append(F(xax1)).Append(' ').Append(F(xay1)).Append(" l ")
+                 .Append(F(xax0)).Append(' ').Append(F(xay1)).Append(" m ").Append(F(xax1)).Append(' ').Append(F(xay0)).Append(" l ");
                 PdfStroke(cs, color, w, null, d + "S");
                 break;
             }

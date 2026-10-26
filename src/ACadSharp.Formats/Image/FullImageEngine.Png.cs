@@ -962,7 +962,8 @@ internal partial class ImageEngine
 
             case Point pt:
                 {
-                    if (Math.Abs(_pdSize) < 1e-12) break;   // $PDSIZE=0：参考 PDF 点实体无墨迹（2026-10-26 像素验证）→ 不绘制
+                    // 2026-10-26 用户裁定：$PDSIZE=0 不再抑制点——中心点恒按基础 1 像素绘制（见 EmitPointPng），
+                    // 外框/臂按设置比例（PointGlyphRadius）绘制；PDMODE=1 且无外框 → 不绘制。
                     var (cx, cy) = tr == null ? (pt.Location.X, pt.Location.Y) : tr.Apply(pt.Location.X, pt.Location.Y);
                     double lw = StrokeWidth(ent, scaleMul);
                     var col = HexToRgb(ColorOf(EntityAciIndex(ent), layerAci, byBlockAci));
@@ -976,7 +977,7 @@ internal partial class ImageEngine
                         double k = PngK;
                         double r = PointGlyphRadius();
                         double wPx = Math.Max(lw * k, 1.0);
-                        double ext = Math.Max(2.0 * r, CenterDotRadius) + 0.5 * wPx / k + 1.0 / k; // 加号/X 半伸出 2r 或固定点径(取大) + 线宽半宽 + 1px 余量（数据单位）
+                        double ext = Math.Max(2.0 * r, 1.0 / k) + 0.5 * wPx / k + 1.0 / k; // 加号/X 半伸出 2r 或 1px 点径(取大) + 线宽半宽 + 1px 余量（数据单位）
                         string key = "P" + _pdMode + "|" + r.ToString("R") + "|" + wPx.ToString("R")
                             + "|" + col.R + "," + col.G + "," + col.B
                             + "|" + (_transparentBg ? 1 : 0) + (_whiteBg ? 1 : 0);
@@ -1316,13 +1317,14 @@ internal partial class ImageEngine
         _rc.Fill(new List<List<RasterCanvas.P>> { pp }, false, new RasterCanvas.Rgb(r, g, b));
     }
 
-    // 点样式（$PDMODE/$PDSIZE）→ PNG 位图，与 SVG/PDF 端逐样式一致（2026-10-16 定稿 + 10-17 缩小一半）：
-    //   ① 笔画与直线一致（lw×k，保底 1px 不加粗）；② 框半径 = 点大小值 × 0.5（数据单位）
-    //   ③ 方框半宽/圆框半径 = 同一半径；④ 加号/X 半伸出 = 2r（伸出框外一 r）；竖线总长 = r（第 5 列）
+    // 点样式（$PDMODE/$PDSIZE）→ PNG 位图，与 SVG/PDF 端逐样式一致（2026-10-16 定稿 + 10-17/10-26 两次各缩小一半）：
+    //   ① 笔画与直线一致（lw×k，保底 1px 不加粗）；② 框半径 = 点大小值 × 0.25（数据单位；2026-10-26 用户“边框再减半”）
+    //   ③ 方框半宽/圆框半径 = 同一半径；④ 加号半伸出（沿轴）= 2r；X 臂长（沿 45° 对角）= 2r（尖在 ±r√2，伸出圆外一 r）；竖线总长 = r（第 5 列）
     //   位0-2：0=点(实心小圆) 1=不显示 2=加号 3=X 4=竖线；位5(32)=外加圆框；位6(64)=外加方框
     private void EmitPointPng(double cx, double cy, RasterCanvas.Rgb col, double lw)
     {
-        if (Math.Abs(_pdSize) < 1e-12) return;   // $PDSIZE=0：参考 PDF 点实体无墨迹（2026-10-26 像素验证）→ 不绘制
+        // 2026-10-26 用户裁定：$PDSIZE=0 不再抑制点——中心点恒按基础 1 像素（0.5px 半径）绘制，
+        // 不受 PDSIZE/缩放影响；外框/臂按设置比例（PointGlyphRadius）绘制；PDMODE=1 且无外框 → 不绘制。
         int mode = _pdMode;
         int shape = mode & 7;
         bool hasFrame = (mode & 96) != 0;
@@ -1335,12 +1337,15 @@ internal partial class ImageEngine
         // 亚像素(<1px)描边带可能整体落在两条采样线之间被整段丢弃（sample2004 加号臂消失根因）；
         // 任意长度≥1 的区间必含一条采样线，且符合用户定稿"线段像素为1，点渲染1像素"。
         float w = (float)Math.Max(lw * k, 1.0);
-        double arm = r * 2.0;                         // 加号/X 半伸出 = 2r（伸出框外一 r）
+        double arm = r * 2.0;                         // 加号半伸出（沿轴）= 2r（伸出框外一 r）
+        double xarm = r * Math.Sqrt(2.0);             // X 臂尖坐标偏移 = 2r/√2：沿 45° 对角臂长恰为 2r，伸出圆外恰一 r（2026-10-26 用户修正）
         float fx = (float)PngSx(cx), fy = (float)PngSy(cy);
         float x0 = (float)PngSx(cx - r), x1 = (float)PngSx(cx + r);
         float y0 = (float)PngSy(cy - r), y1 = (float)PngSy(cy + r);
         float ax0 = (float)PngSx(cx - arm), ax1 = (float)PngSx(cx + arm);
         float ay0 = (float)PngSy(cy - arm), ay1 = (float)PngSy(cy + arm);
+        float xax0 = (float)PngSx(cx - xarm), xax1 = (float)PngSx(cx + xarm);
+        float xay0 = (float)PngSy(cy - xarm), xay1 = (float)PngSy(cy + xarm);
         RasterCanvas.P P(float px, float py) => new RasterCanvas.P(px, py);
         // 外加圆框（位5=32；对话框第 2 行）：48 段折线逼近圆，半径 = 点大小值
         if ((mode & 32) != 0)
@@ -1361,22 +1366,19 @@ internal partial class ImageEngine
         // 中心图形
         switch (shape)
         {
-            case 0: // 点：固定小实心圆（2026-10-24 用户 bug1：中间点不随缩放/点大小变化，仅外框随点渲染比例缩放）
+            case 0: // 点：基础 1 像素小实心圆（2026-10-26 用户裁定：中心点恒 1px 屏幕直径 = 0.5px 半径，
+            // 不随 PDSIZE/缩放变化，无背景光晕；仅外框/臂随 PointGlyphRadius 比例缩放）
             {
-                float rad = Math.Max(1.0f, (float)(CenterDotRadius * k));   // 固定数据单位 → 像素，保底 1px
-                // 背景色光晕环（透明背景无底色，跳过，避免在透明上出现一圈边）
-                if (!_transparentBg)
-                    _rc.FillDisc(fx, fy, rad + Math.Max(0.5f, rad * 0.3f), _whiteBg ? RasterCanvas.Rgb.White : RasterCanvas.Rgb.Black);
-                _rc.FillDisc(fx, fy, rad, col);
+                _rc.FillDisc(fx, fy, 0.5f, col);
                 break;
             }
             case 2: // 加号（±2r，伸出框外一 r）
                 _rc.StrokePolyline(new List<RasterCanvas.P> { P(ax0, fy), P(ax1, fy) }, false, w, col);
                 _rc.StrokePolyline(new List<RasterCanvas.P> { P(fx, ay0), P(fx, ay1) }, false, w, col);
                 break;
-            case 3: // X（±2r，伸出框外一 r）
-                _rc.StrokePolyline(new List<RasterCanvas.P> { P(ax0, ay0), P(ax1, ay1) }, false, w, col);
-                _rc.StrokePolyline(new List<RasterCanvas.P> { P(ax0, ay1), P(ax1, ay0) }, false, w, col);
+            case 3: // X（臂长沿 45° 对角 = 2r，尖在 ±r√2，伸出圆外一 r）
+                _rc.StrokePolyline(new List<RasterCanvas.P> { P(xax0, xay0), P(xax1, xay1) }, false, w, col);
+                _rc.StrokePolyline(new List<RasterCanvas.P> { P(xax0, xay1), P(xax1, xay0) }, false, w, col);
                 break;
             case 4: // 竖线（总长 = r；2026-10-16 用户定稿：第 5 列竖线长度为 r（点大小值）；10-17 缩小一半后 = 点大小值/2）
             {

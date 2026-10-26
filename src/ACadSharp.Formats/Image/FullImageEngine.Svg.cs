@@ -2128,10 +2128,43 @@ internal partial class ImageEngine
         }
     }
 
+    // $SORTENTS/SORTENTSTABLE 显示顺序缓存（首次迭代 AllEntities 时计算，见 ApplySortentsOrder）
+    private List<Entity> _sortOrderCache;
+
     private IEnumerable<Entity> AllEntities()
     {
-        foreach (var e in _doc.ModelSpace.Entities)
+        if (_sortOrderCache == null)
+            _sortOrderCache = ApplySortentsOrder(_doc.ModelSpace.Entities.ToList());
+        foreach (var e in _sortOrderCache)
             yield return e;
+    }
+
+    // 显示顺序 = $SORTENTS（头码 280，EntitySortingFlags）+ SORTENTSTABLE 对象：
+    // 启用时按表的显示顺序渲染（SortHandle 升序 = 底层→顶层；不在表中的实体以自身 Handle 作排序键，
+    // 与 ACadSharp SortEntitiesTable.GetSorterHandle 语义一致）；禁用(0)或无表则退回文档顺序。
+    // 2026-10-26 修复：sampleWIPEOUT.dxf $SORTENTS=127(All，含 Plotting/Postscript) → AutoCAD 的 PDF 导出
+    // 用 sortents 显示顺序；引擎此前按文档顺序（右侧 LINE 在文档末尾=最顶层）→ 线画在五角形 WIPEOUT
+    // 擦除区之上，与 ref.pdf 不符（该线在表中排最底，应被五角形填充擦掉）。
+    private List<Entity> ApplySortentsOrder(List<Entity> docOrder)
+    {
+        try
+        {
+            if (_doc?.Header?.EntitySortingFlags == ACadSharp.Header.ObjectSortingFlags.Disabled) return docOrder;
+            var table = _doc.GetCadObjects<ACadSharp.Objects.SortEntitiesTable>()
+                .FirstOrDefault(t => t.BlockOwner != null && t.BlockOwner.Name == BlockRecord.ModelSpaceName);
+            if (table == null) return docOrder;
+            var keys = new Dictionary<Entity, ulong>();
+            foreach (var s in table) keys[s.Entity] = s.SortHandle;
+            if (keys.Count == 0) return docOrder;
+            // OrderBy 为稳定排序：排序键相同（如多个实体不在表内且 Handle 相同——实际不会）保持文档顺序
+            return docOrder
+                .OrderBy(e => keys.TryGetValue(e, out var k) ? k : e.Handle)
+                .ToList();
+        }
+        catch
+        {
+            return docOrder;
+        }
     }
 
     // 计算数据范围（含 Insert 展开后的块内实体）
@@ -5100,17 +5133,19 @@ internal partial class ImageEngine
 
     private void EmitPoint(StringBuilder sb, double cx, double cy, string color, double lw)
     {
-        // $PDSIZE=0：参考 PDF（sampleWIPEOUT-Model.pdf）像素级验证点实体无任何墨迹（2026-10-26）
-        // → 固定比例矢量导出（无“屏幕高度”语境）不绘制点；PDSIZE>0/<0 仍走下方样式机制。
-        if (Math.Abs(_pdSize) < 1e-12) return;
+        // 2026-10-26 用户裁定：$PDSIZE=0 不再抑制点——
+        //   ① 中心点恒按基础 1 像素绘制（0.5 输出单位半径，不随 PDSIZE/缩放变化）；
+        //   ② 配置了外框/臂（+/×/竖线/圆框/方框）时，按设置比例（PointGlyphRadius）绘制边显示；
+        //   ③ PDMODE=1 且无外框 → 完全无显示。
         // 点样式（$PDMODE/$PDSIZE）——2026-10-16 用户定稿标准 + 2026-10-17 整体缩小一半：
         //   ① 笔画与直线一致（lw，1 像素不加粗，废除随字形缩放的加粗公式）
         //   ② 半径 = 点大小值 × 0.5（数据单位）：PDSIZE=0 → 视高 5%；>0 → 绝对值；<0 → 视高百分比
         //      （“不管设置是 5% 还是 5 单位，1×5×10=50 像素”——折算为数据单位半径，
         //        经渲染变换映射为像素：size(数据单位) × 每单位像素数）
         //   ③ 方框半宽 = 半径，圆框半径 = 半径（同一半径）
-        //   ④ 加号/X 半伸出 = 2r（伸出框外一 r）；竖线总长 = r（第 5 列）；点为小实心圆
-        //   2026-10-17 用户“绘制的有点大了，缩小一半”→ PointGlyphRadius 整体 ×0.5（三引擎统一）
+        //   ④ 加号半伸出（沿轴）= 2r；X 臂长（沿 45° 对角）= 2r（尖坐标偏移 r√2，伸出圆外恰一 r）；竖线总长 = r（第 5 列）；点为小实心圆
+        //   2026-10-17 用户“绘制的有点大了，缩小一半”→ PointGlyphRadius 整体 ×0.5（三引擎统一）；
+        //   2026-10-26 用户“点存在边框渲染时感觉有点大了，边框按缩小一半渲染”→ 整体再减半 ×0.25
         //   PDMODE 位0-2：0=点 1=不显示 2=加号 3=X 4=竖线；位5(32)=外加圆框；位6(64)=外加方框
         int mode = _pdMode;
         int shape = mode & 7;
@@ -5120,12 +5155,14 @@ internal partial class ImageEngine
         double r = PointGlyphRadius();                // 框半径（数据单位）= 点大小值
         if (!double.IsFinite(r) || r <= 0) return;
         double w = lw;                                // 笔画与直线一致，不加粗
-        double arm = r * 2.0;                         // 加号/X 半伸出 = 2r（超出框一 r）
-        // 透明背景无底色：省略背景色描边光晕（避免透明处出现一圈黑/白边）
-        string halo = _transparentBg ? "none" : (_whiteBg ? "#FFFFFF" : "#000000");
+        double arm = r * 2.0;                         // 加号半伸出（沿轴）= 2r（超出框一 r）
+        double xarm = r * Math.Sqrt(2.0);             // X 臂尖坐标偏移 = 2r/√2：沿 45° 对角臂长恰为 2r，
+                                                     // 伸出圆（半径 r）外恰一 r（2026-10-26 用户修正：
+                                                     // 原尖在 (±2r,±2r)，沿臂实际 2√2r≈2.83r，伸出 1.83r 太长）
         double scx = Sx(cx), scy = Sy(cy);
         double fx0 = Sx(cx - r), fx1 = Sx(cx + r), fy0 = Sy(cy - r), fy1 = Sy(cy + r);
         double ax0 = Sx(cx - arm), ax1 = Sx(cx + arm), ay0 = Sy(cy - arm), ay1 = Sy(cy + arm);
+        double xax0 = Sx(cx - xarm), xax1 = Sx(cx + xarm), xay0 = Sy(cy - xarm), xay1 = Sy(cy + xarm);
         // 外加圆框（PDMODE 位5=32；对话框第 2 行）：半径 = 点大小值
         if ((mode & 32) != 0)
             sb.AppendLine($"  <circle cx=\"{F(scx)}\" cy=\"{F(scy)}\" r=\"{F(Math.Abs(fx1 - scx))}\" fill=\"none\" stroke=\"{color}\" stroke-width=\"{F(w)}\"/>");
@@ -5141,10 +5178,10 @@ internal partial class ImageEngine
         // 中心图形
         switch (shape)
         {
-            case 0: // 点：固定小实心圆（2026-10-24 用户 bug1：中间点不随缩放/点大小变化，仅外框随点渲染比例缩放）
+            case 0: // 点：基础 1 像素小实心圆（2026-10-26 用户裁定：中心点恒 1px 屏幕直径 = 0.5 输出单位半径，
+            // 不随 PDSIZE/缩放变化，纯填充无背景光晕；仅外框/臂随 PointGlyphRadius 比例缩放）
             {
-                double pr = CenterDotRadius;
-                sb.AppendLine($"  <circle cx=\"{F(scx)}\" cy=\"{F(scy)}\" r=\"{F(pr)}\" fill=\"{color}\" stroke=\"{halo}\" stroke-width=\"{F(Math.Min(pr * 0.3, Math.Abs(w)))}\"/>");
+                sb.AppendLine($"  <circle cx=\"{F(scx)}\" cy=\"{F(scy)}\" r=\"0.5\" fill=\"{color}\"/>");
                 break;
             }
             case 2: // 加号（±2r，伸出框外一 r）
@@ -5155,11 +5192,11 @@ internal partial class ImageEngine
                 sb.AppendLine($"  <path d=\"{d}\" fill=\"none\" stroke=\"{color}\" stroke-width=\"{F(w)}\" stroke-linecap=\"butt\"/>");
                 break;
             }
-            case 3: // X（±2r，伸出框外一 r）
+            case 3: // X（臂长沿 45° 对角 = 2r，尖在 ±r√2，伸出圆外一 r）
             {
                 var d = new StringBuilder();
-                d.Append("M").Append(F(ax0)).Append(',').Append(F(ay0)).Append("L").Append(F(ax1)).Append(',').Append(F(ay1))
-                 .Append("M").Append(F(ax0)).Append(',').Append(F(ay1)).Append("L").Append(F(ax1)).Append(',').Append(F(ay0));
+                d.Append("M").Append(F(xax0)).Append(',').Append(F(xay0)).Append("L").Append(F(xax1)).Append(',').Append(F(xay1))
+                 .Append("M").Append(F(xax0)).Append(',').Append(F(xay1)).Append("L").Append(F(xax1)).Append(',').Append(F(xay0));
                 sb.AppendLine($"  <path d=\"{d}\" fill=\"none\" stroke=\"{color}\" stroke-width=\"{F(w)}\" stroke-linecap=\"butt\"/>");
                 break;
             }
@@ -5179,13 +5216,15 @@ internal partial class ImageEngine
     // PDSIZE=0 → 视高 5%；>0 → 绝对单位；<0 → |PDSIZE|% 视高。
     // 用户定稿：“不管设置是 5% 还是 5 单位”——一律折算为数据单位半径（方框半宽/圆框半径），
     // 渲染时经变换映射为像素（如 5 单位 × 每单位 10 像素 = 50 像素半径）。
-    // 2026-10-17 用户反馈“绘制的有点大了，缩小一半”→ 整体乘以 PointGlyphScale=0.5：
-    // 方框半宽/圆框半径 = 点大小值/2；加号/X 半伸出 = 点大小值；竖线总长 = 点大小值/2；点径 = 0.15×点大小值/2。
+    // 2026-10-17 用户反馈“绘制的有点大了，缩小一半”→ 整体乘以 0.5；
+    // 2026-10-26 用户反馈“点存在边框渲染时感觉有点大了，边框大小按缩小一半渲染”→
+    // 点按直径算法的比例缩放整体再减半（PointGlyphScale=0.25）：
+    // 方框半宽/圆框半径 = 点大小值/4；加号半伸出 = 点大小值/2；X 臂长（沿对角）= 点大小值/2；竖线总长 = 点大小值/4；
+    // 中心点恒 1 像素（0.5 输出单位半径，不随比例缩放，2026-10-26 裁定不变）。
     // 依赖 _h（画布高度），须在 WriteSvg/WritePdf/WritePng 定稿 _h 之后调用。
-    private const double PointGlyphScale = 0.5;   // 2026-10-17 用户：点样式整体缩小一半
-    // 2026-10-24 用户 bug1：中间点（PDMODE 位0=点）为固定小实心圆，不随点大小/缩放变化；
-    // 仅周围方框/圆框/+/X/竖线随点渲染比例（PointGlyphRadius）缩放。取 ≈GT(AutoCAD) 点径（数据单位）。
-    private const double CenterDotRadius = 1.5;   // 点中心实心圆固定半径（数据单位）
+    private const double PointGlyphScale = 0.25;  // 2026-10-17 减半 0.5；2026-10-26 用户：边框再减半 → 0.25
+    // 2026-10-26 用户裁定：中心点为固定 1 像素（0.5 输出单位半径），不随点大小/缩放变化（原 CenterDotRadius=1.5 数据单位已删除）；
+    // 仅周围方框/圆框/+/X/竖线随点渲染比例（PointGlyphRadius）缩放。
     private double PointGlyphRadius()
     {
         double viewH = _h;
@@ -5216,9 +5255,13 @@ internal partial class ImageEngine
 
     private bool HasVisiblePointGlyph()
     {
-        if (Math.Abs(_pdSize) < 1e-12) return false;   // PDSIZE=0：点无墨迹（与 EmitPoint 一致）→ 无需扩界
+        // 2026-10-26 用户裁定：中心点恒为固定 1 像素（0.5 输出单位半径），不会超出画布被裁 → 纯点无需扩界；
+        // 仅当点样式含外框（位 32/64）或臂（+/×/竖线，shape 2/3/4）时字形会超出点位置，才需扩界保证完整可见。
         int mode = _pdMode;
-        if ((mode & 7) == 1 && (mode & 96) == 0) return false;   // PDMODE=1：无可见字形
+        int shape = mode & 7;
+        bool hasFrame = (mode & 96) != 0;
+        if (shape == 0) return false;                   // 纯点：固定 1px，不扩界
+        if (shape == 1 && !hasFrame) return false;      // PDMODE=1 无框：无可见字形（与 EmitPoint 一致）
         foreach (var ent in AllEntities())
             if (ent is Point) return true;
         return false;

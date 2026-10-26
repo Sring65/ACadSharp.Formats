@@ -1481,8 +1481,12 @@ internal partial class ImageEngine
         return segs;
     }
 
-    // Wipeout 世界坐标多边形（三引擎共享）：擦除多边形，世界点 = InsertPoint + X·UVector + Y·VVector
-    //（ClipBoundaryVertices 为 OCS 平面内每像素偏移，U/V 为每像素方向向量，均取 XY 分量做 2D 渲染）。
+    // Wipeout 世界坐标多边形（三引擎共享）：擦除多边形。
+    // 有 310 世界 blob → 直接采用（权威世界几何）。
+    // 无 blob（DWG 不存该 blob）或损坏 → 用局部顶点重建：
+    //   world = InsertPoint + (x+0.5)·UVector + (0.5−y)·VVector
+    // 局部顶点是图像归一化坐标（原点在图像中心、y 向下），不是“相对 insert 的每像素偏移”：
+    // 标准式 origin+x·U+y·V 会 y 镜像错位（三个样本 310 逐点验证：ALT 式 d=0.000，STD 式偏移 51–123 单位）。
     // tr 非空时 InsertPoint 整体世界化、U/V 只取线性部分（旋转+缩放、不平移）。
     // 顶点 <2 或全退化返回空列表。
     private static List<(double X, double Y)> WipeoutWorldPoly(Wipeout wo, Transform2D tr)
@@ -1493,7 +1497,8 @@ internal partial class ImageEngine
         // [PATCH] 优先消费 DXF 92/310 世界裁剪预览 blob（TryDecodeWorldClip 校验
         // int32[0]==总长、int32[4]==顶点数）：它就是权威世界几何。部分文件的 14/24 局部顶点
         // 是该 blob 的镜像（WO1 同边长 Y 镜像、WO2 鞋带符号相反），只用局部顶点会把擦除形状
-        // 画成错位/翻转的。blob 缺失（DWG 不存该 blob）或损坏时回退 origin + x·U + y·V。
+        // 画成错位/翻转的。blob 缺失（DWG 不存该 blob）或损坏时，用图像归一化坐标式重建：
+        // world = origin + (x+0.5)·U + (0.5−y)·V（见方法头注释）。
         if (wo.WorldClipPreview != null && CadWipeoutBase.TryDecodeWorldClip(wo.WorldClipPreview, out var wv))
         {
             foreach (var v in wv)
@@ -1527,8 +1532,9 @@ internal partial class ImageEngine
         }
         foreach (var c in clip)
         {
-            double wx = ix + c.X * ux + c.Y * vx;
-            double wy = iy + c.X * uy + c.Y * vy;
+            // 局部顶点 = 图像归一化坐标（居中、y 向下）→ world = insert + (x+0.5)·U + (0.5−y)·V
+            double wx = ix + (c.X + 0.5) * ux + (0.5 - c.Y) * vx;
+            double wy = iy + (c.X + 0.5) * uy + (0.5 - c.Y) * vy;
             pts.Add((wx, wy));
         }
         return pts;

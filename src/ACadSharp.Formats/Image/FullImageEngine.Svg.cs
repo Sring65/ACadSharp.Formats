@@ -3582,7 +3582,14 @@ internal partial class ImageEngine
     }
 
     // 解析文字样式的 SHX 文本面：latin=unifont/bigfont 拉丁面（按 Filename），cjk=bigfont CJK 面（按 BigFontFilename）。
-    // 非 .shx 样式、字体文件缺失、或格式不符 → 返回 false（调用方走原 TTF 路径）。
+    //
+    // 【字体降级 2026-10-27 用户需求】渲染图片/PDF/SVG 时样式引用的 SHX 字体找不到 → 默认降级使用项目部署的
+    // Support\fonts\Hztxt.shx（经 FileProvider 解析；未部署则返回 null → 行为与改动前完全一致）。
+    // 注意：Hztxt.shx 为纯 CJK BigFont——实测无任何 ASCII 字形（0x20–0x7E 全缺）——只能作 CJK 面；
+    // 或「文字含 CJK 且主字体缺失」时兼作 latin 面（此时拉丁/符号缺字形仅留 advance 间隙）。
+    // 纯拉丁/符号文字主字体缺失时保持原 TTF 路径（降级 Hztxt 会让拉丁字消失，属劣化）。
+    // 返回 false = 该文字不走 SHX 路径（调用方回退 TTF）：非 SHX 样式（.ttf/.ttc）、
+    // 主字体缺失且文字不含 CJK（或 Hztxt.shx 也未部署）等。
     private bool TryGetShxTextFaces(TextEntity t, out ShxFont latin, out ShxFont cjk)
     {
         latin = null; cjk = null;
@@ -3592,26 +3599,83 @@ internal partial class ImageEngine
         string low = fname.Trim().ToLowerInvariant();
         // TTF/TTC 明确走 TTF 路径（不探 SHX）。
         if (low.EndsWith(".ttf", StringComparison.Ordinal) || low.EndsWith(".ttc", StringComparison.Ordinal)) return false;
-        // SHX 判定：样式表里 SHX 字体名可能带 .shx 也可能不带（如 "simplex"/"hztxt"——HZTXT 样式实测）。
-        // 仅当 FileProvider 能把它解析成真实 .shx 文件时才走 SHX，避免把 arial/simsun 等 TTF 族名（无扩展名写法）
-        // 误判为 SHX 并刷"形状库未找到"警告；解析不到 → 回退 TTF，行为不劣化。
+        bool hasCjk = false;
+        foreach (var ch in t.Value ?? "") if (ch >= 0x2E80) { hasCjk = true; break; }
+        latin = TryLoadShxTextFace(fname);
+        if (latin == null)
+        {
+            // 主字体未找到：文字含 CJK → latin 面降级 Hztxt.shx（CJK 可渲染；拉丁/符号缺字形仅留间隙）；
+            // 纯拉丁/符号 → false（原 TTF 路径；Hztxt 无 ASCII 字形，降级会劣化）。
+            if (!hasCjk) return false;
+            latin = FallbackShxBigFace();
+            if (latin == null) return false;
+            LogShxFallback(fname, "主字体");
+        }
+        ResolveShxCjkFace(bfname, latin, out cjk);
+        return true;
+    }
+
+    // ---- SHX 字体降级辅助（降级默认字体 = Support\fonts\Hztxt.shx，2026-10-27 用户需求）----
+
+    // 降级默认字体名（经 FileProvider 解析到 Support\fonts\ 部署目录）。
+    private const string ShxTextFallbackFont = "Hztxt.shx";
+
+    // 降级日志去重（static：同进程多次渲染同一字体名只打印一次，避免控制台刷屏）。
+    private static readonly System.Collections.Generic.HashSet<string> _shxFallbackLogged =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    // 字体降级日志（按 字体名+角色 去重，仅首次打印）。
+    private void LogShxFallback(string fontName, string role)
+    {
+        string key = string.IsNullOrEmpty(fontName) ? "<未指定>" : fontName.Trim();
+        lock (_shxFallbackLogged)
+        {
+            if (!_shxFallbackLogged.Add(key + "\u0000" + role)) return;
+        }
+        _log($"   [字体降级] SHX {role} \"{key}\" 未找到（缺失或格式不符）→ 降级默认字体 {ShxTextFallbackFont}（纯 CJK BigFont，无 ASCII 字形）");
+    }
+
+    // 把 fontName 解析为可用 SHX 文字面（unifont/bigfont/文字型 shape）；
+    // .ttf/.ttc、解析不到（文件缺失）、加载失败、非文字面 → null。
+    private ShxFont? TryLoadShxTextFace(string fontName)
+    {
+        if (string.IsNullOrWhiteSpace(fontName)) return null;
+        string low = fontName.Trim().ToLowerInvariant();
+        if (low.EndsWith(".ttf", StringComparison.Ordinal) || low.EndsWith(".ttc", StringComparison.Ordinal)) return null;
         string probe = "";
-        try { probe = _opt.FileProvider?.Invoke(fname) ?? ""; } catch { }
-        if (string.IsNullOrEmpty(probe) || !File.Exists(probe)) return false; // 无对应 .shx 文件 → TTF
-        var lat = GetShapeFont(fname); // 已确认能解析到 .shx，直接加载（按文件名缓存）
-        if (lat == null) return false;
+        try { probe = _opt.FileProvider?.Invoke(fontName) ?? ""; } catch { }
+        if (string.IsNullOrEmpty(probe) || !File.Exists(probe)) return null; // 无对应 .shx 文件
+        var f = GetShapeFont(fontName); // 已确认能解析到 .shx，直接加载（按文件名缓存）
+        if (f == null) return null;
         // Unifont/BigFont 是常规文字面；Shapes 容器若带 shape-0 字体定义（"形状外衣的文字面"，如 rs.shx）也接受
         // （IsTextFont 由 LoadShapes 判定），其字形按字符码=形状号直接查表，advance/缩放路径与 unifont 一致。
-        bool latOk = lat.Format == ShxFormat.Unifont || lat.Format == ShxFormat.BigFont
-            || (lat.Format == ShxFormat.Shapes && lat.IsTextFont);
-        if (!latOk) return false;
-        latin = lat;
-        if (!string.IsNullOrWhiteSpace(bfname))
+        return f.Format == ShxFormat.Unifont || f.Format == ShxFormat.BigFont
+            || (f.Format == ShxFormat.Shapes && f.IsTextFont) ? f : null;
+    }
+
+    // 把 fontName 解析为 BigFont（CJK 面）；失败（含"能解析但非 BigFont 格式"）→ null。
+    private ShxFont? TryLoadShxBigFace(string fontName)
+    {
+        var f = TryLoadShxTextFace(fontName);
+        return f != null && f.Format == ShxFormat.BigFont ? f : null;
+    }
+
+    // 降级 CJK 面：Support\fonts\Hztxt.shx（FileProvider 解析；未部署 → null）。
+    private ShxFont? FallbackShxBigFace() => TryLoadShxBigFace(ShxTextFallbackFont);
+
+    // CJK 面解析：优先声明的 bigfont；缺失/非 BigFont → 字体降级：
+    //   latin 面本身即 BigFont（如样式直接引用 hztxt.shx）→ 复用 latin 面
+    //   （与 AutoCAD 一致：主字体为 BigFont 且未指定大字体时，CJK 用主字体）；
+    //   否则 → 降级 Hztxt.shx（未部署 → cjk 仍 null，调用方按原逻辑回退 TTF）。
+    private void ResolveShxCjkFace(string bigFontName, ShxFont latin, out ShxFont cjk)
+    {
+        cjk = TryLoadShxBigFace(bigFontName);
+        if (cjk == null)
         {
-            var big = GetShapeFont(bfname);
-            if (big != null && big.Format == ShxFormat.BigFont) cjk = big;
+            cjk = latin.Format == ShxFormat.BigFont ? latin : FallbackShxBigFace();
+            if (cjk != null && cjk != latin)
+                LogShxFallback(string.IsNullOrEmpty(bigFontName) ? null : bigFontName, "大字体");
         }
-        return true;
     }
 
     // SHX 文字 → 世界坐标（数据单位，y 向上）笔路径。返回 null = 该文字不适合 SHX 路径
@@ -3786,39 +3850,40 @@ internal partial class ImageEngine
     }
 
     // ---- MTEXT 逐 run SHX 笔迹（基础样式 simplex.shx / \Fsimplex 等）----
-    // 解析给定字体名 → SHX 面（latin），并可选 bigfont（cjk）。非 SHX（无对应 .shx 文件 / .ttf/.ttc）→ false。
-    private bool TryResolveShxFaces(string fontName, string bigFontName, out ShxFont latin, out ShxFont cjk)
+    // 解析给定字体名 → SHX 面（latin），并可选 bigfont（cjk）。非 SHX（.ttf/.ttc）→ false。
+    // 【字体降级 2026-10-27】与 TryGetShxTextFaces 同规则：主字体缺失且文字含 CJK → latin 面降级 Hztxt.shx；
+    // 纯拉丁/符号文字主字体缺失 → false（原 TTF 路径）；bigfont 缺失 → CJK 面降级 Hztxt.shx。
+    // text = run 文本（用于降级时判断是否含 CJK；必须与实际渲染文本一致，保证估宽/换行与渲染一致）。
+    private bool TryResolveShxFaces(string fontName, string bigFontName, string text, out ShxFont latin, out ShxFont cjk)
     {
         latin = null; cjk = null;
         if (string.IsNullOrWhiteSpace(fontName)) return false;
         string low = fontName.Trim().ToLowerInvariant();
         if (low.EndsWith(".ttf", StringComparison.Ordinal) || low.EndsWith(".ttc", StringComparison.Ordinal)) return false;
-        string probe = "";
-        try { probe = _opt.FileProvider?.Invoke(fontName) ?? ""; } catch { }
-        if (string.IsNullOrEmpty(probe) || !File.Exists(probe)) return false;
-        var lat = GetShapeFont(fontName);
-        if (lat == null) return false;
-        bool latOk = lat.Format == ShxFormat.Unifont || lat.Format == ShxFormat.BigFont
-            || (lat.Format == ShxFormat.Shapes && lat.IsTextFont);
-        if (!latOk) return false;
-        latin = lat;
-        if (!string.IsNullOrWhiteSpace(bigFontName))
+        bool hasCjk = false;
+        if (text != null) foreach (var ch in text) if (ch >= 0x2E80) { hasCjk = true; break; }
+        latin = TryLoadShxTextFace(fontName);
+        if (latin == null)
         {
-            var big = GetShapeFont(bigFontName);
-            if (big != null && big.Format == ShxFormat.BigFont) cjk = big;
+            // 主字体未找到：含 CJK → 降级 Hztxt.shx；纯拉丁/符号 → false（Hztxt 无 ASCII 字形，降级会劣化）。
+            if (!hasCjk) return false;
+            latin = FallbackShxBigFace();
+            if (latin == null) return false;
+            LogShxFallback(fontName, "主字体");
         }
+        ResolveShxCjkFace(bigFontName, latin, out cjk);
         return true;
     }
 
     // 为一段 MTEXT run 文本构建局部 SHX 笔迹路径（原点=基线左端、+x 右 +y 上，数据单位）。
     //   width = 实际 advance 总宽（数据单位，已乘 wf），供调用方精确定位后续 run / 换行。
-    // 返回 false = 不适配 SHX（非 SHX 字体 / 含 CJK 但无 bigfont / 全缺字形）→ 调用方回退 TTF。
+    // 返回 false = 不适配 SHX（非 SHX 字体 / 含 CJK 但无可用 bigfont（声明与降级均缺失）/ 全缺字形）→ 调用方回退 TTF。
     private bool TryBuildMTextShxLocal(string fontName, string bigFontName, string text, double H, double wf,
         out List<int> types, out List<double[]> pts, out double width)
     {
         types = null; pts = null; width = 0;
         if (string.IsNullOrEmpty(text)) return false;
-        if (!TryResolveShxFaces(fontName, bigFontName, out ShxFont latin, out ShxFont cjk)) return false;
+        if (!TryResolveShxFaces(fontName, bigFontName, text, out ShxFont latin, out ShxFont cjk)) return false;
         bool hasCjk = false;
         foreach (var ch in text) if (ch >= 0x2E80) { hasCjk = true; break; }
         System.Text.Encoding gbk = null;
@@ -3884,7 +3949,7 @@ internal partial class ImageEngine
     {
         width = 0;
         if (string.IsNullOrEmpty(text)) return false;
-        if (!TryResolveShxFaces(fontName, bigFontName, out ShxFont latin, out ShxFont cjk)) return false;
+        if (!TryResolveShxFaces(fontName, bigFontName, text, out ShxFont latin, out ShxFont cjk)) return false;
         bool hasCjk = false;
         foreach (var ch in text) if (ch >= 0x2E80) { hasCjk = true; break; }
         if (hasCjk)
@@ -3929,7 +3994,7 @@ internal partial class ImageEngine
         if (ch >= 0x2E80) return 0; // CJK bigfont → 不计
         if (!(H > 1e-9)) return 0;
         if (!(wf > 1e-9)) wf = 1.0;
-        if (!TryResolveShxFaces(fontName, bigFontName, out ShxFont latin, out _)) return 0;
+        if (!TryResolveShxFaces(fontName, bigFontName, text, out ShxFont latin, out _)) return 0;
         if (latin == null) return 0;
         if (!latin.TryGetAdvance(ch, out float advF)) return 0;
         if (!latin.TryGetInkRight(ch, out float inkR)) return 0;
@@ -3952,7 +4017,7 @@ internal partial class ImageEngine
         if (ch >= 0x2E80) return 0; // CJK bigfont → 不计
         if (!(H > 1e-9)) return 0;
         if (!(wf > 1e-9)) wf = 1.0;
-        if (!TryResolveShxFaces(fontName, bigFontName, out ShxFont latin, out _)) return 0;
+        if (!TryResolveShxFaces(fontName, bigFontName, text, out ShxFont latin, out _)) return 0;
         if (latin == null) return 0;
         if (!latin.TryGetInkLeft(ch, out float inkL)) return 0;
         if (inkL <= 0) return 0; // 墨迹左伸/贴边 → 无留白可让

@@ -1833,7 +1833,9 @@ internal partial class ImageEngine
         return true;
     }
 
-    // 沿路径走查模式（WalkPattern 的位图版）：dash→线子路径；gap→留空；shape→段中点真实 SHX 字形（沿切向，走精灵缓存）。
+    // 沿路径走查模式（WalkPattern 的位图版，算法与 SVG/PDF 完全一致）：
+    //   dash 段→线子路径；正跨度 shape 段→线子路径 + 段末字形；间隙型 shape→段末字形（不画线）；
+    //   gap 段→留空；text 段→跨度中点文字。起始相位同 PatternPhase（首字形两端对称规则）。
     // colRgb/widthPx 透传给字形精灵（同线宽+同颜色变体才可缓存）；shapeEmitted 累加已 blit 的字形段数。
     private void WalkPatternPx(PolyBuilder pb, List<(double X, double Y)> pts, double[] cum, LtpPattern pat,
         List<LtpTextPlace> textOut, RasterCanvas.Rgb colRgb, float widthPx, ref int shapeEmitted)
@@ -1842,38 +1844,89 @@ internal partial class ImageEngine
         var segs = pat.Segs;
         int n = segs.Count;
         if (L <= 1e-9 || n == 0) return;
-        double pos = 0;
-        int i = 0, guard = 0;
+        var cumpat = new double[n + 1];
+        for (int j = 0; j < n; j++) cumpat[j + 1] = cumpat[j] + segs[j].Len;
+        double phi = PatternPhase(pat, L);
+        int i = 0;
+        while (i < n - 1 && cumpat[i + 1] <= phi) i++;
+        double pos = phi;
+        double into = phi - cumpat[i];
         bool perf = PerfOn;
-        while (pos < L - 1e-9 && guard++ < 50000000)
+        double firstStart = double.MaxValue, lastEnd = -1.0; // 已画实线跨度的首/末（供端部空段填充，与 SVG/PDF 一致）
+        int guard = 0;
+        while (pos < L + phi - 1e-9 && guard++ < 50000000)
         {
             var seg = segs[i % n];
             double span = seg.Len;
-            if (seg.Kind == LtpSeg.Dash)
+            double take = Math.Max(0, Math.Min(span - into, (L + phi) - pos));
+            if (take > 1e-12)
             {
-                if (perf) { _lwDashCnt++; long _a0 = Environment.TickCount64; AppendSpanPb(pb, pts, cum, pos, Math.Min(pos + span, L)); _lwDashMs += Environment.TickCount64 - _a0; }
-                else AppendSpanPb(pb, pts, cum, pos, Math.Min(pos + span, L));
+                double p0 = pos - phi;
+                double p1 = p0 + take;
+                if (seg.Kind == LtpSeg.Dash)
+                {
+                    if (perf) { _lwDashCnt++; long _a0 = Environment.TickCount64; AppendSpanPb(pb, pts, cum, p0, p1); _lwDashMs += Environment.TickCount64 - _a0; }
+                    else AppendSpanPb(pb, pts, cum, p0, p1);
+                    if (p0 < firstStart) firstStart = p0;
+                    if (p1 > lastEnd) lastEnd = p1;
+                }
+                else if (seg.Kind == LtpSeg.Shape && !seg.InGap)
+                {
+                    AppendSpanPb(pb, pts, cum, p0, p1); // 正跨度 shape 段同样画线（与 SVG/PDF 一致）
+                    if (p0 < firstStart) firstStart = p0;
+                    if (p1 > lastEnd) lastEnd = p1;
+                }
             }
-            else if (seg.Kind == LtpSeg.Shape)
+            if (seg.Kind == LtpSeg.Shape)
             {
                 long _b0 = 0;
                 if (perf) { _lwShapeCnt++; _b0 = Environment.TickCount64; }
-                double at = pos + seg.CenterOffset;
-                PathPointAt(pts, cum, at, out double px, out double py, out double tx, out double ty);
-                EmitShapeGlyphPng(px, py, tx, ty, seg, colRgb, widthPx);
-                shapeEmitted++;
+                // 字形置于段跨度末端（图案绝对坐标含周期偏移：pos 为段起点的图案绝对坐标，
+                // 末端 = pos + (span−into)；若用 cumpat[(i%n)+1] 则丢失周期数，字形冻结在第一周期，
+                // 且 φ 大于段内坐标时首字形位置为负被误裁剪；含零长间隙型段——take=0 也需输出）
+                double glyphAt = pos + (span - into) - phi;
+                // 对齐 AutoCAD 参考（参考模型 PDF 实测）：仅当段末之后紧接的下一段也完整落在线内时
+                // 才输出该段末字形——如线端附近的 tick 段完整画出、但下一 shape 段溢出线端时，
+                // 该段末的 tick 字形被省略（线跨度本身仍画）。仅用 glyphAt<=L 会多画这类端部字形。
+                double nextLen = Math.Abs(segs[(i + 1) % n].Len);
+                // 头端规则（同 SVG WalkPattern）：首实线跨度出现前（头端填充区）不输出字形，
+                // 头端保持干净直线（BATTING 弹簧头端 ∪ 省略，与 AutoCAD 参考一致）。
+                if (glyphAt >= -1e-9 && glyphAt + nextLen <= L + 1e-9 && firstStart != double.MaxValue)
+                {
+                    double at = Math.Max(0.0, Math.Min(L, glyphAt));
+                    PathPointAt(pts, cum, at, out double px, out double py, out double tx, out double ty);
+                    EmitShapeGlyphPng(px, py, tx, ty, seg, colRgb, widthPx);
+                    shapeEmitted++;
+                }
                 if (perf) _lwShapeMs += Environment.TickCount64 - _b0;
             }
             else if (seg.Kind == LtpSeg.Text && textOut != null && !string.IsNullOrEmpty(seg.TextContent))
             {
                 if (perf) _lwTextCnt++;
-                double at = pos + seg.CenterOffset;
-                PathPointAt(pts, cum, at, out double cx, out double cy, out double tx, out double ty);
-                textOut.Add(BuildTextPlace(cx, cy, tx, ty, seg));
+                // 文字段端部规则（与 SVG/PDF 一致，参考 PDF 实测）：文字段【整体】完整落在线内才输出
+                // （GAS 第 4 段 [134.528,142.148] 末越出 L=141.421 即省略，起点在线内也不例外）。
+                double textAt = pos + (span - into) - seg.Len / 2.0 - phi;
+                if (textAt - seg.Len / 2.0 >= -1e-9 && textAt + seg.Len / 2.0 <= L + 1e-9)
+                {
+                    double at = Math.Max(0.0, Math.Min(L, textAt));
+                    PathPointAt(pts, cum, at, out double cx, out double cy, out double tx, out double ty);
+                    textOut.Add(BuildTextPlace(cx, cy, tx, ty, seg));
+                }
             }
             if (perf) _lwWalkIters++;
-            pos += span;
+            pos += take;
             i++;
+            into = 0;
+        }
+        // 端部空段填充（参考 AutoCAD 模型 PDF 流实测，与 WalkPattern 一致）：线端落在
+        // gap/文字段的不完整空段画成实心（'GAS_LINE' 实测 [0,6.8932]∪[134.5282,141.4214] 实线）；
+        // 两端落在实线段中时为无操作（RED/CYAN 不受影响）。
+        if (lastEnd < 0.0)
+            AppendSpanPb(pb, pts, cum, 0.0, L);
+        else
+        {
+            if (firstStart > 1e-9) AppendSpanPb(pb, pts, cum, 0.0, firstStart);
+            if (L - lastEnd > 1e-9) AppendSpanPb(pb, pts, cum, lastEnd, L);
         }
     }
 
@@ -1938,10 +1991,11 @@ internal partial class ImageEngine
         // 角度量化到 1°（key 与渲染同用量化值，保证同 key 同像素）。
         double angQ = Math.Round(ang * 180.0 / Math.PI) * Math.PI / 180.0;
         double ca = Math.Cos(angQ), sa = Math.Sin(angQ);
-        // offset（DXF 44/45）：字形局部 +X 与路径行进方向相反 → 切向分量取负，法向分量取 OY。
+        // offset（DXF 44/45）：字形原点（插入点）= 路径点 + OX·切向 + OY·法向(-ty,tx)，AutoCAD 语义，
+        // 与 Svg.cs EmitShapeGlyph 一致（旧实现切向取负 → BATTING 拱错位半周期、螺旋方向看似与 CAD 相反）。
         // anchor=路径点+offset：字形原点的精确世界位置（OX/OY 只影响 anchor 位置，不影响精灵内容，故不入 key）。
-        double oxw = -seg.OX * tx - seg.OY * ty;
-        double oyw = -seg.OX * ty + seg.OY * tx;
+        double oxw = seg.OX * tx - seg.OY * ty;
+        double oyw = seg.OX * ty + seg.OY * tx;
         double anchorX = px + oxw, anchorY = py + oyw;
 
         // 精灵内字形相对 anchor 的旋转包围盒（4 角点旋转取极值）→ left/right/top/bottom（数据单位）。

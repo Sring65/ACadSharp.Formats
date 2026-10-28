@@ -275,6 +275,8 @@ internal partial class ImageEngine
                             TextScale = s0.Scale > 0 ? s0.Scale : 1.0,
                             TextRot = s0.Rotation * 180.0 / Math.PI,
                             TextFont = fam,
+                            OX = s0.Offset.X,   // 组码 44（数据单位；参考实测不施加，存档备用）
+                            OY = s0.Offset.Y,   // 组码 45（数据单位；参考施加为基线垂直偏移，经 pat.Scaled 乘图案比例）
                         });
                     }
                     else if (l > 1e-9) pat.Segs.Add(new LtpSeg { Kind = LtpSeg.Dash, Len = l });
@@ -299,13 +301,16 @@ internal partial class ImageEngine
                 pat.Segs.Clear();
                 pat.Segs.AddRange(pm);
                 // Shape/Text 放置位置（相对段起点）：
-                //  - 笔落型（段长>0，符号落在实线上）：居中于自身段；
-                //  - 间隙型（段长≤0，符号在空隙内，如 914C 的"点"）：居中于"总空隙"（AutoCAD 一致）。
+                //  - Shape：按 DXF 规范字形原点落在【自身段跨度末端】（正跨度与间隙型一致）。
+                //    旧实现的"段中点/总空隙中点"经参考 PDF 实测证伪：'444' 的刻度/圆与 '10422' 的
+                //    刻度/靶心位置全部 = 段跨度末端（4.5/9.5 与 0.75/2.25），误差 <0.001u。
+                //  - Text：仍居中于自身段跨度（线在文字处断开，文字置于跨度中点；间隙型用总空隙中点）。
                 int pn = pat.Segs.Count;
                 for (int j = 0; j < pn; j++)
                 {
                     var s0 = pat.Segs[j];
-                    if (s0.Kind != LtpSeg.Shape && s0.Kind != LtpSeg.Text) continue;
+                    if (s0.Kind == LtpSeg.Shape) { s0.CenterOffset = s0.Len; continue; }
+                    if (s0.Kind != LtpSeg.Text) continue;
                     if (!s0.InGap) { s0.CenterOffset = s0.Len / 2; continue; }
                     double gapBefore = pat.Segs[(j - 1 + pn) % pn].Kind == LtpSeg.Gap ? pat.Segs[(j - 1 + pn) % pn].Len : 0;
                     double gapAfter = pat.Segs[(j + 1) % pn].Kind == LtpSeg.Gap ? pat.Segs[(j + 1) % pn].Len : 0;
@@ -600,7 +605,33 @@ internal partial class ImageEngine
         }
     }
 
-    // 沿路径走查模式：dash 段→线子路径；gap 段→留空；shape 段→段中点处真实 SHX 字形（沿切向）。
+    // 图案起始相位（路径起点处的图案坐标）。
+    // DXF 实体未记录 code42（起始偏移），参考（AutoCAD）的布局满足不变式：
+    //   线两端关于【首字形图案位置 T】对称，即 q(起点)+q(终点) ≡ T (mod P)。
+    // 设线长 L，则 q(终点) ≡ q(起点)+L (mod P) ⇒ q(起点) = (T − (L mod P))/2 (mod P)。
+    // 已对参考 PDF 两条线型数值验证：'444'(P=10,T=4.5) 刻度/圆/间隙 与 '10422'(P=3,T=0.75)
+    // 刻度/靶心 全部落在预测位置，误差 <0.001u（L=31.43u/34.03u，约 24 个字形）。
+    // 纯文本图案（无 Shape 段）：锚点取首个文字段【起点】T（参考 PDF 实测同一对称不变式：
+    //   'GAS_LINE' σ=1.5 时 T=19.05（首 dash 末=文字段起点），φ=(T−(L mod P))/2 mod P = 29.3018，
+    //   与实测 29.297±0.005u 吻合）。既有 Shape 锚点规则（'444'/'10422'）不受影响。
+    // 既无 Shape 也无 Text 段的线型保持 φ=0（自路径起点走查，与旧行为一致）。
+    private static double PatternPhase(LtpPattern pat, double L)
+    {
+        double P = pat.Period;
+        if (P <= 1e-9) return 0;
+        double T = pat.PhaseAnchor();
+        if (T < 0) return 0;
+        double phi = (T - L % P) / 2.0;
+        phi %= P;
+        if (phi < 0) phi += P;
+        return phi;
+    }
+
+    // 沿路径走查模式（SVG/PDF 共用）：
+    //   dash 段→线子路径；正跨度 shape 段→线子路径 + 段末字形；间隙型 shape→段末字形（不画线）；
+    //   gap 段→留空；text 段→跨度中点文字（线断开）。
+    // 起始相位见 PatternPhase：从 φ 处切入图案（定位所在段），首末段按路径裁剪。
+    // 字形/文字位置 = 其段跨度末端/中点的图案坐标 − φ（转路径坐标），越界不输出。
     private void WalkPattern(StringBuilder d, List<(double X, double Y)> pts, double[] cum, LtpPattern pat,
         Func<double, double> fx, Func<double, double> fy, bool pdf, List<LtpTextPlace> textOut = null)
     {
@@ -608,56 +639,130 @@ internal partial class ImageEngine
         var segs = pat.Segs;
         int n = segs.Count;
         if (L <= 1e-9 || n == 0) return;
-        double pos = 0;
-        int i = 0, guard = 0;
-        while (pos < L - 1e-9 && guard++ < 50000000)
+        // 图案坐标累计跨度：cumpat[j] = 第 j 段起点在图案中的位置
+        var cumpat = new double[n + 1];
+        for (int j = 0; j < n; j++) cumpat[j + 1] = cumpat[j] + segs[j].Len;
+        double phi = PatternPhase(pat, L);
+        bool _dbg = System.Environment.GetEnvironmentVariable("GDB2CAD_LTP_DEBUG") != null
+            && pat.Period > 10.0 && pat.Period < 11.0 && segs.Count == 4;
+        var _dbgGlyphs = new System.Collections.Generic.List<string>();
+        if (_dbg)
+            System.Console.Error.WriteLine(string.Format("[LTPDBG] L={0:F6} P={1:F6} phi={2:F6} T={3:F6}", L, pat.Period, phi, pat.PhaseAnchor()));
+        // 起点所在段：cumpat[i] <= phi < cumpat[i+1]（φ 恰在边界时归后一段，into=0）
+        int i = 0;
+        while (i < n - 1 && cumpat[i + 1] <= phi) i++;
+        double pos = phi;                 // 当前图案空间位置
+        double into = phi - cumpat[i];    // 段内偏移
+        double firstStart = double.MaxValue, lastEnd = -1.0; // 已画实线跨度的首/末（供端部空段填充）
+        int guard = 0;
+        while (pos < L + phi - 1e-9 && guard++ < 50000000)
         {
             var seg = segs[i % n];
             double span = seg.Len;
-            if (seg.Kind == LtpSeg.Dash)
+            double take = Math.Max(0, Math.Min(span - into, (L + phi) - pos));
+            if (take > 1e-12)
             {
-                AppendSpanPath(d, pts, cum, pos, Math.Min(pos + span, L), fx, fy, pdf);
+                double p0 = pos - phi;    // 本切片路径坐标
+                double p1 = p0 + take;
+                if (seg.Kind == LtpSeg.Dash || (seg.Kind == LtpSeg.Shape && !seg.InGap))
+                {
+                    AppendSpanPath(d, pts, cum, p0, p1, fx, fy, pdf);
+                    if (p0 < firstStart) firstStart = p0;
+                    if (p1 > lastEnd) lastEnd = p1;
+                }
             }
-            else if (seg.Kind == LtpSeg.Shape)
+            if (seg.Kind == LtpSeg.Shape)
             {
-                // 形状中心位置：正跨度=自身段中点；间隙型=总空隙中点（构建时算好，见 LtpSeg.CenterOffset）
-                double at = pos + seg.CenterOffset;
-                PathPointAt(pts, cum, at, out double px, out double py, out double tx, out double ty);
-                EmitShapeGlyph(d, pts, cum, at, px, py, tx, ty, seg, fx, fy, pdf);
+                // 字形置于段跨度末端（图案绝对坐标含周期偏移：pos 为段起点的图案绝对坐标，
+                // 末端 = pos + (span−into)；若用 cumpat[(i%n)+1] 则丢失周期数，字形冻结在第一周期，
+                // 且 φ 大于段内坐标时首字形位置为负被误裁剪；含零长间隙型段——take=0 也需输出）
+                double glyphAt = pos + (span - into) - phi;
+                // 对齐 AutoCAD 参考（参考模型 PDF 实测）：仅当段末之后紧接的下一段也完整落在线内时
+                // 才输出该段末字形——如线端附近的 tick 段完整画出、但下一 shape 段溢出线端时，
+                // 该段末的 tick 字形被省略（线跨度本身仍画）。仅用 glyphAt<=L 会多画这类端部字形。
+                double nextLen = Math.Abs(segs[(i + 1) % n].Len);
+                // 头端规则（用户指令：头尾伸出不足一个循环的按属性保持对称、直接渲染为直线）：
+                // 首实线跨度出现前的图案区（头端填充区 [0,firstStart]）内不输出字形——
+                // 如 BATTING 弹簧首切片落 InGap 段中、段末 ∪ 字形落在头端填充区内被省略，
+                // 头端保持干净直线引入（AutoCAD 参考头端无 ∪，仅被截断的 ∩ 左腿触轴）。
+                bool _emit = glyphAt >= -1e-9 && glyphAt + nextLen <= L + 1e-9 && firstStart != double.MaxValue;
+                if (_dbg)
+                    _dbgGlyphs.Add(string.Format("i={0} span={1:F3} into={2:F3} rotType={3} rotdeg={4:F0} OX={5:F3} OY={6:F3} InGap={7} glyphAt={8:F3} nextLen={9:F3} emit={10}",
+                        i, span, into, seg.RotType, seg.ShapeRot, seg.OX, seg.OY, seg.InGap, glyphAt, nextLen, _emit));
+                if (_emit)
+                {
+                    double at = Math.Max(0.0, Math.Min(L, glyphAt));
+                    PathPointAt(pts, cum, at, out double px, out double py, out double tx, out double ty);
+                    EmitShapeGlyph(d, pts, cum, at, px, py, tx, ty, seg, fx, fy, pdf);
+                }
             }
             else if (seg.Kind == LtpSeg.Text && textOut != null && !string.IsNullOrEmpty(seg.TextContent))
             {
-                // 文字段：段中点沿切向放置，基线居中、旋转=切向角+绝对旋转（数据系，CCW 正）。
-                double at = pos + seg.CenterOffset;
-                PathPointAt(pts, cum, at, out double cx, out double cy, out double tx, out double ty);
-                textOut.Add(BuildTextPlace(cx, cy, tx, ty, seg));
+                // 文字段：基线起点置于段跨度中点（参考 PDF 实测：3 个 "GAS" 的 Tm 原点全部落在
+                // 文字段跨度中点 29.7532/65.9482/102.1432，误差 <0.003u；字符串沿切向【正向】延伸，
+                // 而非以段中点为中心）。旋转=切向角+绝对旋转（数据系，CCW 正）。
+                double textAt = pos + (span - into) - seg.Len / 2.0 - phi;
+                // 端部规则（参考 PDF 实测）：文字段【整体】完整落在线内才输出——第 4 段
+                // [134.528,142.148] 末越出 L=141.421 即被省略（其起点虽在线内、且该区域被
+                // 端部填充画成实线）。比 shape 字形的"下一段也须完整"规则更松。
+                if (textAt - seg.Len / 2.0 >= -1e-9 && textAt + seg.Len / 2.0 <= L + 1e-9)
+                {
+                    double at = Math.Max(0.0, Math.Min(L, textAt));
+                    PathPointAt(pts, cum, at, out double cx, out double cy, out double tx, out double ty);
+                    textOut.Add(BuildTextPlace(cx, cy, tx, ty, seg));
+                }
             }
-            pos += span;
+            pos += take;
             i++;
+            into = 0;
+        }
+        // 端部空段填充（参考 AutoCAD 模型 PDF 流实测）：实体端落在 gap/文字段时，线端的不完整
+        // 空段画成【实心】。'GAS_LINE' 实测：线端空段 [0,6.8932]∪[134.5282,141.4214] 均为实线
+        // （流中仅 4 条显式线段、无 dash-array，排除虚线数组解释）。两端恰好落在实线段中时
+        // firstStart=0/lastEnd=L，本步为无操作（RED/CYAN 线型不受影响）。
+        if (lastEnd < 0.0)
+            AppendSpanPath(d, pts, cum, 0.0, L, fx, fy, pdf);      // 全程无实线跨度（全 gap/文字）→ 整线实心
+        else
+        {
+            if (firstStart > 1e-9) AppendSpanPath(d, pts, cum, 0.0, firstStart, fx, fy, pdf);
+            if (L - lastEnd > 1e-9) AppendSpanPath(d, pts, cum, lastEnd, L, fx, fy, pdf);
+        }
+        if (_dbg)
+        {
+            System.Console.Error.WriteLine(string.Format("[LTPDBG] firstStart={0:F3} lastEnd={1:F3} headFill=[0,{2:F3}] tailFill=[{3:F3},{4:F3}]",
+                firstStart, lastEnd, firstStart, lastEnd, L));
+            foreach (var g in _dbgGlyphs)
+                System.Console.Error.WriteLine("[LTPDBG] " + g);
         }
     }
 
-    // 文字段放置：以段中心 (cx,cy) 为基线中心，文字宽估算 0.6em·字数·字高，沿切向回退半宽得基线左端；
+    // 文字段放置（参考 AutoCAD 模型 PDF 实测，Tm 矩阵逐字反解）：
+    //   · 基线【起点】（首字形基线原点）= 段跨度中点，字符串沿切向正向延伸（不居中回退）；
+    //   · 垂直偏移 = 组码 45(OY)·图案比例（GAS：OY=−1.27→−1.905u，实测 −1.907±0.002u；
+    //     负值=行进方向右侧），组码 44(OX) 参考实测【不施加】（存档备用）；
+    //   · 字号 em = 组码 46·图案比例 ÷ capHeight 比（AutoCAD 把 46 当 cap 高：参考 'GAS'
+    //     Tf=937.36 user-u = 5.3224 模型u = 1.3970×(46·σ=3.81u)，与 Arial upem/cap=2048/1467
+    //     =1.3961 相差 0.06%，在 PDF 舍入误差内）。
     // 旋转 = 切向角 + 绝对旋转（数据系 CCW 正；水平线切向 0 → 文字水平）。
     private static LtpTextPlace BuildTextPlace(double cx, double cy, double tx, double ty, LtpSeg seg)
     {
         double h = seg.TextScale > 1e-9 ? seg.TextScale : 1.0;
-        int chars = Math.Max(1, seg.TextContent.Length);
-        double estW = 0.6 * h * chars;                 // 估算文字宽（数据单位）
         double tanAng = Math.Atan2(ty, tx) * 180.0 / Math.PI; // 数据系切向角（度）
         double rot = tanAng + seg.TextRot;
         double rad = rot * Math.PI / 180.0;
         double ca = Math.Cos(rad), sa = Math.Sin(rad);
-        // 基线左端 = 中心 - (estW/2) 沿切向（局部 x 轴）
-        double bx = cx - (estW / 2.0) * ca;
-        double by = cy - (estW / 2.0) * sa;
-        // 垂直居中：文字视觉中心约在基线上方 0.35*字高（大写字形 cap height≈0.7em 的一半）。
-        // 把基线沿局部 -y（数据系 = (sa,-ca)）平移 0.35h，使文字中心落在路径点上。
-        // 旧实现基线直接贴路径 → 文字主体偏路径上方、线段穿过文字底部而非中部（GAS 未居中）。
-        double vShift = 0.35 * h;
+        // 基线起点 = 段中点（cx,cy），无切向回退（参考：Tm 原点即段中点，字符串正向延伸）。
+        double bx = cx, by = cy;
+        // 垂直偏移：基线沿局部 -y（数据系 = (sa,−ca)，行进方向右侧）平移 −OY（OY 已含图案比例）。
+        // 参考实测 GAS 基线在段中点右侧 1.905u（= −OY·σ）；旧 0.35h 视觉居中不符参考，废弃。
+        double vShift = -seg.OY;
         bx += vShift * sa;
         by -= vShift * ca;
-        return new LtpTextPlace { X = bx, Y = by, RotDeg = rot, Height = h, Text = seg.TextContent, Font = seg.TextFont, WidthFactor = 1.0 };
+        // 字号：46 是 cap 高 → em = h×(upem/cap)。TTF 用字体自身指标（TtfCapScale）；
+        // SHX/无指标字体回退参考实测值 1.397（见方法头注释）。
+        double cap = TtfCapScale(seg.TextFont);
+        if (cap <= 1.0) cap = 1.397;
+        return new LtpTextPlace { X = bx, Y = by, RotDeg = rot, Height = h * cap, Text = seg.TextContent, Font = seg.TextFont, WidthFactor = 1.0 };
     }
 
     // 在路径点 (px,py) 绘制真实 SHX 字形（追加到 d）：字形包围盒中心对齐路径点，
@@ -695,11 +800,14 @@ internal partial class ImageEngine
             default: ang = 0; break;                   // upright
         }
         double ca = Math.Cos(ang), sa = Math.Sin(ang);
-        // offset（DXF 44/45）= 数据单位偏移。字形局部 +X 与路径行进方向【相反】（字形原点置于
-        // 段内位置、其 +X 指向路径前方之前），故切向分量取【负】：offset = -OX·切向 + OY·法向(-ty,tx)。
-        // 法向分量保持 OY（局部 +Y = 左法向的标准约定）。不随字形旋转、不乘字形缩放 S。
-        double oxw = -seg.OX * tx - seg.OY * ty;  // -切向*OX + 法向*OY → 世界 x
-        double oyw = -seg.OX * ty + seg.OY * tx;  // → 世界 y
+        // offset（DXF 44/45）= 数据单位偏移：字形原点（插入点）= 路径点 + OX·切向 + OY·法向(-ty,tx)，
+        // AutoCAD 语义（BATTING 参考实测：44=−2.54 的字形原点落在段末 glyphAt 之后 2.54 处、
+        // 拱心恰在 7.195@+侧；44=+2.54 的 180° 字形拱心在 12.275@−侧）。
+        // 旧实现切向分量取负（-44·切向）→ 原点沿路径错位 2×44=P/2，交替 ∩∪ 拱整体平移半周期，
+        // 视觉上与 CAD 的螺旋方向相反（实为半周期位置差，非镜像）。法向分量保持 OY
+        // （局部 +Y = 左法向；444/10422 的 45≠0 字形当前渲染正确，已验证）。不随字形旋转、不乘字形缩放 S。
+        double oxw = seg.OX * tx - seg.OY * ty;   // 切向*OX + 法向*OY → 世界 x
+        double oyw = seg.OX * ty + seg.OY * tx;   // → 世界 y
         // 【关键】SHX 字形按【原点(0,0)】锚定到"路径点+offset"（DXF 线型 shape 的插入点语义），
         // 不是按包围盒中心。BATTING 教训（Drawing1.dxf，CAD ground truth=弹簧状相切椭圆环）：
         // 若按包围盒中心锚定，BAT 字形弧心(1,2)=包围盒中心 → 弧心必然落在线型基线上，0°/180° 两个
@@ -907,7 +1015,7 @@ internal partial class ImageEngine
         public double ShapeScale;
         public int RotType;       // 0=upright 1=relative 2=absolute
         public double ShapeRot;   // 绝对旋转（度）
-        public double OX, OY;     // 形状偏移（字体单位）
+        public double OX, OY;     // 组码 44/45 偏移：Shape 段=字体单位；Text 段=数据单位（参考施加 OY 为基线垂直偏移，OX 不施加）
         public string TextContent; // Text：文字内容（组码 9）
         public double TextScale;   // Text：字高（组码 46，数据单位）
         public double TextRot;     // Text：绝对旋转（度，组码 50；0=沿切向）
@@ -948,6 +1056,57 @@ internal partial class ImageEngine
             }
             p.Period = this.Period * s;
             return p;
+        }
+
+        // 首个字形（Shape 段）的图案位置 = 累计跨度至该段末（含段长）；无 Shape 段返回 -1。
+        // 供 PatternPhase 计算起始相位：参考把图案布局为实体两端关于首字形图案位置对称。
+        public double FirstShapePos()
+        {
+            double c = 0;
+            foreach (var s in Segs)
+            {
+                c += s.Len;
+                if (s.Kind == LtpSeg.Shape) return c;
+            }
+            return -1;
+        }
+
+        // 首个文字（Text 段）的图案位置 = 累计跨度至该段【起点】；无 Text 段返回 -1。
+        // 纯文本线型（无 Shape 段）供 PatternPhase 用作锚点：参考 PDF 实测同一"两端关于
+        // 锚点对称"不变式成立，且锚点为首文字段起点（GAS：T=19.05，φ=29.3018 命中实测 29.297）。
+        public double FirstTextPos()
+        {
+            double c = 0;
+            foreach (var s in Segs)
+            {
+                if (s.Kind == LtpSeg.Text) return c;
+                c += s.Len;
+            }
+            return -1;
+        }
+
+        // 相位锚点 T（线两端实线伸出关于该图案位置对称），按首特征段【属性】判定（Shape 优先于 Text）：
+        //   正跨度（带实线）首字形段 → 段末（=字形位置；'444' T=4.5 / '10422' T=0.75 实测对称）；
+        //   间隙型 InGap 首字形段（段内无实线，如 BATTING 弹簧点线）→ 段【起点】（=前一段实线末；
+        //     AutoCAD 实测 BATTING 头尾伸出对称要求 T=0.00254=点线末=InGap 段起点，旧取段末 2.54254
+        //     致头 3.383/尾 5.923 不对称）；
+        //   无 Shape 段 → 首文字段起点（GAS T=19.05@σ1.5 实测命中）。
+        // 注意：返回【未缩放】锚点——调用方先 pat.Scaled(σ) 再取，与 FirstShapePos/FirstTextPos 一致。
+        public double PhaseAnchor()
+        {
+            double c = 0;
+            foreach (var s in Segs)
+            {
+                if (s.Kind == LtpSeg.Shape) return s.InGap ? c : c + s.Len;
+                c += s.Len;
+            }
+            c = 0;
+            foreach (var s in Segs)
+            {
+                if (s.Kind == LtpSeg.Text) return c;
+                c += s.Len;
+            }
+            return -1;
         }
     }
 

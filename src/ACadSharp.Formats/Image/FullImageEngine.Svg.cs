@@ -955,7 +955,8 @@ internal partial class ImageEngine
         if (ent is Ellipse el)
         {
             Apply(el.Center.X, el.Center.Y, out double cx, out double cy);
-            double rx = el.MajorAxis * (tr?.Scale ?? 1.0), ry = el.MinorAxis * (tr?.Scale ?? 1.0);
+            // fork MajorAxis/MinorAxis 为主/短轴全长(2a/2b)，采样点用半轴 → 各除以 2（与 Png.cs L944 一致）
+            double rx = el.MajorAxis / 2.0 * (tr?.Scale ?? 1.0), ry = el.MinorAxis / 2.0 * (tr?.Scale ?? 1.0);
             if (rx <= 0 || ry <= 0) return false;
             double rot = el.Rotation * 180.0 / Math.PI + (tr?.Rotation ?? 0.0); // fork 弧度 → 度（与参考实现单位一致）
             double ca = Math.Cos(rot), sa = Math.Sin(rot);
@@ -2590,7 +2591,7 @@ internal partial class ImageEngine
         }
         else if (e is Circle c) { yield return new XY(c.Center.X - c.Radius, c.Center.Y - c.Radius); yield return new XY(c.Center.X + c.Radius, c.Center.Y + c.Radius); }
         else if (e is Arc a) { yield return new XY(a.Center.X - a.Radius, a.Center.Y - a.Radius); yield return new XY(a.Center.X + a.Radius, a.Center.Y + a.Radius); }
-        else if (e is Ellipse el) { double r = Math.Max(el.MajorAxis, el.MinorAxis); yield return new XY(el.Center.X - r, el.Center.Y - r); yield return new XY(el.Center.X + r, el.Center.Y + r); }
+        else if (e is Ellipse el) { double r = Math.Max(el.MajorAxis, el.MinorAxis) / 2.0; yield return new XY(el.Center.X - r, el.Center.Y - r); yield return new XY(el.Center.X + r, el.Center.Y + r); } // fork MajorAxis=全长(2a)，与 Circle/Arc 的半半径一致
         else if (e is TextEntity t) { var tm = TextMetrics(t); foreach (var cp in TextBoxCorners(t.InsertPoint.X, t.InsertPoint.Y, tm)) yield return cp; }
         else if (e is MText mt) { var tm = TextMetrics(mt); foreach (var cp in TextBoxCorners(mt.InsertPoint.X, mt.InsertPoint.Y, tm)) yield return cp; }
         else if (e is Solid so)

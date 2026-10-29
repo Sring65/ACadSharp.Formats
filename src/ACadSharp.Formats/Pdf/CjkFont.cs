@@ -40,7 +40,9 @@ internal sealed class CjkFont
     /// <summary>
     /// 跨平台查找 TTF 字体文件：
     ///   1) 环境变量 D2X_CJK_FONT：直接指定 .ttf 文件路径（最高优先级）；
-    ///   2) 环境变量 D2X_FONT_DIR：字体目录；
+    ///   2) 环境变量 D2X_FONT_DIR：字体目录（封闭字体集——设置后只在该目录内查找，
+    ///      不再回落到 OS 系统字体目录；后端宿主据此与浏览器 wasm 宿主保持逐字节一致，
+    ///      浏览器宿主的字体集天然封闭于 VFS 镜像，不允许后端泄漏 C:\Windows\Fonts 等系统字体）；
     ///   3) Windows：C:\Windows\Fonts；
     ///   4) 非 Windows：/usr/share/fonts、/usr/local/share/fonts、~/.fonts、~/.local/share/fonts；
     ///   5) 本地：Support\fonts、fonts（CWD 与 exe 目录）。
@@ -53,9 +55,25 @@ internal sealed class CjkFont
         string envFile = Environment.GetEnvironmentVariable("D2X_CJK_FONT") ?? "";
         if (File.Exists(envFile)) return envFile;
 
-        var dirs = new List<string>();
         string envDir = Environment.GetEnvironmentVariable("D2X_FONT_DIR") ?? "";
-        if (Directory.Exists(envDir)) dirs.Add(envDir);
+        if (envDir.Length > 0 && Directory.Exists(envDir))
+        {
+            // 封闭字体集：只查该目录（快路径 + 递归），未命中直接返回 null（不回落到系统目录）。
+            foreach (string name in candidateNames)
+            {
+                string p = Path.Combine(envDir, name);
+                if (File.Exists(p)) return p;
+                try
+                {
+                    foreach (string hit in Directory.EnumerateFiles(envDir, name, SearchOption.AllDirectories))
+                        return hit;
+                }
+                catch { /* 容错：权限/IO 异常跳过 */ }
+            }
+            return null;
+        }
+
+        var dirs = new List<string>();
         string winFonts = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "Fonts");
         if (!string.IsNullOrEmpty(winFonts) && Directory.Exists(winFonts)) dirs.Add(winFonts);
         bool isWin = OperatingSystem.IsWindows();

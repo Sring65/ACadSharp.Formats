@@ -6392,7 +6392,8 @@ internal partial class ImageEngine
         var segs = BuildPatternSegments(loops, ht, tr, MaxPatternLinesPerHatch);
         if (segs.Count == 0) { RecordSkip("HATCH(图案)"); return; }
         string col = HatchSolidFillHex(ht, layerAci, byBlockAci);
-        double w = Math.Max(0.03, 0.1 * scaleMul); // 图案线细
+        // 图案线细；线宽为屏幕空间常量，不乘块缩放 scaleMul（间距随 tr 缩放，2026-10-29 用户裁定）
+        double w = 0.1;
         var d = new StringBuilder();
         foreach (var s in segs)
             d.Append("M").Append(F(Sx(s.X1))).Append(',').Append(F(Sy(s.Y1)))
@@ -6629,7 +6630,13 @@ internal partial class ImageEngine
         if (lw > 0 && _lwDisplay && _lwScale > 0)
             lw *= _lwScale;
         double w = lw > 0 ? BaseStroke * lw / DefaultLwMm : BaseStroke;
-        return Math.Max(0.1, w * scaleMul);
+        // 显示线宽为屏幕空间常量：【不】乘块插入缩放 scaleMul。
+        // 2026-10-29 用户裁定：渲染时只缩放渲染尺寸（几何），不缩放绘制线条的像素——
+        // 块缩放 27× 且内线宽为 0 时，旧逻辑把 1px 兜底线宽放大 27× 成 27px，符号糊成一团。
+        // AutoCAD 语义：显示线宽（组码 370 及其 0 兜底）是屏幕属性，不受缩放级别/块插入比例影响；
+        // 点实体中心点同样恒 1px（见 EmitPointPng 注释）。几何（字高、折线几何宽度 40/43、
+        // 箭头、图案间距等）仍随块缩放——那些走各自的 tr/scaleMul 路径，不经过此处。
+        return Math.Max(0.1, w);
     }
 
     private static readonly CultureInfo Ci = CultureInfo.InvariantCulture;

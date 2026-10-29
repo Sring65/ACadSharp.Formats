@@ -2526,7 +2526,9 @@ internal partial class ImageEngine
         var segs = BuildPatternSegments(loops, ht, tr, MaxPatternLinesPerHatch);
         if (segs.Count == 0) { RecordSkip("HATCH(图案)"); return; }
         string col = HatchSolidFillHex(ht, layerAci, byBlockAci);
-        double w = Math.Max(0.03, 0.1 * scaleMul);
+        // 图案线宽为屏幕空间常量：不乘块缩放 scaleMul（与显示线宽同语义，2026-10-29 用户裁定）；
+        // 块/图案缩放只影响图案【间距】（BuildPatternSegments 走 tr 世界坐标）。
+        double w = 0.1;
         var colRgb = HexToRgb(col);
         // 保底 1px：图案线在低分辨率下 w*PngK 可能 <1px，亚像素描边带落在两行像素采样线之间会被整段丢弃
         float widthPx = (float)Math.Max(1.0, w * PngK);

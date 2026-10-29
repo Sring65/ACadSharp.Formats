@@ -1459,7 +1459,8 @@ internal partial class ImageEngine
         // （"1 0.749 0"）再传入，PdfStroke 会二次 HexToRgbPdf → 非 #RRGGBB → 兜底白(1 1 1)
         // → 白底 PDF 上图案线不可见。必须传 hex（HatchSolidFillHex 返回 #RRGGBB）。
         string col = HatchSolidFillHex(ht, layerAci, byBlockAci);
-        double w = Math.Max(0.03, 0.1 * scaleMul);
+        // 图案线宽为屏幕空间常量：不乘块缩放 scaleMul（与显示线宽同语义，2026-10-29 用户裁定）
+        double w = 0.1;
         var d = new StringBuilder();
         foreach (var s in segs)
             d.Append(F(Sx(s.X1))).Append(' ').Append(F(Py(s.Y1))).Append(" m ")
